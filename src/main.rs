@@ -1,0 +1,26062 @@
+#![allow(dead_code)]
+
+mod config;
+mod executor;
+mod grpc;
+mod market_universe;
+mod model;
+mod parser;
+mod rpc;
+mod strategy;
+
+use anyhow::{Context, Result};
+use bytemuck::pod_read_unaligned;
+use config::Config;
+use cp_amm::state::Pool as MeteoraDammV2Pool;
+use executor::config::ExecutionScope;
+use executor::manager::ExecutionManager;
+use grpc::subscribe::{self, AccountKind};
+use model::state::{
+    MeteoraState, PriceSnapshot, PumpState, PumpSwapState, RaydiumState, RaydiumVenue,
+    WhirlpoolState, WhirlpoolTickArrayState,
+};
+use parser::{meteora, meteora_damm_v2, pump, pumpswap, raydium, raydium_clmm, whirlpool};
+use rand::Rng;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+};
+use solana_system_interface::instruction::transfer;
+use spl_token_2022_interface::{
+    extension::{transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions},
+    state::Mint,
+};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, RwLock};
+use tokio::time::{interval, sleep, MissedTickBehavior};
+
+const PUMPSWAP_FEE_BPS: f64 = 125.0;
+const METEORA_LOCAL_QUOTE_SAFETY_BPS: f64 = 10.0;
+const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const PUMP_AMM_FALLBACK_BUYBACK_FEE_RECIPIENTS: [&str; 8] = [
+    "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
+    "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
+    "GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL",
+    "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
+    "5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6",
+    "EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL",
+    "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD",
+    "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
+];
+static PUMP_AMM_BUYBACK_FEE_RECIPIENTS: OnceLock<Option<Vec<Pubkey>>> = OnceLock::new();
+const ATA_EXISTENCE_CACHE_DURATION: Duration = Duration::from_secs(30);
+const TOKEN_ACCOUNT_BALANCE_CACHE_DURATION: Duration = Duration::from_secs(1);
+const WALLET_BALANCE_CACHE_DURATION: Duration = Duration::from_secs(2);
+const TOKEN_2022_TRANSFER_FEE_CACHE_DURATION: Duration = Duration::from_secs(30);
+const CURRENT_EPOCH_CACHE_DURATION: Duration = Duration::from_secs(5);
+const CURRENT_SLOT_CACHE_DURATION: Duration = Duration::from_secs(1);
+const RUNTIME_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+const CANDIDATE_LOG_TTL: Duration = Duration::from_secs(600);
+const EXECUTION_ATTEMPT_TTL: Duration = Duration::from_secs(180);
+const DIRECT_TOKEN_FEEDBACK_TTL: Duration = Duration::from_secs(180);
+const MAX_MINT_TOKEN_PROGRAM_CACHE_ENTRIES: usize = 2048;
+const WALLET_SOL_RESERVE_LAMPORTS: u64 = 10_000_000;
+const EXECUTION_ATTEMPT_MIN_INTERVAL: Duration = Duration::from_millis(500);
+const EXECUTION_ATTEMPT_MIN_NET_CHANGE_PCT: f64 = 0.05;
+const DIRECT_SEND_ATTEMPT_MIN_INTERVAL: Duration = Duration::from_secs(10);
+const DIRECT_PAIR_FEEDBACK_TTL: Duration = Duration::from_secs(45);
+const PROGRAM_PAIR_PATH_FEEDBACK_TTL: Duration = Duration::from_secs(900);
+const ROUTE_HIT_RATE_TTL: Duration = Duration::from_secs(1800);
+const DIRECT_TOKEN_PROCESS_DELAY: Duration = Duration::from_millis(400);
+const DIRECT_TOKEN_PROCESS_DELAY_LIVE_NO_SIM: Duration = Duration::from_millis(25);
+const MAIN_LOOP_TICK_INTERVAL: Duration = Duration::from_millis(100);
+const DYNAMIC_MARKET_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
+const RPC_HEALTH_WAIT_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_DRAINED_UPDATES_PER_BATCH: usize = 4_096;
+const LIVE_TRADE_SIZE_FRACTIONS: [f64; 5] = [0.2, 0.35, 0.5, 0.75, 1.0];
+const MONITOR_TRADE_SIZE_FRACTIONS: [f64; 8] = [0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0];
+const MONITOR_MIN_TRADE_SIZE_USDC: f64 = 1.0;
+const LIVE_RANGE_PROBE_POINTS: usize = 5;
+const MANUAL_DIRECT_SCAN_TRADE_SIZES_USDC: [f64; 10] =
+    [0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0];
+const DIRECT_PROCESS_BACKLOG_HIGH_WATERMARK_MIN: usize = 1_024;
+const DIRECT_PROCESS_BACKLOG_LOW_WATERMARK_MIN: usize = 256;
+const RAYDIUM_CLMM_BITMAP_EXTENSION_HYDRATION_TTL: Duration = Duration::from_secs(300);
+const PROGRAM_PAIR_SCAN_INTERVAL: Duration = Duration::from_millis(100);
+const TWO_HOP_PROFIT_GUARD_BPS: f64 = 0.0;
+const DEFAULT_TWO_HOP_PROFIT_GUARD_MIN_USDC: f64 = 0.01;
+const DEFAULT_DIRECT_SEND_EXTRA_EDGE_PCT: f64 = 0.0;
+const DEFAULT_DIRECT_SEND_EXTRA_EDGE_USDC: f64 = 0.0;
+const BASE_SIGNATURE_FEE_LAMPORTS: u64 = 5_000;
+const DEFAULT_DYNAMIC_JITO_TIP_MIN_SHARE: f64 = 0.10;
+const DEFAULT_DYNAMIC_JITO_TIP_MAX_SHARE: f64 = 0.40;
+const DEFAULT_DYNAMIC_JITO_TIP_FULL_SHARE_PROFIT_PCT: f64 = 3.0;
+const DEFAULT_JITO_MIN_TIP_LAMPORTS: u64 = 1_000;
+const DEFAULT_JITO_MAX_TIP_LAMPORTS: u64 = 200_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DynamicMarketFileMarker {
+    modified: Option<SystemTime>,
+    len: Option<u64>,
+}
+
+impl DynamicMarketFileMarker {
+    fn read(path: &str) -> Self {
+        match fs::metadata(path) {
+            Ok(metadata) => Self {
+                modified: metadata.modified().ok(),
+                len: Some(metadata.len()),
+            },
+            Err(_) => Self {
+                modified: None,
+                len: None,
+            },
+        }
+    }
+
+    fn refresh_changed(&mut self, path: &str) -> bool {
+        let current = Self::read(path);
+        if current != *self {
+            *self = current;
+            true
+        } else {
+            false
+        }
+    }
+}
+const DEFAULT_DIRECT_SEND_MIN_GATE_PCT: f64 = 0.0;
+const DEFAULT_DIRECT_SEND_MAX_STATE_AGE_MS: u64 = 1_500;
+const PUMPSWAP_METEORA_MIN_PROFIT_PCT_FLOOR: f64 = 0.1;
+const PUMPSWAP_METEORA_MIN_PROFIT_PCT_CEILING: f64 = 0.5;
+const RAYDIUM_CLMM_EXACT_INPUT: bool = true;
+const RAYDIUM_CLMM_MIN_SQRT_PRICE_X64_PLUS_ONE: u128 = 4_295_048_017;
+const RAYDIUM_CLMM_MAX_SQRT_PRICE_X64_MINUS_ONE: u128 = 7_176_558_269_927_463_967_822_415_808;
+const BPS_DENOMINATOR_U64: u64 = 10_000;
+const PUMPSWAP_RAYDIUM_CLMM_TARGET_BPS: u64 = 9_500;
+const PUMPSWAP_RAYDIUM_PUMP_BUY_MAX_QUOTE_BPS: u64 = 10_050;
+const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
+const METEORA_NEARBY_BIN_ARRAYS_EACH_SIDE: i64 = 3;
+const METEORA_EXECUTION_QUOTE_DETAIL_SAFETY_BIN_ARRAYS: i64 = 0;
+const DEFAULT_DIRECT_RAYDIUM_REMAINING_TICK_ARRAY_COUNT: usize = 8;
+const DEFAULT_RAYDIUM_CLMM_HYDRATE_TICK_ARRAYS_EACH_SIDE: usize = 8;
+const DEFAULT_DIRECT_METEORA_REMAINING_BIN_ARRAY_COUNT: usize = 1;
+const DEFAULT_MAX_RAYDIUM_CLMM_TRACKED_TICK_ARRAYS_PER_POOL: usize = 24;
+const DEFAULT_MAX_METEORA_TRACKED_BIN_ARRAYS_PER_POOL: usize = 12;
+const PREFERRED_LIVE_METEORA_CLMM_TOKEN_MINT: &str = "SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3";
+
+struct AtaExistenceCache {
+    entries: HashMap<Pubkey, Instant>,
+}
+
+struct MeteoraBitmapExtensionCache {
+    entries: HashMap<Pubkey, (bool, Instant)>,
+}
+
+struct MeteoraBitmapExtensionStateCache {
+    entries: HashMap<Pubkey, (Option<meteora::MeteoraBitmapExtensionState>, Instant)>,
+}
+
+struct MintTokenProgramCache {
+    entries: HashMap<Pubkey, Pubkey>,
+}
+
+struct TokenAccountBalanceCache {
+    balances: HashMap<Pubkey, (Option<u64>, Instant)>,
+}
+
+struct WalletBalanceCache {
+    balances: HashMap<Pubkey, (u64, Instant)>,
+}
+
+struct Token2022TransferFeeConfigCache {
+    entries: HashMap<Pubkey, (Option<TransferFeeConfig>, Instant)>,
+}
+
+struct CurrentEpochCache {
+    epoch: Option<u64>,
+    timestamp: Option<Instant>,
+}
+
+struct CurrentSlotCache {
+    slot: Option<u64>,
+    timestamp: Option<Instant>,
+}
+
+static ATA_EXISTENCE_CACHE: once_cell::sync::Lazy<Arc<RwLock<AtaExistenceCache>>> =
+    once_cell::sync::Lazy::new(|| {
+        Arc::new(RwLock::new(AtaExistenceCache {
+            entries: HashMap::new(),
+        }))
+    });
+
+static METEORA_BITMAP_EXTENSION_CACHE: once_cell::sync::Lazy<
+    Arc<RwLock<MeteoraBitmapExtensionCache>>,
+> = once_cell::sync::Lazy::new(|| {
+    Arc::new(RwLock::new(MeteoraBitmapExtensionCache {
+        entries: HashMap::new(),
+    }))
+});
+static METEORA_BITMAP_EXTENSION_STATE_CACHE: once_cell::sync::Lazy<
+    Arc<RwLock<MeteoraBitmapExtensionStateCache>>,
+> = once_cell::sync::Lazy::new(|| {
+    Arc::new(RwLock::new(MeteoraBitmapExtensionStateCache {
+        entries: HashMap::new(),
+    }))
+});
+
+static MINT_TOKEN_PROGRAM_CACHE: once_cell::sync::Lazy<Arc<RwLock<MintTokenProgramCache>>> =
+    once_cell::sync::Lazy::new(|| {
+        Arc::new(RwLock::new(MintTokenProgramCache {
+            entries: HashMap::new(),
+        }))
+    });
+
+static TOKEN_ACCOUNT_BALANCE_CACHE: once_cell::sync::Lazy<Arc<RwLock<TokenAccountBalanceCache>>> =
+    once_cell::sync::Lazy::new(|| {
+        Arc::new(RwLock::new(TokenAccountBalanceCache {
+            balances: HashMap::new(),
+        }))
+    });
+
+static WALLET_BALANCE_CACHE: once_cell::sync::Lazy<Arc<RwLock<WalletBalanceCache>>> =
+    once_cell::sync::Lazy::new(|| {
+        Arc::new(RwLock::new(WalletBalanceCache {
+            balances: HashMap::new(),
+        }))
+    });
+
+static TOKEN_2022_TRANSFER_FEE_CONFIG_CACHE: once_cell::sync::Lazy<
+    Arc<std::sync::RwLock<Token2022TransferFeeConfigCache>>,
+> = once_cell::sync::Lazy::new(|| {
+    Arc::new(std::sync::RwLock::new(Token2022TransferFeeConfigCache {
+        entries: HashMap::new(),
+    }))
+});
+
+static CURRENT_EPOCH_CACHE: once_cell::sync::Lazy<Arc<std::sync::RwLock<CurrentEpochCache>>> =
+    once_cell::sync::Lazy::new(|| {
+        Arc::new(std::sync::RwLock::new(CurrentEpochCache {
+            epoch: None,
+            timestamp: None,
+        }))
+    });
+static CURRENT_SLOT_CACHE: once_cell::sync::Lazy<Arc<std::sync::RwLock<CurrentSlotCache>>> =
+    once_cell::sync::Lazy::new(|| {
+        Arc::new(std::sync::RwLock::new(CurrentSlotCache {
+            slot: None,
+            timestamp: None,
+        }))
+    });
+static WHIRLPOOL_DIRECT_DIAGNOSTIC_KEYS: once_cell::sync::Lazy<Mutex<HashSet<String>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashSet::new()));
+static METEORA_EXECUTION_BIN_ARRAY_COUNT_OVERRIDES: once_cell::sync::Lazy<
+    Arc<std::sync::RwLock<HashMap<String, usize>>>,
+> = once_cell::sync::Lazy::new(|| Arc::new(std::sync::RwLock::new(HashMap::new())));
+static RAYDIUM_EXECUTION_TICK_ARRAY_COUNT_OVERRIDES: once_cell::sync::Lazy<
+    Arc<std::sync::RwLock<HashMap<String, usize>>>,
+> = once_cell::sync::Lazy::new(|| Arc::new(std::sync::RwLock::new(HashMap::new())));
+static RAYDIUM_CLMM_BITMAP_EXTENSION_HYDRATION_CACHE: once_cell::sync::Lazy<
+    Arc<RwLock<HashMap<String, Instant>>>,
+> = once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+static METEORA_EXECUTION_BIN_ARRAY_SEARCH_STATE: once_cell::sync::Lazy<
+    Arc<std::sync::RwLock<HashMap<String, MeteoraExecutionBinArraySearchState>>>,
+> = once_cell::sync::Lazy::new(|| Arc::new(std::sync::RwLock::new(HashMap::new())));
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MeteoraExecutionBinArraySearchState {
+    min_required: Option<usize>,
+    max_allowed: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeStats {
+    updates: u64,
+    pump_updates: u64,
+    raydium_updates: u64,
+    raydium_vault_updates: u64,
+    raydium_clmm_tick_array_updates: u64,
+    whirlpool_updates: u64,
+    whirlpool_tick_array_updates: u64,
+    pumpswap_pool_updates: u64,
+    pumpswap_vault_updates: u64,
+    meteora_updates: u64,
+    meteora_vault_updates: u64,
+    meteora_bin_array_updates: u64,
+    meteora_parse_errors: u64,
+    meteora_bin_array_parse_errors: u64,
+    pump_parse_errors: u64,
+    raydium_parse_errors: u64,
+    raydium_clmm_tick_array_parse_errors: u64,
+    whirlpool_parse_errors: u64,
+    whirlpool_tick_array_parse_errors: u64,
+    pumpswap_parse_errors: u64,
+    metadata_mismatches: u64,
+    metadata_overrides: u64,
+    meteora_ignored: u64,
+    unchanged_updates: u64,
+    route_misses: u64,
+    no_match_checks: u64,
+    validated_checks: u64,
+    rejected_below_threshold: u64,
+    rejected_risk: u64,
+    executable_opportunities: u64,
+    non_executable_opportunities: u64,
+    hydrated_accounts: u64,
+    latest_slot: u64,
+    best_route: Option<RouteSnapshot>,
+    candidate_logs: HashMap<String, CandidateLogState>,
+    execution_attempts: HashMap<String, CandidateLogState>,
+    direct_token_feedback: HashMap<String, CandidateLogState>,
+    direct_pair_feedback: HashMap<String, CandidateLogState>,
+    direct_path_cooldowns: HashMap<String, DirectPathCooldownState>,
+    program_pair_path_feedback: HashMap<String, ProgramPairPathFeedbackState>,
+    route_hit_rate: HashMap<String, RouteHitRateState>,
+    exact_quote_required: u64,
+    exact_quote_passed: u64,
+    tx_build_required: u64,
+    tx_build_blocked: u64,
+    simulation_required: u64,
+    simulation_passed: u64,
+    simulation_failed: u64,
+    last_simulation_error: Option<String>,
+    clmm_preflight_passed: u64,
+    clmm_preflight_tick_crossing_required: u64,
+    clmm_preflight_missing_tick_arrays: u64,
+    token_selection: HashMap<String, TokenSelectionState>,
+}
+
+#[derive(Debug, Clone)]
+struct RouteSnapshot {
+    token_mint: String,
+    buy_venue: String,
+    sell_venue: String,
+    buy_price_usdc: f64,
+    sell_price_usdc: f64,
+    gross_profit_pct: f64,
+    net_profit_pct: f64,
+    route_kind: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateLogState {
+    last_seen: Instant,
+    last_net_profit_pct: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TokenSelectionState {
+    recent_updates: VecDeque<Instant>,
+    last_score: f64,
+    selection_count: u64,
+    exact_candidate_count: u64,
+    send_attempt_count: u64,
+    send_success_count: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DirectPathCooldownState {
+    cooldown_until: Instant,
+    reason_key: &'static str,
+    last_gate_profit_pct: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ProgramPairPathFeedbackState {
+    last_seen: Instant,
+    evaluation_count: u64,
+    exact_successful_quote_count: u64,
+    exact_missing_quote_count: u64,
+    near_profit_count: u64,
+    profitable_selection_count: u64,
+    last_gate_profit_pct: f64,
+    best_gate_profit_pct: f64,
+    last_trade_size_usdc: f64,
+}
+
+#[derive(Debug, Clone)]
+struct RouteHitRateState {
+    last_seen: Instant,
+    discovery_count: u64,
+    sent_count: u64,
+    landed_count: u64,
+    success_count: u64,
+    failure_count: u64,
+    negative_real_profit_count: u64,
+    total_expected_profit_usdc: f64,
+    total_real_profit_usdc: f64,
+    total_cu_used: u64,
+    cu_samples: u64,
+    last_fail_reason: Option<String>,
+}
+
+impl Default for RouteHitRateState {
+    fn default() -> Self {
+        Self {
+            last_seen: Instant::now(),
+            discovery_count: 0,
+            sent_count: 0,
+            landed_count: 0,
+            success_count: 0,
+            failure_count: 0,
+            negative_real_profit_count: 0,
+            total_expected_profit_usdc: 0.0,
+            total_real_profit_usdc: 0.0,
+            total_cu_used: 0,
+            cu_samples: 0,
+            last_fail_reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExecutableRouteBlock {
+    reason_key: &'static str,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClmmSpotDirection {
+    PumpSwapToClmm,
+    ClmmToPumpSwap,
+}
+
+fn pumpswap_clmm_direction_label(direction: ClmmSpotDirection) -> &'static str {
+    match direction {
+        ClmmSpotDirection::PumpSwapToClmm => "PumpSwap->Raydium CLMM",
+        ClmmSpotDirection::ClmmToPumpSwap => "Raydium CLMM->PumpSwap",
+    }
+}
+
+fn pumpswap_clmm_execution_direction_enabled(direction: ClmmSpotDirection) -> bool {
+    matches!(direction, ClmmSpotDirection::PumpSwapToClmm)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeteoraClmmDirection {
+    MeteoraToClmm,
+    ClmmToMeteora,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeteoraPumpSwapDirection {
+    PumpSwapToMeteora,
+    MeteoraToPumpSwap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeteoraWhirlpoolDirection {
+    MeteoraToWhirlpool,
+    WhirlpoolToMeteora,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectRouteFamily {
+    PumpSwapRaydium,
+    PumpSwapMeteora,
+    PumpSwapWhirlpool,
+    MeteoraRaydium,
+    MeteoraWhirlpool,
+    RaydiumWhirlpool,
+    MeteoraMeteora,
+}
+
+#[derive(Debug, Clone)]
+enum DirectRouteCandidate {
+    PumpSwapClmm {
+        token_mint: String,
+        pumpswap_address: String,
+        raydium_address: String,
+        direction: ClmmSpotDirection,
+        net_profit_pct: f64,
+    },
+    PumpSwapMeteora {
+        token_mint: String,
+        pumpswap_address: String,
+        meteora_address: String,
+        direction: MeteoraPumpSwapDirection,
+        net_profit_pct: f64,
+    },
+    MeteoraClmm {
+        token_mint: String,
+        meteora_address: String,
+        raydium_address: String,
+        direction: MeteoraClmmDirection,
+        net_profit_pct: f64,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum ExactDirectRouteCandidate {
+    PumpSwapClmm {
+        token_mint: String,
+        pumpswap_address: String,
+        raydium_address: String,
+        direction: ClmmSpotDirection,
+        trade_size_usdc: f64,
+        exact_net_profit_pct: f64,
+        gate_profit_pct: f64,
+    },
+    PumpSwapMeteora {
+        token_mint: String,
+        pumpswap_address: String,
+        meteora_address: String,
+        direction: MeteoraPumpSwapDirection,
+        trade_size_usdc: f64,
+        exact_net_profit_pct: f64,
+        gate_profit_pct: f64,
+    },
+    MeteoraClmm {
+        token_mint: String,
+        meteora_address: String,
+        raydium_address: String,
+        direction: MeteoraClmmDirection,
+        trade_size_usdc: f64,
+        exact_net_profit_pct: f64,
+        gate_profit_pct: f64,
+    },
+    PumpSwapWhirlpool {
+        token_mint: String,
+        pumpswap_address: String,
+        whirlpool_address: String,
+        path_label: &'static str,
+        trade_size_usdc: f64,
+        exact_net_profit_pct: f64,
+        gate_profit_pct: f64,
+    },
+    MeteoraWhirlpool {
+        token_mint: String,
+        meteora_address: String,
+        whirlpool_address: String,
+        direction: MeteoraWhirlpoolDirection,
+        path_label: &'static str,
+        trade_size_usdc: f64,
+        exact_net_profit_pct: f64,
+        gate_profit_pct: f64,
+    },
+    RaydiumWhirlpool {
+        token_mint: String,
+        raydium_address: String,
+        whirlpool_address: String,
+        path_label: &'static str,
+        trade_size_usdc: f64,
+        exact_net_profit_pct: f64,
+        gate_profit_pct: f64,
+    },
+    MeteoraMeteora {
+        token_mint: String,
+        buy_meteora_address: String,
+        sell_meteora_address: String,
+        trade_size_usdc: f64,
+        exact_net_profit_pct: f64,
+        gate_profit_pct: f64,
+    },
+}
+
+async fn wait_for_rpc_health(rpc_url: &str) -> Result<()> {
+    if !parse_bool_env("WAIT_FOR_RPC_HEALTH", true) {
+        return Ok(());
+    }
+
+    let interval = Duration::from_secs(
+        parse_positive_env_u64(
+            "WAIT_FOR_RPC_HEALTH_INTERVAL_SECS",
+            RPC_HEALTH_WAIT_INTERVAL.as_secs(),
+        )
+        .max(1),
+    );
+    let max_wait_secs = parse_non_negative_env_u64("WAIT_FOR_RPC_HEALTH_MAX_SECS", 0);
+    let max_wait = (max_wait_secs > 0).then(|| Duration::from_secs(max_wait_secs));
+    let started_at = Instant::now();
+    let mut attempts = 0u64;
+
+    loop {
+        attempts += 1;
+        match rpc::get_health(rpc_url).await {
+            Ok(status) if status == "ok" => {
+                tracing::info!(
+                    "RPC 已就绪：地址={}，尝试={}，等待={}毫秒",
+                    rpc_url,
+                    attempts,
+                    started_at.elapsed().as_millis()
+                );
+                return Ok(());
+            }
+            Ok(status) => {
+                if attempts == 1 || attempts % 6 == 0 {
+                    tracing::warn!(
+                        "等待 RPC 就绪：地址={}，状态={}，尝试={}，已等={}秒",
+                        rpc_url,
+                        status,
+                        attempts,
+                        started_at.elapsed().as_secs()
+                    );
+                } else {
+                    tracing::debug!(
+                        "等待 RPC 就绪：地址={}，状态={}，尝试={}",
+                        rpc_url,
+                        status,
+                        attempts
+                    );
+                }
+            }
+            Err(error) => {
+                if attempts == 1 || attempts % 6 == 0 {
+                    tracing::warn!(
+                        "等待 RPC 就绪：地址={}，错误={}，尝试={}，已等={}秒",
+                        rpc_url,
+                        error,
+                        attempts,
+                        started_at.elapsed().as_secs()
+                    );
+                } else {
+                    tracing::debug!(
+                        "等待 RPC 就绪：地址={}，错误={}，尝试={}",
+                        rpc_url,
+                        error,
+                        attempts
+                    );
+                }
+            }
+        }
+
+        if let Some(max_wait) = max_wait {
+            if started_at.elapsed() >= max_wait {
+                anyhow::bail!("RPC 在 {} 秒内没有就绪：{}", max_wait.as_secs(), rpc_url);
+            }
+        }
+
+        sleep(interval).await;
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenv::dotenv().ok();
+
+    let config = Config::from_file_or_default()?;
+    config.apply_runtime_overrides_to_env();
+    let log_only_send = parse_bool_env("LOG_ONLY_SEND", true);
+    let log_level = if log_only_send {
+        tracing::level_filters::LevelFilter::OFF
+    } else {
+        match config.logging.level.to_lowercase().as_str() {
+            "trace" => tracing::level_filters::LevelFilter::TRACE,
+            "debug" => tracing::level_filters::LevelFilter::DEBUG,
+            "warn" => tracing::level_filters::LevelFilter::WARN,
+            "error" => tracing::level_filters::LevelFilter::ERROR,
+            "off" => tracing::level_filters::LevelFilter::OFF,
+            _ => tracing::level_filters::LevelFilter::INFO,
+        }
+    };
+
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_max_level(log_level)
+        .init();
+
+    tracing::info!("套利机器人启动");
+
+    let execution_scope = ExecutionScope::from_env();
+    tracing::info!("RPC 地址：{}", config.rpc.http_url);
+    wait_for_rpc_health(&config.rpc.http_url).await?;
+    let execution_manager = ExecutionManager::new(&config.rpc.http_url)?;
+    tracing::info!(
+        "发送状态：可直发={}，实盘开关={}，两跳程序={}",
+        executor_direct_send_ready(&execution_manager),
+        if execution_manager.live_send_enabled() {
+            "开"
+        } else {
+            "关"
+        },
+        if execution_manager.two_hop_executor_program_id().is_some() {
+            "已配置"
+        } else {
+            "未配置"
+        }
+    );
+
+    let subscriptions =
+        market_universe::build_subscription_accounts(&config, &execution_scope).await?;
+    let mut account_metadata = subscriptions.metadata;
+    let mut pump_accounts = subscriptions.pump_accounts;
+    let mut pumpswap_pools = subscriptions.pumpswap_pools;
+    let mut raydium_accounts = subscriptions.raydium_accounts;
+    let mut meteora_accounts = subscriptions.meteora_accounts;
+    let mut whirlpool_accounts = subscriptions.whirlpool_accounts;
+    let mut market_address_set = subscription_market_address_set(
+        &pump_accounts,
+        &pumpswap_pools,
+        &raydium_accounts,
+        &meteora_accounts,
+        &whirlpool_accounts,
+    );
+
+    if pump_accounts.is_empty() && pumpswap_pools.is_empty() {
+        tracing::error!("配置里至少需要一个 Pump 或 PumpSwap 账户");
+        return Ok(());
+    }
+
+    if raydium_accounts.is_empty() && meteora_accounts.is_empty() && whirlpool_accounts.is_empty() {
+        tracing::error!("配置里至少需要一个 Raydium、Meteora 或 Whirlpool 池");
+        return Ok(());
+    }
+
+    tracing::info!("市场来源：静态配置加动态文件");
+    tracing::info!(
+        "市场数量：Pump={}，PumpSwap={}，Raydium={}，Meteora={}，Whirl池={}",
+        pump_accounts.len(),
+        pumpswap_pools.len(),
+        raydium_accounts.len(),
+        meteora_accounts.len(),
+        whirlpool_accounts.len()
+    );
+    tracing::info!(
+        "策略参数：最低利润={:.2}%，SOL价格=${:.2}",
+        config.strategy.min_profit_threshold,
+        config.strategy.sol_usdc_price
+    );
+    let pumpswap_fee_config = hydrate_pumpswap_fee_config(&config).await;
+
+    tracing::info!("连接 gRPC：{}", config.grpc.endpoint);
+    let mut pump_state: HashMap<String, PumpState> = HashMap::new();
+    let mut pumpswap_state: HashMap<String, PumpSwapState> = HashMap::new();
+    let mut raydium_state: HashMap<String, RaydiumState> = HashMap::new();
+    let mut meteora_state: HashMap<String, MeteoraState> = HashMap::new();
+    let mut whirlpool_state: HashMap<String, WhirlpoolState> = HashMap::new();
+    let mut pump_by_token: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pumpswap_by_token: HashMap<String, Vec<String>> = HashMap::new();
+    let mut raydium_by_token: HashMap<String, Vec<String>> = HashMap::new();
+    let mut meteora_by_token: HashMap<String, Vec<String>> = HashMap::new();
+    let mut whirlpool_by_token: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pumpswap_vault_to_pool: HashMap<String, (String, bool)> = HashMap::new();
+    let mut raydium_vault_to_pool: HashMap<String, (String, bool)> = HashMap::new();
+    let mut raydium_clmm_tick_array_to_pool: HashMap<String, (String, i32)> = HashMap::new();
+    let mut raydium_clmm_tick_arrays: HashMap<String, raydium_clmm::ClmmTickArrayState> =
+        HashMap::new();
+    let mut meteora_vault_to_pool: HashMap<String, (String, bool)> = HashMap::new();
+    let mut meteora_bin_array_to_pool: HashMap<String, (String, i64)> = HashMap::new();
+    let mut meteora_bin_arrays: HashMap<String, meteora::MeteoraBinArrayState> = HashMap::new();
+    let mut whirlpool_tick_array_to_pool: HashMap<String, (String, i32)> = HashMap::new();
+    let mut whirlpool_tick_arrays: HashMap<String, WhirlpoolTickArrayState> = HashMap::new();
+    let mut metadata_warnings: HashSet<String> = HashSet::new();
+
+    let sol_price = config.strategy.sol_usdc_price;
+    let mut stats = RuntimeStats::default();
+    let mut dirty_direct_tokens: HashSet<String> = HashSet::new();
+    let mut hydrated_supporting_pools: HashSet<String> = HashSet::new();
+    let mut last_direct_process = Instant::now()
+        .checked_sub(PROGRAM_PAIR_SCAN_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut last_runtime_prune = Instant::now();
+    let mut direct_processing_deferred = false;
+
+    hydrate_initial_state(
+        &config,
+        &pump_accounts,
+        &pumpswap_pools,
+        &raydium_accounts,
+        &meteora_accounts,
+        &whirlpool_accounts,
+        &account_metadata,
+        &mut metadata_warnings,
+        &mut pump_state,
+        &mut pumpswap_state,
+        &mut raydium_state,
+        &mut meteora_state,
+        &mut whirlpool_state,
+        &mut pump_by_token,
+        &mut pumpswap_by_token,
+        &mut raydium_by_token,
+        &mut meteora_by_token,
+        &mut whirlpool_by_token,
+        &mut pumpswap_vault_to_pool,
+        &mut raydium_vault_to_pool,
+        &mut raydium_clmm_tick_array_to_pool,
+        &mut raydium_clmm_tick_arrays,
+        &mut meteora_vault_to_pool,
+        &mut meteora_bin_array_to_pool,
+        &mut meteora_bin_arrays,
+        &mut whirlpool_tick_array_to_pool,
+        &mut whirlpool_tick_arrays,
+        &mut stats,
+    )
+    .await;
+
+    let initial_routeable_tokens = collect_program_pair_routeable_tokens(
+        &config,
+        &pump_by_token,
+        &pumpswap_by_token,
+        &raydium_by_token,
+        &meteora_by_token,
+        &whirlpool_by_token,
+    );
+    tracing::info!(
+        "初始可扫描币种：{}，后续只扫描有账户更新的币种",
+        initial_routeable_tokens.len()
+    );
+    dirty_direct_tokens.extend(initial_routeable_tokens);
+
+    let mut rx = subscribe_current_accounts(
+        &config,
+        &pump_accounts,
+        &pumpswap_pools,
+        &raydium_accounts,
+        &meteora_accounts,
+        &whirlpool_accounts,
+        &pumpswap_vault_to_pool,
+        &raydium_vault_to_pool,
+        &raydium_clmm_tick_array_to_pool,
+        &meteora_vault_to_pool,
+        &meteora_bin_array_to_pool,
+        &whirlpool_tick_array_to_pool,
+    );
+
+    tracing::info!("账户监听已启动");
+
+    let monitoring_started_at = Instant::now();
+    let mut last_account_update_at: Option<Instant> = None;
+    let mut last_status_log_at = Instant::now();
+    let mut main_loop_tick = interval(MAIN_LOOP_TICK_INTERVAL);
+    main_loop_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut dynamic_market_reload_tick = interval(DYNAMIC_MARKET_RELOAD_INTERVAL);
+    dynamic_market_reload_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut dynamic_market_marker =
+        DynamicMarketFileMarker::read(&config.discovery.dynamic_market_addresses_path);
+    main_loop_tick.tick().await;
+
+    loop {
+        let mut received_account_update = false;
+        let mut dynamic_market_reload_requested = false;
+        let maybe_update = tokio::select! {
+            biased;
+            update = rx.recv() => match update {
+                Some(update) => Some(update),
+                None => break,
+            },
+            _ = main_loop_tick.tick() => None,
+            _ = dynamic_market_reload_tick.tick() => {
+                dynamic_market_reload_requested =
+                    dynamic_market_marker.refresh_changed(&config.discovery.dynamic_market_addresses_path);
+                None
+            },
+        };
+
+        if dynamic_market_reload_requested {
+            match market_universe::build_subscription_accounts(&config, &execution_scope).await {
+                Ok(subscriptions) => {
+                    let new_market_address_set = subscription_market_address_set(
+                        &subscriptions.pump_accounts,
+                        &subscriptions.pumpswap_pools,
+                        &subscriptions.raydium_accounts,
+                        &subscriptions.meteora_accounts,
+                        &subscriptions.whirlpool_accounts,
+                    );
+                    if new_market_address_set == market_address_set {
+                        tracing::debug!(
+                            "动态市场文件已更新，但可用市场地址没有变化：文件={}",
+                            config.discovery.dynamic_market_addresses_path
+                        );
+                    } else if subscriptions.pump_accounts.is_empty()
+                        && subscriptions.pumpswap_pools.is_empty()
+                    {
+                        tracing::warn!("动态市场重载跳过：没有 Pump 或 PumpSwap 账户");
+                    } else if subscriptions.raydium_accounts.is_empty()
+                        && subscriptions.meteora_accounts.is_empty()
+                        && subscriptions.whirlpool_accounts.is_empty()
+                    {
+                        tracing::warn!("动态市场重载跳过：没有 Raydium、Meteora 或 Whirlpool 池");
+                    } else {
+                        tracing::info!(
+                            "动态市场变化，重新加载：旧市场={}，新市场={}",
+                            market_address_set.len(),
+                            new_market_address_set.len()
+                        );
+
+                        account_metadata = subscriptions.metadata;
+                        pump_accounts = subscriptions.pump_accounts;
+                        pumpswap_pools = subscriptions.pumpswap_pools;
+                        raydium_accounts = subscriptions.raydium_accounts;
+                        meteora_accounts = subscriptions.meteora_accounts;
+                        whirlpool_accounts = subscriptions.whirlpool_accounts;
+                        market_address_set = new_market_address_set;
+
+                        pump_state.clear();
+                        pumpswap_state.clear();
+                        raydium_state.clear();
+                        meteora_state.clear();
+                        whirlpool_state.clear();
+                        pump_by_token.clear();
+                        pumpswap_by_token.clear();
+                        raydium_by_token.clear();
+                        meteora_by_token.clear();
+                        whirlpool_by_token.clear();
+                        pumpswap_vault_to_pool.clear();
+                        raydium_vault_to_pool.clear();
+                        raydium_clmm_tick_array_to_pool.clear();
+                        raydium_clmm_tick_arrays.clear();
+                        meteora_vault_to_pool.clear();
+                        meteora_bin_array_to_pool.clear();
+                        meteora_bin_arrays.clear();
+                        whirlpool_tick_array_to_pool.clear();
+                        whirlpool_tick_arrays.clear();
+                        hydrated_supporting_pools.clear();
+                        metadata_warnings.clear();
+                        stats.hydrated_accounts = 0;
+
+                        hydrate_initial_state(
+                            &config,
+                            &pump_accounts,
+                            &pumpswap_pools,
+                            &raydium_accounts,
+                            &meteora_accounts,
+                            &whirlpool_accounts,
+                            &account_metadata,
+                            &mut metadata_warnings,
+                            &mut pump_state,
+                            &mut pumpswap_state,
+                            &mut raydium_state,
+                            &mut meteora_state,
+                            &mut whirlpool_state,
+                            &mut pump_by_token,
+                            &mut pumpswap_by_token,
+                            &mut raydium_by_token,
+                            &mut meteora_by_token,
+                            &mut whirlpool_by_token,
+                            &mut pumpswap_vault_to_pool,
+                            &mut raydium_vault_to_pool,
+                            &mut raydium_clmm_tick_array_to_pool,
+                            &mut raydium_clmm_tick_arrays,
+                            &mut meteora_vault_to_pool,
+                            &mut meteora_bin_array_to_pool,
+                            &mut meteora_bin_arrays,
+                            &mut whirlpool_tick_array_to_pool,
+                            &mut whirlpool_tick_arrays,
+                            &mut stats,
+                        )
+                        .await;
+
+                        let routeable_tokens = collect_program_pair_routeable_tokens(
+                            &config,
+                            &pump_by_token,
+                            &pumpswap_by_token,
+                            &raydium_by_token,
+                            &meteora_by_token,
+                            &whirlpool_by_token,
+                        );
+                        dirty_direct_tokens.clear();
+                        dirty_direct_tokens.extend(routeable_tokens.iter().cloned());
+                        rx = subscribe_current_accounts(
+                            &config,
+                            &pump_accounts,
+                            &pumpswap_pools,
+                            &raydium_accounts,
+                            &meteora_accounts,
+                            &whirlpool_accounts,
+                            &pumpswap_vault_to_pool,
+                            &raydium_vault_to_pool,
+                            &raydium_clmm_tick_array_to_pool,
+                            &meteora_vault_to_pool,
+                            &meteora_bin_array_to_pool,
+                            &whirlpool_tick_array_to_pool,
+                        );
+                        last_direct_process = Instant::now()
+                            .checked_sub(PROGRAM_PAIR_SCAN_INTERVAL)
+                            .unwrap_or_else(Instant::now);
+                        direct_processing_deferred = false;
+                        last_account_update_at = None;
+                        tracing::info!(
+                            "动态市场重载完成：Pump={}，PumpSwap={}，Raydium={}，Meteora={}，Whirlpool={}，可扫描币种={}",
+                            pump_accounts.len(),
+                            pumpswap_pools.len(),
+                            raydium_accounts.len(),
+                            meteora_accounts.len(),
+                            whirlpool_accounts.len(),
+                            routeable_tokens.len()
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!("动态市场重载失败：{}", error),
+            }
+        }
+
+        if let Some(update) = maybe_update {
+            received_account_update = true;
+            last_account_update_at = Some(Instant::now());
+            let latest_updates = drain_latest_updates(&mut rx, update, &mut stats);
+
+            for update in latest_updates {
+                process_account_update(
+                    update,
+                    &execution_manager,
+                    &execution_scope,
+                    &config,
+                    &account_metadata,
+                    &mut metadata_warnings,
+                    &mut pump_state,
+                    &mut pumpswap_state,
+                    &mut raydium_state,
+                    &mut meteora_state,
+                    &mut whirlpool_state,
+                    &mut pump_by_token,
+                    &mut pumpswap_by_token,
+                    &mut raydium_by_token,
+                    &mut meteora_by_token,
+                    &mut whirlpool_by_token,
+                    &mut pumpswap_vault_to_pool,
+                    &mut raydium_vault_to_pool,
+                    &mut raydium_clmm_tick_array_to_pool,
+                    &mut raydium_clmm_tick_arrays,
+                    &mut meteora_vault_to_pool,
+                    &mut meteora_bin_array_to_pool,
+                    &mut meteora_bin_arrays,
+                    &mut whirlpool_tick_array_to_pool,
+                    &mut whirlpool_tick_arrays,
+                    &mut dirty_direct_tokens,
+                    &mut hydrated_supporting_pools,
+                    pumpswap_fee_config.as_ref(),
+                    &mut stats,
+                    sol_price,
+                )
+                .await;
+            }
+        }
+
+        let backlog_len = rx.len();
+        let high_watermark = direct_processing_backlog_high_watermark(&config);
+        let low_watermark = direct_processing_backlog_low_watermark(&config);
+        let defer_direct_processing = backlog_len >= high_watermark;
+        if defer_direct_processing && !direct_processing_deferred {
+            tracing::warn!(
+                "处理队列积压，暂停扫描：队列={}，恢复线={}，待扫币种={}",
+                backlog_len,
+                low_watermark,
+                dirty_direct_tokens.len()
+            );
+            direct_processing_deferred = true;
+        } else if direct_processing_deferred && backlog_len <= low_watermark {
+            tracing::info!(
+                "处理队列恢复，继续扫描：队列={}，恢复线={}",
+                backlog_len,
+                low_watermark
+            );
+            direct_processing_deferred = false;
+        }
+
+        let now = Instant::now();
+        if !defer_direct_processing && last_direct_process.elapsed() >= PROGRAM_PAIR_SCAN_INTERVAL {
+            let mut program_pair_tokens = std::mem::take(&mut dirty_direct_tokens);
+            if !program_pair_tokens.is_empty() {
+                process_program_pair_tokens(
+                    &execution_manager,
+                    &config,
+                    &account_metadata,
+                    &pump_state,
+                    &pumpswap_state,
+                    &raydium_state,
+                    &meteora_state,
+                    &whirlpool_state,
+                    &pumpswap_by_token,
+                    &raydium_by_token,
+                    &meteora_by_token,
+                    &whirlpool_by_token,
+                    &raydium_clmm_tick_arrays,
+                    &meteora_bin_arrays,
+                    &whirlpool_tick_arrays,
+                    pumpswap_fee_config.as_ref(),
+                    &mut program_pair_tokens,
+                    &mut stats,
+                )
+                .await;
+                last_direct_process = Instant::now();
+            }
+        }
+
+        if now.duration_since(last_runtime_prune) >= RUNTIME_PRUNE_INTERVAL {
+            prune_runtime_state(&mut stats, now);
+            prune_ephemeral_caches(now).await;
+            last_runtime_prune = now;
+        }
+
+        if config.logging.idle_status_interval_secs > 0
+            && last_status_log_at.elapsed()
+                >= Duration::from_secs(config.logging.idle_status_interval_secs.max(1))
+        {
+            log_monitoring_status(
+                &config,
+                &stats,
+                &pump_state,
+                &pumpswap_state,
+                &raydium_state,
+                &raydium_clmm_tick_arrays,
+                &meteora_state,
+                &meteora_bin_arrays,
+                &whirlpool_state,
+                &whirlpool_tick_arrays,
+                &pump_by_token,
+                &pumpswap_by_token,
+                &raydium_by_token,
+                &meteora_by_token,
+                &whirlpool_by_token,
+                dirty_direct_tokens.len(),
+                rx.len(),
+                monitoring_started_at,
+                last_account_update_at,
+            );
+            last_status_log_at = Instant::now();
+        }
+
+        if received_account_update {
+            maybe_log_heartbeat(
+                &config,
+                &stats,
+                &pump_state,
+                &pumpswap_state,
+                &raydium_state,
+                &raydium_clmm_tick_arrays,
+                &meteora_state,
+                &meteora_bin_arrays,
+                &whirlpool_state,
+                &whirlpool_tick_arrays,
+                &pump_by_token,
+                &pumpswap_by_token,
+                &raydium_by_token,
+                &meteora_by_token,
+                &whirlpool_by_token,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn drain_latest_updates(
+    rx: &mut mpsc::Receiver<subscribe::AccountUpdate>,
+    first_update: subscribe::AccountUpdate,
+    stats: &mut RuntimeStats,
+) -> Vec<subscribe::AccountUpdate> {
+    let mut latest_updates = Vec::new();
+    let mut positions = HashMap::new();
+    let mut drained = 0usize;
+
+    let mut push_update = |update: subscribe::AccountUpdate| {
+        stats.updates += 1;
+        stats.latest_slot = stats.latest_slot.max(update.slot);
+        if let Some(index) = positions.get(&update.pubkey).copied() {
+            latest_updates[index] = update;
+        } else {
+            positions.insert(update.pubkey.clone(), latest_updates.len());
+            latest_updates.push(update);
+        }
+    };
+
+    push_update(first_update);
+    while drained < MAX_DRAINED_UPDATES_PER_BATCH {
+        match rx.try_recv() {
+            Ok(update) => {
+                push_update(update);
+                drained += 1;
+            }
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+
+    latest_updates
+}
+
+fn subscription_market_address_set(
+    pump_accounts: &[String],
+    pumpswap_pools: &[String],
+    raydium_accounts: &[String],
+    meteora_accounts: &[String],
+    whirlpool_accounts: &[String],
+) -> HashSet<String> {
+    pump_accounts
+        .iter()
+        .chain(pumpswap_pools.iter())
+        .chain(raydium_accounts.iter())
+        .chain(meteora_accounts.iter())
+        .chain(whirlpool_accounts.iter())
+        .cloned()
+        .collect()
+}
+
+fn subscribe_current_accounts(
+    config: &Config,
+    pump_accounts: &[String],
+    pumpswap_pools: &[String],
+    raydium_accounts: &[String],
+    meteora_accounts: &[String],
+    whirlpool_accounts: &[String],
+    pumpswap_vault_to_pool: &HashMap<String, (String, bool)>,
+    raydium_vault_to_pool: &HashMap<String, (String, bool)>,
+    raydium_clmm_tick_array_to_pool: &HashMap<String, (String, i32)>,
+    meteora_vault_to_pool: &HashMap<String, (String, bool)>,
+    meteora_bin_array_to_pool: &HashMap<String, (String, i64)>,
+    whirlpool_tick_array_to_pool: &HashMap<String, (String, i32)>,
+) -> mpsc::Receiver<subscribe::AccountUpdate> {
+    let pumpswap_vaults: Vec<String> = pumpswap_vault_to_pool.keys().cloned().collect();
+    let raydium_vaults: Vec<String> = raydium_vault_to_pool.keys().cloned().collect();
+    let raydium_clmm_tick_array_accounts: Vec<String> =
+        raydium_clmm_tick_array_to_pool.keys().cloned().collect();
+    let meteora_vaults: Vec<String> = meteora_vault_to_pool.keys().cloned().collect();
+    let meteora_bin_array_accounts: Vec<String> =
+        meteora_bin_array_to_pool.keys().cloned().collect();
+    let whirlpool_tick_array_accounts: Vec<String> =
+        whirlpool_tick_array_to_pool.keys().cloned().collect();
+
+    subscribe::subscribe_accounts(
+        config.clone(),
+        pump_accounts.to_vec(),
+        pumpswap_pools.to_vec(),
+        pumpswap_vaults,
+        raydium_vaults,
+        raydium_clmm_tick_array_accounts,
+        meteora_vaults,
+        meteora_bin_array_accounts,
+        meteora_accounts.to_vec(),
+        raydium_accounts.to_vec(),
+        whirlpool_tick_array_accounts,
+        whirlpool_accounts.to_vec(),
+    )
+}
+
+fn direct_processing_backlog_high_watermark(config: &Config) -> usize {
+    let capacity = config.subscription.effective_channel_capacity();
+    (capacity / 4)
+        .max(DIRECT_PROCESS_BACKLOG_HIGH_WATERMARK_MIN)
+        .min(capacity)
+}
+
+fn direct_processing_backlog_low_watermark(config: &Config) -> usize {
+    let capacity = config.subscription.effective_channel_capacity();
+    let high_watermark = direct_processing_backlog_high_watermark(config);
+    (capacity / 8)
+        .max(DIRECT_PROCESS_BACKLOG_LOW_WATERMARK_MIN)
+        .min(high_watermark.saturating_sub(1).max(1))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_account_update(
+    update: subscribe::AccountUpdate,
+    _execution_manager: &ExecutionManager,
+    _execution_scope: &ExecutionScope,
+    config: &Config,
+    account_metadata: &HashMap<String, market_universe::AccountMetadata>,
+    metadata_warnings: &mut HashSet<String>,
+    pump_state: &mut HashMap<String, PumpState>,
+    pumpswap_state: &mut HashMap<String, PumpSwapState>,
+    raydium_state: &mut HashMap<String, RaydiumState>,
+    meteora_state: &mut HashMap<String, MeteoraState>,
+    whirlpool_state: &mut HashMap<String, WhirlpoolState>,
+    pump_by_token: &mut HashMap<String, Vec<String>>,
+    pumpswap_by_token: &mut HashMap<String, Vec<String>>,
+    raydium_by_token: &mut HashMap<String, Vec<String>>,
+    meteora_by_token: &mut HashMap<String, Vec<String>>,
+    whirlpool_by_token: &mut HashMap<String, Vec<String>>,
+    pumpswap_vault_to_pool: &mut HashMap<String, (String, bool)>,
+    raydium_vault_to_pool: &mut HashMap<String, (String, bool)>,
+    raydium_clmm_tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+    raydium_clmm_tick_arrays: &mut HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    meteora_vault_to_pool: &mut HashMap<String, (String, bool)>,
+    meteora_bin_array_to_pool: &mut HashMap<String, (String, i64)>,
+    meteora_bin_arrays: &mut HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+    whirlpool_tick_arrays: &mut HashMap<String, WhirlpoolTickArrayState>,
+    dirty_direct_tokens: &mut HashSet<String>,
+    hydrated_supporting_pools: &mut HashSet<String>,
+    _pumpswap_fee_config: Option<&pumpswap::PumpSwapGlobalFeeConfig>,
+    stats: &mut RuntimeStats,
+    sol_price: f64,
+) {
+    match update.kind {
+        AccountKind::Pump => {
+            stats.pump_updates += 1;
+            match pump::parse_pump_state(&update.data) {
+                Ok(mut state) => {
+                    let first_seen = !pump_state.contains_key(&update.pubkey);
+                    apply_pump_metadata(
+                        &update.pubkey,
+                        &mut state,
+                        account_metadata,
+                        metadata_warnings,
+                        stats,
+                    );
+                    let price_changed = pump_state
+                        .get(&update.pubkey)
+                        .map(|old| {
+                            old.sol_reserve != state.sol_reserve
+                                || old.token_reserve != state.token_reserve
+                        })
+                        .unwrap_or(true);
+
+                    if price_changed {
+                        let token_mint = state.token_mint.clone();
+                        state.update_price_history();
+                        let price = state.calculate_price();
+                        tracing::debug!(
+                            "Pump {} price: ${:.8}",
+                            &update.pubkey[..8],
+                            price * sol_price
+                        );
+
+                        if pump_curve_is_active(&state) {
+                            upsert_index(pump_by_token, &token_mint, &update.pubkey);
+                        } else {
+                            remove_index_value(pump_by_token, &token_mint, &update.pubkey);
+                        }
+                        mark_token_for_scan(config, dirty_direct_tokens, stats, &token_mint);
+
+                        pump_state.insert(update.pubkey.clone(), state);
+                        if first_seen
+                            && token_has_program_pair_route(
+                                config,
+                                &token_mint,
+                                pump_by_token,
+                                pumpswap_by_token,
+                                raydium_by_token,
+                                meteora_by_token,
+                                whirlpool_by_token,
+                            )
+                        {
+                            hydrate_routeable_token_supporting_accounts(
+                                config,
+                                &token_mint,
+                                pumpswap_state,
+                                raydium_state,
+                                meteora_state,
+                                whirlpool_state,
+                                pumpswap_by_token,
+                                raydium_by_token,
+                                meteora_by_token,
+                                whirlpool_by_token,
+                                pumpswap_vault_to_pool,
+                                raydium_vault_to_pool,
+                                raydium_clmm_tick_array_to_pool,
+                                raydium_clmm_tick_arrays,
+                                meteora_vault_to_pool,
+                                meteora_bin_array_to_pool,
+                                meteora_bin_arrays,
+                                whirlpool_tick_array_to_pool,
+                                whirlpool_tick_arrays,
+                                hydrated_supporting_pools,
+                                stats,
+                            )
+                            .await;
+                        }
+                    } else {
+                        stats.unchanged_updates += 1;
+                    }
+                }
+                Err(e) => {
+                    stats.pump_parse_errors += 1;
+                    tracing::warn!("解析 Pump 账户失败：{}", e);
+                }
+            }
+        }
+        AccountKind::Raydium => {
+            stats.raydium_updates += 1;
+            match raydium::parse_raydium_state(&update.data, &update.pubkey) {
+                Ok(mut state) => {
+                    let first_seen = !raydium_state.contains_key(&update.pubkey);
+                    if let Some(existing) = raydium_state.get(&update.pubkey) {
+                        state.base_reserve = existing.base_reserve;
+                        state.quote_reserve = existing.quote_reserve;
+                    }
+                    index_raydium_vaults(&update.pubkey, &state, raydium_vault_to_pool);
+                    index_raydium_clmm_tick_arrays(
+                        &update.pubkey,
+                        &state,
+                        Some(&update.data),
+                        raydium_clmm_tick_array_to_pool,
+                    );
+                    validate_raydium_metadata(
+                        &update.pubkey,
+                        &state,
+                        account_metadata,
+                        metadata_warnings,
+                        stats,
+                    );
+                    let price = state.calculate_price();
+                    tracing::debug!(
+                        "Raydium {} price: ${:.8}",
+                        &update.pubkey[..8],
+                        price * sol_price
+                    );
+                    state.update_price_history();
+
+                    let traded_token = strategy::quote::raydium_traded_token(
+                        &state,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                    );
+                    if let Some(token_mint) = traded_token.as_ref() {
+                        tracing::debug!(
+                            "Raydium 池映射：池={}，币种={}，base={}，quote={}",
+                            &update.pubkey[..8],
+                            &token_mint[..8],
+                            &state.base_mint[..8],
+                            &state.quote_mint[..8]
+                        );
+                        upsert_index(raydium_by_token, token_mint, &update.pubkey);
+                        mark_token_for_scan(config, dirty_direct_tokens, stats, token_mint);
+                    } else {
+                        stats.route_misses += 1;
+                    }
+
+                    raydium_state.insert(update.pubkey.clone(), state);
+                    if let Some(token_mint) = traded_token {
+                        if first_seen
+                            && token_has_program_pair_route(
+                                config,
+                                &token_mint,
+                                pump_by_token,
+                                pumpswap_by_token,
+                                raydium_by_token,
+                                meteora_by_token,
+                                whirlpool_by_token,
+                            )
+                        {
+                            hydrate_routeable_token_supporting_accounts(
+                                config,
+                                &token_mint,
+                                pumpswap_state,
+                                raydium_state,
+                                meteora_state,
+                                whirlpool_state,
+                                pumpswap_by_token,
+                                raydium_by_token,
+                                meteora_by_token,
+                                whirlpool_by_token,
+                                pumpswap_vault_to_pool,
+                                raydium_vault_to_pool,
+                                raydium_clmm_tick_array_to_pool,
+                                raydium_clmm_tick_arrays,
+                                meteora_vault_to_pool,
+                                meteora_bin_array_to_pool,
+                                meteora_bin_arrays,
+                                whirlpool_tick_array_to_pool,
+                                whirlpool_tick_arrays,
+                                hydrated_supporting_pools,
+                                stats,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    stats.raydium_parse_errors += 1;
+                    tracing::warn!("解析 Raydium 账户失败：{}", e);
+                }
+            }
+        }
+        AccountKind::RaydiumClmmTickArray => {
+            stats.raydium_clmm_tick_array_updates += 1;
+            if update.data.is_empty() {
+                tracing::debug!("忽略空的 Raydium CLMM tick数组更新：{}", update.pubkey);
+                return;
+            }
+            match raydium_clmm::parse_tick_array(&update.data) {
+                Ok(state) => {
+                    raydium_clmm_tick_arrays.insert(update.pubkey, state);
+                }
+                Err(e) => {
+                    stats.raydium_clmm_tick_array_parse_errors += 1;
+                    tracing::warn!("解析 Raydium CLMM tick数组失败：{}", e);
+                }
+            }
+        }
+        AccountKind::RaydiumVault => {
+            stats.raydium_vault_updates += 1;
+            let Some((pool_address, is_base_vault)) =
+                raydium_vault_to_pool.get(&update.pubkey).cloned()
+            else {
+                stats.route_misses += 1;
+                return;
+            };
+
+            match pumpswap::parse_token_account_amount(&update.data) {
+                Ok(amount) => {
+                    let Some(raydium) = raydium_state.get_mut(&pool_address) else {
+                        stats.route_misses += 1;
+                        return;
+                    };
+
+                    if is_base_vault {
+                        raydium.base_reserve = amount;
+                    } else {
+                        raydium.quote_reserve = amount;
+                    }
+                    raydium.update_price_history();
+
+                    if let Some(token_mint) = strategy::quote::raydium_traded_token(
+                        raydium,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                    ) {
+                        upsert_index(raydium_by_token, &token_mint, &pool_address);
+                        mark_token_for_scan(config, dirty_direct_tokens, stats, &token_mint);
+                    } else {
+                        stats.route_misses += 1;
+                    }
+                }
+                Err(e) => {
+                    stats.raydium_parse_errors += 1;
+                    tracing::warn!("解析 Raydium vault 失败：{}", e);
+                }
+            }
+        }
+        AccountKind::PumpSwapPool => {
+            stats.pumpswap_pool_updates += 1;
+            match pumpswap::parse_pumpswap_pool(&update.data, &update.pubkey) {
+                Ok(mut state) => {
+                    let first_seen = !pumpswap_state.contains_key(&update.pubkey);
+                    if let Some(existing) = pumpswap_state.get(&update.pubkey) {
+                        state.base_reserve = existing.base_reserve;
+                        state.quote_reserve = existing.quote_reserve;
+                    }
+                    index_pumpswap_pool(
+                        config,
+                        &update.pubkey,
+                        &state,
+                        pumpswap_by_token,
+                        pumpswap_vault_to_pool,
+                    );
+                    let traded_token =
+                        state.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint);
+                    if let Some(token_mint) = traded_token.as_ref() {
+                        mark_token_for_scan(config, dirty_direct_tokens, stats, token_mint);
+                    }
+                    pumpswap_state.insert(update.pubkey.clone(), state);
+                    if let Some(token_mint) = traded_token {
+                        if first_seen
+                            && token_has_program_pair_route(
+                                config,
+                                &token_mint,
+                                pump_by_token,
+                                pumpswap_by_token,
+                                raydium_by_token,
+                                meteora_by_token,
+                                whirlpool_by_token,
+                            )
+                        {
+                            hydrate_routeable_token_supporting_accounts(
+                                config,
+                                &token_mint,
+                                pumpswap_state,
+                                raydium_state,
+                                meteora_state,
+                                whirlpool_state,
+                                pumpswap_by_token,
+                                raydium_by_token,
+                                meteora_by_token,
+                                whirlpool_by_token,
+                                pumpswap_vault_to_pool,
+                                raydium_vault_to_pool,
+                                raydium_clmm_tick_array_to_pool,
+                                raydium_clmm_tick_arrays,
+                                meteora_vault_to_pool,
+                                meteora_bin_array_to_pool,
+                                meteora_bin_arrays,
+                                whirlpool_tick_array_to_pool,
+                                whirlpool_tick_arrays,
+                                hydrated_supporting_pools,
+                                stats,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    stats.pumpswap_parse_errors += 1;
+                    tracing::warn!("解析 PumpSwap 池失败：{}", e);
+                }
+            }
+        }
+        AccountKind::PumpSwapVault => {
+            stats.pumpswap_vault_updates += 1;
+            let Some((pool_address, is_base_vault)) =
+                pumpswap_vault_to_pool.get(&update.pubkey).cloned()
+            else {
+                stats.route_misses += 1;
+                return;
+            };
+
+            match pumpswap::parse_token_account_amount(&update.data) {
+                Ok(amount) => {
+                    let Some(pumpswap) = pumpswap_state.get_mut(&pool_address) else {
+                        stats.route_misses += 1;
+                        return;
+                    };
+
+                    if is_base_vault {
+                        pumpswap.base_reserve = amount;
+                    } else {
+                        pumpswap.quote_reserve = amount;
+                    }
+                    pumpswap.update_price_history();
+
+                    if let Some(token_mint) =
+                        pumpswap.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+                    {
+                        mark_token_for_scan(config, dirty_direct_tokens, stats, &token_mint);
+                    } else {
+                        stats.route_misses += 1;
+                    }
+                }
+                Err(e) => {
+                    stats.pumpswap_parse_errors += 1;
+                    tracing::warn!("解析 PumpSwap vault 失败：{}", e);
+                }
+            }
+        }
+        AccountKind::Meteora => {
+            stats.meteora_updates += 1;
+            match meteora_damm_v2::parse_meteora_damm_v2_state(&update.data, &update.pubkey)
+                .or_else(|_| meteora::parse_meteora_state(&update.data, &update.pubkey))
+            {
+                Ok(mut state) => {
+                    let first_seen = !meteora_state.contains_key(&update.pubkey);
+                    if let Some(existing) = meteora_state.get(&update.pubkey) {
+                        state.token_x_amount = existing.token_x_amount;
+                        state.token_y_amount = existing.token_y_amount;
+                    }
+                    index_meteora_pool(
+                        config,
+                        &update.pubkey,
+                        &state,
+                        meteora_by_token,
+                        meteora_vault_to_pool,
+                        meteora_bin_array_to_pool,
+                    );
+                    state.update_price_history();
+                    let traded_token =
+                        state.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint);
+                    if let Some(token_mint) = traded_token.as_ref() {
+                        mark_token_for_scan(config, dirty_direct_tokens, stats, token_mint);
+                    }
+                    meteora_state.insert(update.pubkey.clone(), state);
+                    if let Some(token_mint) = traded_token {
+                        if first_seen
+                            && token_has_program_pair_route(
+                                config,
+                                &token_mint,
+                                pump_by_token,
+                                pumpswap_by_token,
+                                raydium_by_token,
+                                meteora_by_token,
+                                whirlpool_by_token,
+                            )
+                        {
+                            hydrate_routeable_token_supporting_accounts(
+                                config,
+                                &token_mint,
+                                pumpswap_state,
+                                raydium_state,
+                                meteora_state,
+                                whirlpool_state,
+                                pumpswap_by_token,
+                                raydium_by_token,
+                                meteora_by_token,
+                                whirlpool_by_token,
+                                pumpswap_vault_to_pool,
+                                raydium_vault_to_pool,
+                                raydium_clmm_tick_array_to_pool,
+                                raydium_clmm_tick_arrays,
+                                meteora_vault_to_pool,
+                                meteora_bin_array_to_pool,
+                                meteora_bin_arrays,
+                                whirlpool_tick_array_to_pool,
+                                whirlpool_tick_arrays,
+                                hydrated_supporting_pools,
+                                stats,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    stats.meteora_parse_errors += 1;
+                    tracing::warn!("解析 Meteora 池失败：{}", e);
+                }
+            }
+        }
+        AccountKind::MeteoraVault => {
+            stats.meteora_vault_updates += 1;
+            let Some((pool_address, is_x_vault)) =
+                meteora_vault_to_pool.get(&update.pubkey).cloned()
+            else {
+                stats.route_misses += 1;
+                return;
+            };
+
+            match pumpswap::parse_token_account_amount(&update.data) {
+                Ok(amount) => {
+                    let Some(meteora) = meteora_state.get_mut(&pool_address) else {
+                        stats.route_misses += 1;
+                        return;
+                    };
+                    if is_x_vault {
+                        meteora.token_x_amount = amount;
+                    } else {
+                        meteora.token_y_amount = amount;
+                    }
+                    meteora.update_price_history();
+
+                    if let Some(token_mint) =
+                        meteora.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+                    {
+                        mark_token_for_scan(config, dirty_direct_tokens, stats, &token_mint);
+                    } else {
+                        stats.route_misses += 1;
+                    }
+                }
+                Err(e) => {
+                    stats.meteora_parse_errors += 1;
+                    tracing::warn!("解析 Meteora vault 失败：{}", e);
+                }
+            }
+        }
+        AccountKind::MeteoraBinArray => {
+            stats.meteora_bin_array_updates += 1;
+            if update.data.is_empty() {
+                tracing::debug!("忽略空的 Meteora bin数组更新：{}", update.pubkey);
+                return;
+            }
+            match meteora::parse_bin_array(&update.data) {
+                Ok(state) => {
+                    meteora_bin_arrays.insert(update.pubkey.clone(), state);
+                }
+                Err(e) => {
+                    stats.meteora_bin_array_parse_errors += 1;
+                    tracing::warn!("解析 Meteora bin数组失败：{}", e);
+                }
+            }
+        }
+        AccountKind::Whirlpool => {
+            stats.whirlpool_updates += 1;
+            match whirlpool::parse_whirlpool_state(&update.data, &update.pubkey) {
+                Ok(mut state) => {
+                    let first_seen = !whirlpool_state.contains_key(&update.pubkey);
+                    index_whirlpool_pool(
+                        config,
+                        &update.pubkey,
+                        &state,
+                        whirlpool_by_token,
+                        whirlpool_tick_array_to_pool,
+                    );
+                    state.update_price_history(
+                        default_decimals(&state.token_mint_a) as u8,
+                        default_decimals(&state.token_mint_b) as u8,
+                    );
+                    let traded_token =
+                        state.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint);
+                    if let Some(token_mint) = traded_token.as_ref() {
+                        mark_token_for_scan(config, dirty_direct_tokens, stats, &token_mint);
+                    }
+                    whirlpool_state.insert(update.pubkey.clone(), state);
+                    if let Some(token_mint) = traded_token {
+                        if first_seen
+                            && token_has_program_pair_route(
+                                config,
+                                &token_mint,
+                                pump_by_token,
+                                pumpswap_by_token,
+                                raydium_by_token,
+                                meteora_by_token,
+                                whirlpool_by_token,
+                            )
+                        {
+                            hydrate_routeable_token_supporting_accounts(
+                                config,
+                                &token_mint,
+                                pumpswap_state,
+                                raydium_state,
+                                meteora_state,
+                                whirlpool_state,
+                                pumpswap_by_token,
+                                raydium_by_token,
+                                meteora_by_token,
+                                whirlpool_by_token,
+                                pumpswap_vault_to_pool,
+                                raydium_vault_to_pool,
+                                raydium_clmm_tick_array_to_pool,
+                                raydium_clmm_tick_arrays,
+                                meteora_vault_to_pool,
+                                meteora_bin_array_to_pool,
+                                meteora_bin_arrays,
+                                whirlpool_tick_array_to_pool,
+                                whirlpool_tick_arrays,
+                                hydrated_supporting_pools,
+                                stats,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    stats.whirlpool_parse_errors += 1;
+                    tracing::warn!("解析 Whirlpool 池失败：{}", e);
+                }
+            }
+        }
+        AccountKind::WhirlpoolTickArray => {
+            stats.whirlpool_tick_array_updates += 1;
+            if update.data.is_empty() {
+                tracing::debug!("忽略空的 Whirlpool tick数组更新：{}", update.pubkey);
+                return;
+            }
+            match whirlpool::parse_tick_array(&update.data) {
+                Ok(state) => {
+                    whirlpool_tick_arrays.insert(update.pubkey, state);
+                }
+                Err(e) => {
+                    stats.whirlpool_tick_array_parse_errors += 1;
+                    tracing::warn!("解析 Whirlpool tick数组失败：{}", e);
+                }
+            }
+        }
+    }
+}
+
+fn token_has_program_pair_route(
+    config: &Config,
+    token_mint: &str,
+    pump_by_token: &HashMap<String, Vec<String>>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+) -> bool {
+    if !should_scan_direct_token(config, token_mint) {
+        return false;
+    }
+
+    let mut matched = 0usize;
+    if pump_by_token.contains_key(token_mint) {
+        matched += 1;
+    }
+    if pumpswap_by_token.contains_key(token_mint) {
+        matched += 1;
+    }
+    if raydium_by_token.contains_key(token_mint) {
+        matched += 1;
+    }
+    if meteora_by_token.contains_key(token_mint) {
+        matched += 1;
+    }
+    if whirlpool_by_token.contains_key(token_mint) {
+        matched += 1;
+    }
+
+    matched >= config.discovery.min_routeable_dex_count.max(2)
+}
+
+fn limited_token_pools(
+    pools_by_token: &HashMap<String, Vec<String>>,
+    token_mint: &str,
+    limit: usize,
+) -> Vec<String> {
+    pools_by_token
+        .get(token_mint)
+        .into_iter()
+        .flat_map(|pools| pools.iter())
+        .take(limit.max(1))
+        .cloned()
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_routeable_token_supporting_accounts(
+    config: &Config,
+    token_mint: &str,
+    pumpswap_state: &mut HashMap<String, PumpSwapState>,
+    raydium_state: &mut HashMap<String, RaydiumState>,
+    meteora_state: &mut HashMap<String, MeteoraState>,
+    _whirlpool_state: &mut HashMap<String, WhirlpoolState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &mut HashMap<String, Vec<String>>,
+    meteora_by_token: &mut HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+    _pumpswap_vault_to_pool: &HashMap<String, (String, bool)>,
+    raydium_vault_to_pool: &HashMap<String, (String, bool)>,
+    raydium_clmm_tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+    raydium_clmm_tick_arrays: &mut HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    meteora_vault_to_pool: &HashMap<String, (String, bool)>,
+    meteora_bin_array_to_pool: &HashMap<String, (String, i64)>,
+    meteora_bin_arrays: &mut HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_tick_array_to_pool: &HashMap<String, (String, i32)>,
+    whirlpool_tick_arrays: &mut HashMap<String, WhirlpoolTickArrayState>,
+    hydrated_supporting_pools: &mut HashSet<String>,
+    stats: &mut RuntimeStats,
+) {
+    let per_venue_limit = config.discovery.max_pairs_per_token.max(1).min(3);
+    let meteora_limit = config
+        .strategy
+        .max_meteora_pools_per_token_for_direct_scan
+        .max(1)
+        .min(3);
+    let mut hydrated_now = 0usize;
+
+    for pool_address in limited_token_pools(pumpswap_by_token, token_mint, per_venue_limit) {
+        if hydrated_supporting_pools.insert(pool_address.clone()) {
+            hydrate_pumpswap_pool_supporting_accounts(config, &pool_address, pumpswap_state, stats)
+                .await;
+            hydrated_now += 1;
+        }
+    }
+
+    for pool_address in limited_token_pools(raydium_by_token, token_mint, per_venue_limit) {
+        if hydrated_supporting_pools.insert(pool_address.clone()) {
+            hydrate_raydium_pool_supporting_accounts(
+                config,
+                &pool_address,
+                raydium_state,
+                raydium_by_token,
+                raydium_vault_to_pool,
+                raydium_clmm_tick_array_to_pool,
+                raydium_clmm_tick_arrays,
+                stats,
+            )
+            .await;
+            hydrated_now += 1;
+        }
+    }
+
+    for pool_address in limited_token_pools(meteora_by_token, token_mint, meteora_limit) {
+        if hydrated_supporting_pools.insert(pool_address.clone()) {
+            hydrate_meteora_pool_supporting_accounts(
+                config,
+                &pool_address,
+                meteora_state,
+                meteora_by_token,
+                meteora_vault_to_pool,
+                meteora_bin_array_to_pool,
+                meteora_bin_arrays,
+                stats,
+            )
+            .await;
+            hydrated_now += 1;
+        }
+    }
+
+    for pool_address in limited_token_pools(whirlpool_by_token, token_mint, per_venue_limit) {
+        if hydrated_supporting_pools.insert(pool_address.clone()) {
+            hydrate_whirlpool_pool_supporting_accounts(
+                config,
+                &pool_address,
+                whirlpool_tick_array_to_pool,
+                whirlpool_tick_arrays,
+                stats,
+            )
+            .await;
+            hydrated_now += 1;
+        }
+    }
+
+    if hydrated_now > 0 {
+        tracing::debug!(
+            "已加载路由辅助账户：币种={}，池数={}",
+            token_mint,
+            hydrated_now
+        );
+    }
+}
+
+async fn hydrate_pumpswap_pool_supporting_accounts(
+    config: &Config,
+    pool_address: &str,
+    pumpswap_state: &mut HashMap<String, PumpSwapState>,
+    stats: &mut RuntimeStats,
+) {
+    let Some(state) = pumpswap_state.get(pool_address) else {
+        return;
+    };
+    let accounts = vec![state.base_vault.clone(), state.quote_vault.clone()];
+    let account_data = match rpc::get_multiple_accounts_data(&config.rpc.http_url, &accounts).await
+    {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!(
+                "拉取 PumpSwap 配套账户失败：池={}，原因={}",
+                pool_address,
+                e
+            );
+            return;
+        }
+    };
+
+    let Some(state) = pumpswap_state.get_mut(pool_address) else {
+        return;
+    };
+    if let Some(data) = account_data.get(&state.base_vault) {
+        match pumpswap::parse_token_account_amount(data) {
+            Ok(amount) => state.base_reserve = amount,
+            Err(e) => {
+                stats.pumpswap_parse_errors += 1;
+                tracing::warn!(
+                    "解析 PumpSwap base vault 失败：池={}，原因={}",
+                    pool_address,
+                    e
+                );
+            }
+        }
+    }
+    if let Some(data) = account_data.get(&state.quote_vault) {
+        match pumpswap::parse_token_account_amount(data) {
+            Ok(amount) => state.quote_reserve = amount,
+            Err(e) => {
+                stats.pumpswap_parse_errors += 1;
+                tracing::warn!(
+                    "解析 PumpSwap quote vault 失败：池={}，原因={}",
+                    pool_address,
+                    e
+                );
+            }
+        }
+    }
+    state.update_price_history();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_raydium_pool_supporting_accounts(
+    config: &Config,
+    pool_address: &str,
+    raydium_state: &mut HashMap<String, RaydiumState>,
+    raydium_by_token: &mut HashMap<String, Vec<String>>,
+    raydium_vault_to_pool: &HashMap<String, (String, bool)>,
+    raydium_clmm_tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+    raydium_clmm_tick_arrays: &mut HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    stats: &mut RuntimeStats,
+) {
+    let clmm_tick_spacing = raydium_state.get(pool_address).and_then(|state| {
+        (state.venue == RaydiumVenue::Clmm)
+            .then_some(state.tick_spacing)
+            .flatten()
+    });
+    if let Some(tick_spacing) = clmm_tick_spacing {
+        hydrate_raydium_clmm_bitmap_extension_tick_array_index_for_pool(
+            config,
+            pool_address,
+            tick_spacing,
+            raydium_clmm_tick_array_to_pool,
+            stats,
+        )
+        .await;
+    }
+
+    let vault_accounts = raydium_vault_to_pool
+        .iter()
+        .filter(|(_, (pool, _))| pool == pool_address)
+        .map(|(account, _)| account.clone())
+        .collect::<Vec<_>>();
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &vault_accounts).await {
+        Ok(vault_data) => {
+            for (vault, (pool, is_base_vault)) in raydium_vault_to_pool {
+                if pool != pool_address {
+                    continue;
+                }
+                let Some(data) = vault_data.get(vault) else {
+                    continue;
+                };
+                match pumpswap::parse_token_account_amount(data) {
+                    Ok(amount) => {
+                        if let Some(state) = raydium_state.get_mut(pool_address) {
+                            if *is_base_vault {
+                                state.base_reserve = amount;
+                            } else {
+                                state.quote_reserve = amount;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        stats.raydium_parse_errors += 1;
+                        tracing::warn!(
+                            "解析 Raydium vault 失败：池={}，vault={}，原因={}",
+                            pool_address,
+                            vault,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("拉取 Raydium vault 失败：池={}，原因={}", pool_address, e),
+    }
+
+    let tick_array_accounts = raydium_clmm_tick_array_to_pool
+        .iter()
+        .filter(|(_, (pool, _))| pool == pool_address)
+        .map(|(account, _)| account.clone())
+        .collect::<Vec<_>>();
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &tick_array_accounts).await {
+        Ok(tick_data) => {
+            for (address, data) in tick_data {
+                match raydium_clmm::parse_tick_array(&data) {
+                    Ok(state) => {
+                        raydium_clmm_tick_arrays.insert(address, state);
+                    }
+                    Err(e) => {
+                        stats.raydium_clmm_tick_array_parse_errors += 1;
+                        tracing::warn!(
+                            "解析 Raydium tick数组失败：池={}，原因={}",
+                            pool_address,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("拉取 Raydium tick数组失败：池={}，原因={}", pool_address, e),
+    }
+
+    if let Some(state) = raydium_state.get_mut(pool_address) {
+        state.update_price_history();
+        if let Some(token_mint) = strategy::quote::raydium_traded_token(
+            state,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+        ) {
+            upsert_index(raydium_by_token, &token_mint, pool_address);
+        }
+    }
+}
+
+async fn hydrate_whirlpool_pool_supporting_accounts(
+    config: &Config,
+    pool_address: &str,
+    whirlpool_tick_array_to_pool: &HashMap<String, (String, i32)>,
+    whirlpool_tick_arrays: &mut HashMap<String, WhirlpoolTickArrayState>,
+    stats: &mut RuntimeStats,
+) {
+    let tick_array_accounts = whirlpool_tick_array_to_pool
+        .iter()
+        .filter(|(_, (pool, _))| pool == pool_address)
+        .map(|(account, _)| account.clone())
+        .collect::<Vec<_>>();
+    if tick_array_accounts.is_empty() {
+        return;
+    }
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &tick_array_accounts).await {
+        Ok(tick_data) => {
+            for (address, data) in tick_data {
+                match whirlpool::parse_tick_array(&data) {
+                    Ok(state) => {
+                        tracing::debug!(
+                            "已加载 Whirlpool tick数组：{}，start={}，已初始化={}",
+                            &address[..address.len().min(8)],
+                            state.start_tick_index,
+                            state.initialized_tick_count
+                        );
+                        whirlpool_tick_arrays.insert(address, state);
+                    }
+                    Err(e) => {
+                        stats.whirlpool_tick_array_parse_errors += 1;
+                        tracing::warn!(
+                            "解析 Whirlpool tick数组失败：池={}，原因={}",
+                            pool_address,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!(
+            "拉取 Whirlpool tick数组失败：池={}，原因={}",
+            pool_address,
+            e
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_meteora_pool_supporting_accounts(
+    config: &Config,
+    pool_address: &str,
+    meteora_state: &mut HashMap<String, MeteoraState>,
+    meteora_by_token: &mut HashMap<String, Vec<String>>,
+    meteora_vault_to_pool: &HashMap<String, (String, bool)>,
+    meteora_bin_array_to_pool: &HashMap<String, (String, i64)>,
+    meteora_bin_arrays: &mut HashMap<String, meteora::MeteoraBinArrayState>,
+    stats: &mut RuntimeStats,
+) {
+    let vault_accounts = meteora_vault_to_pool
+        .iter()
+        .filter(|(_, (pool, _))| pool == pool_address)
+        .map(|(account, _)| account.clone())
+        .collect::<Vec<_>>();
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &vault_accounts).await {
+        Ok(vault_data) => {
+            for (vault, (pool, is_x_vault)) in meteora_vault_to_pool {
+                if pool != pool_address {
+                    continue;
+                }
+                let Some(data) = vault_data.get(vault) else {
+                    continue;
+                };
+                match pumpswap::parse_token_account_amount(data) {
+                    Ok(amount) => {
+                        if let Some(state) = meteora_state.get_mut(pool_address) {
+                            if *is_x_vault {
+                                state.token_x_amount = amount;
+                            } else {
+                                state.token_y_amount = amount;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        stats.meteora_parse_errors += 1;
+                        tracing::warn!(
+                            "解析 Meteora vault 失败：池={}，vault={}，原因={}",
+                            pool_address,
+                            vault,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("拉取 Meteora vault 失败：池={}，原因={}", pool_address, e),
+    }
+
+    let bin_array_accounts = meteora_bin_array_to_pool
+        .iter()
+        .filter(|(_, (pool, _))| pool == pool_address)
+        .map(|(account, _)| account.clone())
+        .collect::<Vec<_>>();
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &bin_array_accounts).await {
+        Ok(bin_data) => {
+            for (address, data) in bin_data {
+                match meteora::parse_bin_array(&data) {
+                    Ok(state) => {
+                        meteora_bin_arrays.insert(address, state);
+                    }
+                    Err(e) => {
+                        stats.meteora_bin_array_parse_errors += 1;
+                        tracing::warn!("解析 Meteora bin数组失败：池={}，原因={}", pool_address, e);
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("拉取 Meteora bin数组失败：池={}，原因={}", pool_address, e),
+    }
+
+    if let Some(state) = meteora_state.get_mut(pool_address) {
+        state.update_price_history();
+        if let Some(token_mint) =
+            state.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        {
+            upsert_index(meteora_by_token, &token_mint, pool_address);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_monitoring_status(
+    config: &Config,
+    stats: &RuntimeStats,
+    pump_state: &HashMap<String, PumpState>,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_state: &HashMap<String, WhirlpoolState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    pump_by_token: &HashMap<String, Vec<String>>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+    pending_direct_token_count: usize,
+    queued_updates: usize,
+    monitoring_started_at: Instant,
+    last_account_update_at: Option<Instant>,
+) {
+    let idle_message = match last_account_update_at {
+        Some(last_update_at) => format!("最近更新 {} 秒前", last_update_at.elapsed().as_secs()),
+        None => format!(
+            "已启动 {} 秒，暂未收到更新",
+            monitoring_started_at.elapsed().as_secs()
+        ),
+    };
+    let tracked_markets = pump_state.len()
+        + pumpswap_state.len()
+        + raydium_state.len()
+        + meteora_state.len()
+        + whirlpool_state.len();
+    let support_accounts =
+        raydium_clmm_tick_arrays.len() + meteora_bin_arrays.len() + whirlpool_tick_arrays.len();
+    let routeable_tokens = routeable_token_count(
+        pump_by_token,
+        pumpswap_by_token,
+        raydium_by_token,
+        meteora_by_token,
+        whirlpool_by_token,
+        config.discovery.min_routeable_dex_count,
+    );
+    tracing::info!(
+        "状态：{}，更新={}，slot={}，队列={}，待扫币种={}，市场={}，辅助账户={}，可路由币种={}，已验证={}，利润不足={}，构建失败={}，最佳={}",
+        idle_message,
+        stats.updates,
+        stats.latest_slot,
+        queued_updates,
+        pending_direct_token_count,
+        tracked_markets,
+        support_accounts,
+        routeable_tokens,
+        stats.validated_checks,
+        stats.rejected_below_threshold,
+        stats.tx_build_blocked,
+        format_best_route(stats.best_route.as_ref()),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_log_heartbeat(
+    config: &Config,
+    stats: &RuntimeStats,
+    pump_state: &HashMap<String, PumpState>,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_state: &HashMap<String, WhirlpoolState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    pump_by_token: &HashMap<String, Vec<String>>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+) {
+    if config.logging.heartbeat_interval == 0
+        || stats.updates % config.logging.heartbeat_interval != 0
+    {
+        return;
+    }
+
+    let best_route = format_best_route(stats.best_route.as_ref());
+    let tracked_markets = pump_state.len()
+        + pumpswap_state.len()
+        + raydium_state.len()
+        + meteora_state.len()
+        + whirlpool_state.len();
+    let support_accounts =
+        raydium_clmm_tick_arrays.len() + meteora_bin_arrays.len() + whirlpool_tick_arrays.len();
+    let routeable_tokens = routeable_token_count(
+        pump_by_token,
+        pumpswap_by_token,
+        raydium_by_token,
+        meteora_by_token,
+        whirlpool_by_token,
+        config.discovery.min_routeable_dex_count,
+    );
+    let parse_errors = stats.pump_parse_errors
+        + stats.pumpswap_parse_errors
+        + stats.raydium_parse_errors
+        + stats.raydium_clmm_tick_array_parse_errors
+        + stats.meteora_parse_errors
+        + stats.meteora_bin_array_parse_errors
+        + stats.whirlpool_parse_errors
+        + stats.whirlpool_tick_array_parse_errors;
+    tracing::debug!(
+        "心跳：更新={}，slot={}，已加载={}，市场={}，辅助账户={}，可路由币种={}，通过={}，跳过={}，解析错误={}，最佳={}",
+        stats.updates,
+        stats.latest_slot,
+        stats.hydrated_accounts,
+        tracked_markets,
+        support_accounts,
+        routeable_tokens,
+        stats.validated_checks,
+        stats.rejected_below_threshold,
+        parse_errors,
+        best_route,
+    );
+}
+
+fn prune_runtime_state(stats: &mut RuntimeStats, now: Instant) {
+    let candidate_logs = prune_candidate_log_map(&mut stats.candidate_logs, now, CANDIDATE_LOG_TTL);
+    let execution_attempts =
+        prune_candidate_log_map(&mut stats.execution_attempts, now, EXECUTION_ATTEMPT_TTL);
+    let direct_token_feedback = prune_candidate_log_map(
+        &mut stats.direct_token_feedback,
+        now,
+        DIRECT_TOKEN_FEEDBACK_TTL,
+    );
+    let direct_pair_feedback = prune_candidate_log_map(
+        &mut stats.direct_pair_feedback,
+        now,
+        DIRECT_PAIR_FEEDBACK_TTL,
+    );
+    let direct_path_cooldowns = prune_direct_path_cooldowns(&mut stats.direct_path_cooldowns, now);
+    let program_pair_path_feedback = prune_program_pair_path_feedback_map(
+        &mut stats.program_pair_path_feedback,
+        now,
+        PROGRAM_PAIR_PATH_FEEDBACK_TTL,
+    );
+    let route_hit_rate =
+        prune_route_hit_rate_map(&mut stats.route_hit_rate, now, ROUTE_HIT_RATE_TTL);
+    let total_pruned = candidate_logs
+        + execution_attempts
+        + direct_token_feedback
+        + direct_pair_feedback
+        + direct_path_cooldowns
+        + program_pair_path_feedback
+        + route_hit_rate;
+
+    prune_token_selection_map(&mut stats.token_selection, now);
+
+    if total_pruned > 0 {
+        tracing::debug!(
+            "清理运行缓存：候选={}，发送记录={}，币种反馈={}，池对反馈={}，路径冷却={}，程序路径反馈={}，命中率={}，合计={}",
+            candidate_logs,
+            execution_attempts,
+            direct_token_feedback,
+            direct_pair_feedback,
+            direct_path_cooldowns,
+            program_pair_path_feedback,
+            route_hit_rate,
+            total_pruned,
+        );
+    }
+}
+
+async fn prune_ephemeral_caches(now: Instant) {
+    let ata_entries = {
+        let mut cache = ATA_EXISTENCE_CACHE.write().await;
+        let before = cache.entries.len();
+        cache.entries.retain(|_, timestamp| {
+            now.saturating_duration_since(*timestamp) < ATA_EXISTENCE_CACHE_DURATION
+        });
+        before.saturating_sub(cache.entries.len())
+    };
+    let meteora_bitmap_entries = {
+        let mut cache = METEORA_BITMAP_EXTENSION_CACHE.write().await;
+        let before = cache.entries.len();
+        cache.entries.retain(|_, (_, timestamp)| {
+            now.saturating_duration_since(*timestamp) < ATA_EXISTENCE_CACHE_DURATION
+        });
+        before.saturating_sub(cache.entries.len())
+    };
+    let meteora_bitmap_state_entries = {
+        let mut cache = METEORA_BITMAP_EXTENSION_STATE_CACHE.write().await;
+        let before = cache.entries.len();
+        cache.entries.retain(|_, (_, timestamp)| {
+            now.saturating_duration_since(*timestamp) < ATA_EXISTENCE_CACHE_DURATION
+        });
+        before.saturating_sub(cache.entries.len())
+    };
+    let token_balance_entries = {
+        let mut cache = TOKEN_ACCOUNT_BALANCE_CACHE.write().await;
+        let before = cache.balances.len();
+        cache.balances.retain(|_, (_, timestamp)| {
+            now.saturating_duration_since(*timestamp) < TOKEN_ACCOUNT_BALANCE_CACHE_DURATION
+        });
+        before.saturating_sub(cache.balances.len())
+    };
+    let wallet_balance_entries = {
+        let mut cache = WALLET_BALANCE_CACHE.write().await;
+        let before = cache.balances.len();
+        cache.balances.retain(|_, (_, timestamp)| {
+            now.saturating_duration_since(*timestamp) < WALLET_BALANCE_CACHE_DURATION
+        });
+        before.saturating_sub(cache.balances.len())
+    };
+    let token_2022_fee_entries = {
+        let mut cache = TOKEN_2022_TRANSFER_FEE_CONFIG_CACHE.write().unwrap();
+        let before = cache.entries.len();
+        cache.entries.retain(|_, (_, timestamp)| {
+            now.saturating_duration_since(*timestamp) < TOKEN_2022_TRANSFER_FEE_CACHE_DURATION
+        });
+        before.saturating_sub(cache.entries.len())
+    };
+    let total_pruned = ata_entries
+        + meteora_bitmap_entries
+        + meteora_bitmap_state_entries
+        + token_balance_entries
+        + wallet_balance_entries
+        + token_2022_fee_entries;
+    if total_pruned > 0 {
+        tracing::debug!(
+            "清理临时缓存：ATA={}，Meteora位图={}，位图状态={}，代币余额={}，钱包余额={}，Token2022费用={}，合计={}",
+            ata_entries,
+            meteora_bitmap_entries,
+            meteora_bitmap_state_entries,
+            token_balance_entries,
+            wallet_balance_entries,
+            token_2022_fee_entries,
+            total_pruned,
+        );
+    }
+}
+
+fn prune_candidate_log_map(
+    entries: &mut HashMap<String, CandidateLogState>,
+    now: Instant,
+    ttl: Duration,
+) -> usize {
+    let before = entries.len();
+    entries.retain(|_, state| now.saturating_duration_since(state.last_seen) < ttl);
+    before.saturating_sub(entries.len())
+}
+
+fn prune_program_pair_path_feedback_map(
+    entries: &mut HashMap<String, ProgramPairPathFeedbackState>,
+    now: Instant,
+    ttl: Duration,
+) -> usize {
+    let before = entries.len();
+    entries.retain(|_, state| now.saturating_duration_since(state.last_seen) < ttl);
+    before.saturating_sub(entries.len())
+}
+
+fn prune_route_hit_rate_map(
+    entries: &mut HashMap<String, RouteHitRateState>,
+    now: Instant,
+    ttl: Duration,
+) -> usize {
+    let before = entries.len();
+    entries.retain(|_, state| now.saturating_duration_since(state.last_seen) < ttl);
+    before.saturating_sub(entries.len())
+}
+
+fn prune_direct_path_cooldowns(
+    entries: &mut HashMap<String, DirectPathCooldownState>,
+    now: Instant,
+) -> usize {
+    let before = entries.len();
+    entries.retain(|_, state| state.cooldown_until > now);
+    before.saturating_sub(entries.len())
+}
+
+fn prune_token_selection_map(entries: &mut HashMap<String, TokenSelectionState>, now: Instant) {
+    const TOKEN_SELECTION_ACTIVITY_TTL: Duration = Duration::from_secs(600);
+    entries.retain(|_, state| {
+        while let Some(front) = state.recent_updates.front().copied() {
+            if now.saturating_duration_since(front) > TOKEN_SELECTION_ACTIVITY_TTL {
+                state.recent_updates.pop_front();
+            } else {
+                break;
+            }
+        }
+        !state.recent_updates.is_empty()
+            || state.selection_count > 0
+            || state.exact_candidate_count > 0
+            || state.send_attempt_count > 0
+            || state.send_success_count > 0
+    });
+}
+
+async fn hydrate_pumpswap_fee_config(config: &Config) -> Option<pumpswap::PumpSwapGlobalFeeConfig> {
+    let global_config = match executor::swap::pump_amm_global_config_address() {
+        Ok(address) => address.to_string(),
+        Err(e) => {
+            tracing::warn!("推导 Pump AMM 配置账户失败：{}", e);
+            return None;
+        }
+    };
+
+    let accounts = vec![global_config.clone()];
+    let account_data = match rpc::get_multiple_accounts_data(&config.rpc.http_url, &accounts).await
+    {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!("加载 Pump AMM 配置失败：{}", e);
+            return None;
+        }
+    };
+
+    let Some(data) = account_data.get(&global_config) else {
+        tracing::warn!("没有找到 Pump AMM 配置账户：{}", global_config);
+        return None;
+    };
+
+    match pumpswap::parse_global_config_fee_recipients(data) {
+        Ok(fee_config) => {
+            let buyback_recipients = if fee_config.buyback_basis_points > 0 {
+                Some(
+                    fee_config
+                        .buyback_fee_recipients
+                        .iter()
+                        .filter_map(|recipient| Pubkey::from_str(recipient).ok())
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            };
+            let buyback_recipient_count = buyback_recipients
+                .as_ref()
+                .map_or(0, |recipients| recipients.len());
+            let _ = PUMP_AMM_BUYBACK_FEE_RECIPIENTS.set(buyback_recipients);
+            tracing::debug!(
+                "已加载 Pump AMM 配置：账户={}，协议收款={}，mayhem={}，预留收款={}，回购bps={}，回购账户数={}",
+                global_config,
+                fee_config.protocol_fee_recipient,
+                fee_config.mayhem_mode_enabled,
+                format_optional_log_value(fee_config.reserved_fee_recipient.as_deref()),
+                fee_config.buyback_basis_points,
+                buyback_recipient_count,
+            );
+            Some(fee_config)
+        }
+        Err(e) => {
+            tracing::warn!("解析 Pump AMM 配置失败：{}", e);
+            None
+        }
+    }
+}
+
+async fn hydrate_initial_state(
+    config: &Config,
+    pump_accounts: &[String],
+    pumpswap_pools: &[String],
+    raydium_accounts: &[String],
+    meteora_accounts: &[String],
+    whirlpool_accounts: &[String],
+    metadata: &HashMap<String, market_universe::AccountMetadata>,
+    warnings: &mut HashSet<String>,
+    pump_state: &mut HashMap<String, PumpState>,
+    pumpswap_state: &mut HashMap<String, PumpSwapState>,
+    raydium_state: &mut HashMap<String, RaydiumState>,
+    meteora_state: &mut HashMap<String, MeteoraState>,
+    whirlpool_state: &mut HashMap<String, WhirlpoolState>,
+    pump_by_token: &mut HashMap<String, Vec<String>>,
+    pumpswap_by_token: &mut HashMap<String, Vec<String>>,
+    raydium_by_token: &mut HashMap<String, Vec<String>>,
+    meteora_by_token: &mut HashMap<String, Vec<String>>,
+    whirlpool_by_token: &mut HashMap<String, Vec<String>>,
+    pumpswap_vault_to_pool: &mut HashMap<String, (String, bool)>,
+    raydium_vault_to_pool: &mut HashMap<String, (String, bool)>,
+    raydium_clmm_tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+    raydium_clmm_tick_arrays: &mut HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    meteora_vault_to_pool: &mut HashMap<String, (String, bool)>,
+    meteora_bin_array_to_pool: &mut HashMap<String, (String, i64)>,
+    meteora_bin_arrays: &mut HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+    whirlpool_tick_arrays: &mut HashMap<String, WhirlpoolTickArrayState>,
+    stats: &mut RuntimeStats,
+) {
+    let accounts: Vec<String> = pump_accounts
+        .iter()
+        .chain(pumpswap_pools.iter())
+        .chain(raydium_accounts.iter())
+        .chain(meteora_accounts.iter())
+        .chain(whirlpool_accounts.iter())
+        .cloned()
+        .collect();
+
+    if accounts.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        "加载初始账户：数量={}，RPC={}",
+        accounts.len(),
+        config.rpc.http_url
+    );
+
+    let account_data = match rpc::get_multiple_accounts_data(&config.rpc.http_url, &accounts).await
+    {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!("加载初始账户失败：{}", e);
+            return;
+        }
+    };
+
+    for account in pump_accounts {
+        let Some(data) = account_data.get(account) else {
+            continue;
+        };
+
+        match pump::parse_pump_state(data) {
+            Ok(mut state) => {
+                apply_pump_metadata(account, &mut state, metadata, warnings, stats);
+                state.update_price_history();
+                if pump_curve_is_active(&state) {
+                    upsert_index(pump_by_token, &state.token_mint, account);
+                }
+                pump_state.insert(account.clone(), state);
+                stats.hydrated_accounts += 1;
+            }
+            Err(e) => {
+                stats.pump_parse_errors += 1;
+                tracing::warn!("加载 Pump 账户失败：账户={}，原因={}", account, e);
+            }
+        }
+    }
+
+    for account in raydium_accounts {
+        let Some(data) = account_data.get(account) else {
+            continue;
+        };
+
+        match raydium::parse_raydium_state(data, account) {
+            Ok(mut state) => {
+                validate_raydium_metadata(account, &state, metadata, warnings, stats);
+                index_raydium_vaults(account, &state, raydium_vault_to_pool);
+                index_raydium_clmm_tick_arrays(
+                    account,
+                    &state,
+                    Some(data),
+                    raydium_clmm_tick_array_to_pool,
+                );
+                state.update_price_history();
+                if let Some(token_mint) = strategy::quote::raydium_traded_token(
+                    &state,
+                    &config.tokens.usdc_mint,
+                    &config.tokens.sol_mint,
+                ) {
+                    upsert_index(raydium_by_token, &token_mint, account);
+                }
+                raydium_state.insert(account.clone(), state);
+                stats.hydrated_accounts += 1;
+            }
+            Err(e) => {
+                stats.raydium_parse_errors += 1;
+                tracing::warn!("加载 Raydium 账户失败：账户={}，原因={}", account, e);
+            }
+        }
+    }
+
+    hydrate_raydium_clmm_bitmap_extension_tick_array_indexes(
+        config,
+        raydium_state,
+        raydium_clmm_tick_array_to_pool,
+        stats,
+    )
+    .await;
+
+    let raydium_clmm_tick_array_accounts: Vec<String> =
+        raydium_clmm_tick_array_to_pool.keys().cloned().collect();
+    if !raydium_clmm_tick_array_accounts.is_empty() {
+        tracing::debug!(
+            "加载 Raydium CLMM tick数组：数量={}，RPC={}",
+            raydium_clmm_tick_array_accounts.len(),
+            config.rpc.http_url
+        );
+    }
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &raydium_clmm_tick_array_accounts)
+        .await
+    {
+        Ok(tick_array_data) => {
+            let loaded_count = tick_array_data.len();
+            for (address, data) in tick_array_data {
+                match raydium_clmm::parse_tick_array(&data) {
+                    Ok(state) => {
+                        tracing::debug!(
+                            "已加载 Raydium CLMM tick数组：{}，start={}，已初始化={}",
+                            &address[..address.len().min(8)],
+                            state.start_tick_index,
+                            state.initialized_tick_count
+                        );
+                        raydium_clmm_tick_arrays.insert(address, state);
+                    }
+                    Err(e) => {
+                        stats.raydium_clmm_tick_array_parse_errors += 1;
+                        tracing::warn!("加载 Raydium CLMM tick数组失败：{}", e);
+                    }
+                }
+            }
+            if !raydium_clmm_tick_array_accounts.is_empty() {
+                tracing::debug!(
+                    "Raydium CLMM tick数组加载完成：候选={}，找到={}，已解析={}",
+                    raydium_clmm_tick_array_accounts.len(),
+                    loaded_count,
+                    raydium_clmm_tick_arrays.len()
+                );
+            }
+            if !raydium_clmm_tick_array_accounts.is_empty() && loaded_count == 0 {
+                tracing::warn!("Raydium CLMM tick数组没有加载到账户，报价会暂时跳过");
+            }
+        }
+        Err(e) => tracing::warn!("加载 Raydium CLMM tick数组失败：{}", e),
+    }
+
+    let raydium_vaults: Vec<String> = raydium_vault_to_pool.keys().cloned().collect();
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &raydium_vaults).await {
+        Ok(vault_data) => {
+            for (vault, (pool_address, is_base_vault)) in raydium_vault_to_pool.iter() {
+                let Some(data) = vault_data.get(vault) else {
+                    continue;
+                };
+                let Ok(amount) = pumpswap::parse_token_account_amount(data) else {
+                    stats.raydium_parse_errors += 1;
+                    continue;
+                };
+                if let Some(state) = raydium_state.get_mut(pool_address) {
+                    if *is_base_vault {
+                        state.base_reserve = amount;
+                    } else {
+                        state.quote_reserve = amount;
+                    }
+                    state.update_price_history();
+                    if let Some(token_mint) = strategy::quote::raydium_traded_token(
+                        state,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                    ) {
+                        upsert_index(raydium_by_token, &token_mint, pool_address);
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("加载 Raydium vault 失败：{}", e),
+    }
+
+    let mut pumpswap_vaults = Vec::new();
+    for account in pumpswap_pools {
+        let Some(data) = account_data.get(account) else {
+            continue;
+        };
+
+        match pumpswap::parse_pumpswap_pool(data, account) {
+            Ok(mut state) => {
+                index_pumpswap_pool(
+                    config,
+                    account,
+                    &state,
+                    pumpswap_by_token,
+                    pumpswap_vault_to_pool,
+                );
+                pumpswap_vaults.push(state.base_vault.clone());
+                pumpswap_vaults.push(state.quote_vault.clone());
+                state.update_price_history();
+                pumpswap_state.insert(account.clone(), state);
+                stats.hydrated_accounts += 1;
+            }
+            Err(e) => {
+                stats.pumpswap_parse_errors += 1;
+                tracing::warn!("加载 PumpSwap 池失败：池={}，原因={}", account, e);
+            }
+        }
+    }
+
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &pumpswap_vaults).await {
+        Ok(vault_data) => {
+            for (vault, (pool_address, is_base_vault)) in pumpswap_vault_to_pool.iter() {
+                let Some(data) = vault_data.get(vault) else {
+                    continue;
+                };
+                let Ok(amount) = pumpswap::parse_token_account_amount(data) else {
+                    continue;
+                };
+                if let Some(state) = pumpswap_state.get_mut(pool_address) {
+                    if *is_base_vault {
+                        state.base_reserve = amount;
+                    } else {
+                        state.quote_reserve = amount;
+                    }
+                    state.update_price_history();
+                }
+            }
+        }
+        Err(e) => tracing::warn!("加载 PumpSwap vault 失败：{}", e),
+    }
+
+    let mut meteora_vaults = Vec::new();
+    for account in meteora_accounts {
+        let Some(data) = account_data.get(account) else {
+            continue;
+        };
+
+        match meteora_damm_v2::parse_meteora_damm_v2_state(data, account)
+            .or_else(|_| meteora::parse_meteora_state(data, account))
+        {
+            Ok(mut state) => {
+                index_meteora_pool(
+                    config,
+                    account,
+                    &state,
+                    meteora_by_token,
+                    meteora_vault_to_pool,
+                    meteora_bin_array_to_pool,
+                );
+                meteora_vaults.push(state.reserve_x.clone());
+                meteora_vaults.push(state.reserve_y.clone());
+                state.update_price_history();
+                meteora_state.insert(account.clone(), state);
+                stats.hydrated_accounts += 1;
+            }
+            Err(e) => {
+                stats.meteora_parse_errors += 1;
+                tracing::warn!("加载 Meteora 池失败：池={}，原因={}", account, e);
+            }
+        }
+    }
+
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &meteora_vaults).await {
+        Ok(vault_data) => {
+            for (vault, (pool_address, is_x_vault)) in meteora_vault_to_pool.iter() {
+                let Some(data) = vault_data.get(vault) else {
+                    continue;
+                };
+                let Ok(amount) = pumpswap::parse_token_account_amount(data) else {
+                    stats.meteora_parse_errors += 1;
+                    continue;
+                };
+                if let Some(state) = meteora_state.get_mut(pool_address) {
+                    if *is_x_vault {
+                        state.token_x_amount = amount;
+                    } else {
+                        state.token_y_amount = amount;
+                    }
+                    state.update_price_history();
+                }
+            }
+        }
+        Err(e) => tracing::warn!("加载 Meteora vault 失败：{}", e),
+    }
+
+    let meteora_bin_array_accounts: Vec<String> =
+        meteora_bin_array_to_pool.keys().cloned().collect();
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &meteora_bin_array_accounts).await {
+        Ok(bin_array_data) => {
+            for (address, data) in bin_array_data {
+                match meteora::parse_bin_array(&data) {
+                    Ok(state) => {
+                        tracing::debug!(
+                            "已加载 Meteora bin数组：{}，index={}，bins={}",
+                            &address[..address.len().min(8)],
+                            state.index,
+                            state.bins.len()
+                        );
+                        meteora_bin_arrays.insert(address, state);
+                    }
+                    Err(e) => {
+                        stats.meteora_bin_array_parse_errors += 1;
+                        tracing::warn!("加载 Meteora bin数组失败：{}", e);
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("加载 Meteora bin数组失败：{}", e),
+    }
+
+    for account in whirlpool_accounts {
+        let Some(data) = account_data.get(account) else {
+            continue;
+        };
+
+        match whirlpool::parse_whirlpool_state(data, account) {
+            Ok(mut state) => {
+                index_whirlpool_pool(
+                    config,
+                    account,
+                    &state,
+                    whirlpool_by_token,
+                    whirlpool_tick_array_to_pool,
+                );
+                state.update_price_history(
+                    default_decimals(&state.token_mint_a) as u8,
+                    default_decimals(&state.token_mint_b) as u8,
+                );
+                whirlpool_state.insert(account.clone(), state);
+                stats.hydrated_accounts += 1;
+            }
+            Err(e) => {
+                stats.whirlpool_parse_errors += 1;
+                tracing::warn!("加载 Whirlpool 池失败：池={}，原因={}", account, e);
+            }
+        }
+    }
+
+    let whirlpool_tick_array_accounts: Vec<String> =
+        whirlpool_tick_array_to_pool.keys().cloned().collect();
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &whirlpool_tick_array_accounts)
+        .await
+    {
+        Ok(tick_array_data) => {
+            for (address, data) in tick_array_data {
+                match whirlpool::parse_tick_array(&data) {
+                    Ok(state) => {
+                        tracing::debug!(
+                            "已加载 Whirlpool tick数组：{}，start={}，已初始化={}",
+                            &address[..address.len().min(8)],
+                            state.start_tick_index,
+                            state.initialized_tick_count
+                        );
+                        whirlpool_tick_arrays.insert(address, state);
+                    }
+                    Err(e) => {
+                        stats.whirlpool_tick_array_parse_errors += 1;
+                        tracing::warn!("加载 Whirlpool tick数组失败：{}", e);
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("加载 Whirlpool tick数组失败：{}", e),
+    }
+
+    tracing::info!(
+        "初始账户加载完成：账户={}，市场=Pump {}、PumpSwap {}、Raydium {}、Meteora {}、Whirlpool {}，辅助账户=CLMM tick {}、Meteora bin {}、Whirlpool tick {}，可路由币种={}",
+        stats.hydrated_accounts,
+        pump_state.len(),
+        pumpswap_state.len(),
+        raydium_state.len(),
+        meteora_state.len(),
+        whirlpool_state.len(),
+        raydium_clmm_tick_arrays.len(),
+        meteora_bin_arrays.len(),
+        whirlpool_tick_arrays.len(),
+        routeable_token_count(
+            pump_by_token,
+            pumpswap_by_token,
+            raydium_by_token,
+            meteora_by_token,
+            whirlpool_by_token,
+            config.discovery.min_routeable_dex_count,
+        )
+    );
+
+    log_missing_routes(
+        config,
+        raydium_by_token,
+        pumpswap_by_token,
+        meteora_by_token,
+        whirlpool_by_token,
+        raydium_state,
+        metadata,
+    );
+}
+
+fn apply_pump_metadata(
+    pubkey: &str,
+    state: &mut PumpState,
+    metadata: &HashMap<String, market_universe::AccountMetadata>,
+    warnings: &mut HashSet<String>,
+    stats: &mut RuntimeStats,
+) {
+    let Some(meta) = metadata.get(pubkey) else {
+        return;
+    };
+
+    let Some(expected_mint) = &meta.token_mint else {
+        return;
+    };
+
+    if state.token_mint != *expected_mint {
+        stats.metadata_overrides += 1;
+        if warnings.insert(format!("pump_override_{pubkey}")) {
+            tracing::debug!(
+                "修正 Pump 元数据：账户={}，标签={}，来源={}，解析币种={}，配置币种={}",
+                pubkey,
+                meta.label,
+                meta.source,
+                state.token_mint,
+                expected_mint
+            );
+        }
+        state.token_mint = expected_mint.clone();
+    }
+}
+
+fn pump_curve_is_active(state: &PumpState) -> bool {
+    state.sol_reserve > 0 && state.token_reserve > 0
+}
+
+fn validate_raydium_metadata(
+    pubkey: &str,
+    state: &RaydiumState,
+    metadata: &HashMap<String, market_universe::AccountMetadata>,
+    warnings: &mut HashSet<String>,
+    stats: &mut RuntimeStats,
+) {
+    let Some(meta) = metadata.get(pubkey) else {
+        return;
+    };
+
+    let expected_base = meta.base_mint.as_deref();
+    let expected_quote = meta.quote_mint.as_deref();
+    let matches_expected = match (expected_base, expected_quote) {
+        (Some(base), Some(quote)) => {
+            (state.base_mint == base && state.quote_mint == quote)
+                || (state.base_mint == quote && state.quote_mint == base)
+        }
+        _ => true,
+    };
+
+    if !matches_expected {
+        stats.metadata_mismatches += 1;
+        if warnings.insert(format!("raydium_mismatch_{pubkey}")) {
+            tracing::warn!(
+                "Raydium 元数据不一致：账户={}，标签={}，dex={:?}，解析=({}/{})，配置=({:?}/{:?})",
+                pubkey,
+                meta.label,
+                meta.dex_id,
+                state.base_mint,
+                state.quote_mint,
+                expected_base,
+                expected_quote
+            );
+        }
+    }
+}
+
+fn upsert_index(index: &mut HashMap<String, Vec<String>>, token_mint: &str, address: &str) {
+    let addresses = index.entry(token_mint.to_string()).or_default();
+    if !addresses.iter().any(|existing| existing == address) {
+        addresses.push(address.to_string());
+    }
+}
+
+fn remove_index_value(index: &mut HashMap<String, Vec<String>>, token_mint: &str, address: &str) {
+    let Some(addresses) = index.get_mut(token_mint) else {
+        return;
+    };
+    addresses.retain(|existing| existing != address);
+    if addresses.is_empty() {
+        index.remove(token_mint);
+    }
+}
+
+fn index_pumpswap_pool(
+    config: &Config,
+    pool_address: &str,
+    state: &PumpSwapState,
+    pumpswap_by_token: &mut HashMap<String, Vec<String>>,
+    pumpswap_vault_to_pool: &mut HashMap<String, (String, bool)>,
+) {
+    if let Some(token_mint) = state.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    {
+        upsert_index(pumpswap_by_token, &token_mint, pool_address);
+    }
+    pumpswap_vault_to_pool.insert(state.base_vault.clone(), (pool_address.to_string(), true));
+    pumpswap_vault_to_pool.insert(state.quote_vault.clone(), (pool_address.to_string(), false));
+}
+
+fn index_raydium_vaults(
+    pool_address: &str,
+    state: &RaydiumState,
+    raydium_vault_to_pool: &mut HashMap<String, (String, bool)>,
+) {
+    if let Some(base_vault) = &state.base_vault {
+        raydium_vault_to_pool.insert(base_vault.clone(), (pool_address.to_string(), true));
+    }
+    if let Some(quote_vault) = &state.quote_vault {
+        raydium_vault_to_pool.insert(quote_vault.clone(), (pool_address.to_string(), false));
+    }
+}
+
+fn index_raydium_clmm_tick_arrays(
+    pool_address: &str,
+    state: &RaydiumState,
+    pool_data: Option<&[u8]>,
+    tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+) {
+    if state.venue != RaydiumVenue::Clmm {
+        return;
+    }
+
+    let Some(tick_spacing) = state.tick_spacing else {
+        return;
+    };
+
+    let mut indexed_from_pool_bitmap = 0usize;
+    if raydium_clmm_index_pool_bitmap_tick_arrays() {
+        if let Some(data) = pool_data {
+            match raydium_clmm::initialized_tick_array_start_indexes_from_pool_state(
+                data,
+                tick_spacing,
+            )
+            .and_then(|starts| {
+                raydium_clmm::derive_tick_array_addresses_for_start_indexes(pool_address, &starts)
+            }) {
+                Ok(addresses) => {
+                    indexed_from_pool_bitmap = index_raydium_clmm_tick_array_addresses(
+                        pool_address,
+                        addresses,
+                        tick_array_to_pool,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "索引 Raydium CLMM 池位图 tick数组失败：池={}，原因={}",
+                        pool_address,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(tick_current) = state.tick_current {
+        let count_each_side = raydium_clmm_hydrate_tick_arrays_each_side();
+        match raydium_clmm::derive_nearby_tick_array_addresses(
+            pool_address,
+            tick_current,
+            tick_spacing,
+            count_each_side,
+        ) {
+            Ok(addresses) => {
+                let indexed_nearby = addresses.len();
+                index_raydium_clmm_tick_array_addresses(
+                    pool_address,
+                    addresses,
+                    tick_array_to_pool,
+                );
+                tracing::debug!(
+                    "已索引 Raydium CLMM tick数组候选：池={}，当前tick={}，间距={}，两侧={}，附近={}，位图={}，合计={}",
+                    pool_address,
+                    tick_current,
+                    tick_spacing,
+                    count_each_side,
+                    indexed_nearby,
+                    indexed_from_pool_bitmap,
+                    tick_array_to_pool
+                        .values()
+                        .filter(|(pool, _)| pool == pool_address)
+                        .count()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "推导 Raydium CLMM 附近 tick数组失败：池={}，原因={}",
+                    pool_address,
+                    e
+                );
+            }
+        }
+    } else if indexed_from_pool_bitmap > 0 {
+        tracing::debug!(
+            "已索引 Raydium CLMM 池位图 tick数组：池={}，间距={}，位图={}，合计={}",
+            pool_address,
+            tick_spacing,
+            indexed_from_pool_bitmap,
+            tick_array_to_pool
+                .values()
+                .filter(|(pool, _)| pool == pool_address)
+                .count()
+        );
+    }
+}
+
+fn index_raydium_clmm_tick_array_addresses(
+    pool_address: &str,
+    addresses: Vec<(String, i32)>,
+    tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+) -> usize {
+    let mut inserted = 0usize;
+    let max_per_pool = max_raydium_clmm_tracked_tick_arrays_per_pool();
+    let mut tracked_for_pool = tick_array_to_pool
+        .values()
+        .filter(|(pool, _)| pool == pool_address)
+        .count();
+    for (address, start_index) in addresses {
+        if tick_array_to_pool.contains_key(&address) {
+            tick_array_to_pool.insert(address, (pool_address.to_string(), start_index));
+            continue;
+        }
+        if tracked_for_pool >= max_per_pool {
+            continue;
+        }
+        tick_array_to_pool.insert(address, (pool_address.to_string(), start_index));
+        tracked_for_pool += 1;
+        inserted += 1;
+    }
+    inserted
+}
+
+async fn hydrate_raydium_clmm_bitmap_extension_tick_array_indexes(
+    config: &Config,
+    raydium_state: &HashMap<String, RaydiumState>,
+    raydium_clmm_tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+    stats: &mut RuntimeStats,
+) {
+    if !raydium_clmm_hydrate_bitmap_extensions() {
+        return;
+    }
+
+    let mut extension_to_pool = HashMap::new();
+    for (pool_address, state) in raydium_state {
+        if state.venue != RaydiumVenue::Clmm {
+            continue;
+        }
+        let Some(tick_spacing) = state.tick_spacing else {
+            continue;
+        };
+        match raydium_clmm::derive_tickarray_bitmap_extension_address(pool_address) {
+            Ok(extension_address) => {
+                extension_to_pool.insert(extension_address, (pool_address.clone(), tick_spacing));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "推导 Raydium CLMM 位图扩展失败：池={}，原因={}",
+                    pool_address,
+                    e
+                );
+            }
+        }
+    }
+
+    if extension_to_pool.is_empty() {
+        return;
+    }
+
+    let now = Instant::now();
+    let extension_accounts: Vec<String> = {
+        let cache = RAYDIUM_CLMM_BITMAP_EXTENSION_HYDRATION_CACHE.read().await;
+        extension_to_pool
+            .keys()
+            .filter(|address| {
+                cache
+                    .get(*address)
+                    .map(|last_hydrated| {
+                        now.saturating_duration_since(*last_hydrated)
+                            >= RAYDIUM_CLMM_BITMAP_EXTENSION_HYDRATION_TTL
+                    })
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect()
+    };
+    if extension_accounts.is_empty() {
+        return;
+    }
+    tracing::debug!(
+        "加载 Raydium CLMM 位图扩展：数量={}，RPC={}",
+        extension_accounts.len(),
+        config.rpc.http_url
+    );
+
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &extension_accounts).await {
+        Ok(extension_data) => {
+            {
+                let mut cache = RAYDIUM_CLMM_BITMAP_EXTENSION_HYDRATION_CACHE.write().await;
+                for address in &extension_accounts {
+                    cache.insert(address.clone(), now);
+                }
+            }
+            let loaded_count = extension_data.len();
+            let mut indexed_count = 0usize;
+            for (address, data) in extension_data {
+                let Some((pool_address, tick_spacing)) = extension_to_pool.get(&address) else {
+                    continue;
+                };
+                match raydium_clmm::initialized_tick_array_start_indexes_from_bitmap_extension(
+                    &data,
+                    *tick_spacing,
+                )
+                .and_then(|starts| {
+                    raydium_clmm::derive_tick_array_addresses_for_start_indexes(
+                        pool_address,
+                        &starts,
+                    )
+                    .map(|addresses| (starts, addresses))
+                }) {
+                    Ok((starts, addresses)) => {
+                        let inserted = index_raydium_clmm_tick_array_addresses(
+                            pool_address,
+                            addresses,
+                            raydium_clmm_tick_array_to_pool,
+                        );
+                        indexed_count += inserted;
+                        tracing::debug!(
+                            "已加载 Raydium CLMM 位图扩展：{}，池={}，已初始化tick数组={}，新增={}",
+                            &address[..address.len().min(8)],
+                            pool_address,
+                            starts.len(),
+                            inserted
+                        );
+                    }
+                    Err(e) => {
+                        stats.raydium_clmm_tick_array_parse_errors += 1;
+                        tracing::warn!(
+                            "解析 Raydium CLMM 位图扩展失败：账户={}，原因={}",
+                            address,
+                            e
+                        );
+                    }
+                }
+            }
+
+            tracing::debug!(
+                "Raydium CLMM 位图扩展加载完成：候选={}，找到={}，新增tick数组={}",
+                extension_accounts.len(),
+                loaded_count,
+                indexed_count
+            );
+        }
+        Err(e) => tracing::warn!("加载 Raydium CLMM 位图扩展失败：{}", e),
+    }
+}
+
+async fn hydrate_raydium_clmm_bitmap_extension_tick_array_index_for_pool(
+    config: &Config,
+    pool_address: &str,
+    tick_spacing: u16,
+    raydium_clmm_tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+    stats: &mut RuntimeStats,
+) {
+    if !raydium_clmm_hydrate_bitmap_extensions() {
+        return;
+    }
+
+    let extension_address =
+        match raydium_clmm::derive_tickarray_bitmap_extension_address(pool_address) {
+            Ok(address) => address,
+            Err(e) => {
+                tracing::warn!(
+                    "推导 Raydium CLMM 位图扩展失败：池={}，原因={}",
+                    pool_address,
+                    e
+                );
+                return;
+            }
+        };
+
+    let now = Instant::now();
+    let should_hydrate = {
+        let cache = RAYDIUM_CLMM_BITMAP_EXTENSION_HYDRATION_CACHE.read().await;
+        cache
+            .get(&extension_address)
+            .map(|last_hydrated| {
+                now.saturating_duration_since(*last_hydrated)
+                    >= RAYDIUM_CLMM_BITMAP_EXTENSION_HYDRATION_TTL
+            })
+            .unwrap_or(true)
+    };
+    if !should_hydrate {
+        return;
+    }
+
+    match rpc::get_multiple_accounts_data(&config.rpc.http_url, &[extension_address.clone()]).await
+    {
+        Ok(extension_data) => {
+            {
+                let mut cache = RAYDIUM_CLMM_BITMAP_EXTENSION_HYDRATION_CACHE.write().await;
+                cache.insert(extension_address.clone(), now);
+            }
+
+            let Some(data) = extension_data.get(&extension_address) else {
+                return;
+            };
+            match raydium_clmm::initialized_tick_array_start_indexes_from_bitmap_extension(
+                data,
+                tick_spacing,
+            )
+            .and_then(|starts| {
+                raydium_clmm::derive_tick_array_addresses_for_start_indexes(pool_address, &starts)
+                    .map(|addresses| (starts, addresses))
+            }) {
+                Ok((starts, addresses)) => {
+                    let inserted = index_raydium_clmm_tick_array_addresses(
+                        pool_address,
+                        addresses,
+                        raydium_clmm_tick_array_to_pool,
+                    );
+                    tracing::debug!(
+                        "已加载 Raydium CLMM 位图扩展：{}，池={}，已初始化tick数组={}，新增={}",
+                        &extension_address[..extension_address.len().min(8)],
+                        pool_address,
+                        starts.len(),
+                        inserted
+                    );
+                }
+                Err(e) => {
+                    stats.raydium_clmm_tick_array_parse_errors += 1;
+                    tracing::warn!(
+                        "解析 Raydium CLMM 位图扩展失败：账户={}，原因={}",
+                        extension_address,
+                        e
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(
+            "加载 Raydium CLMM 位图扩展失败：池={}，原因={}",
+            pool_address,
+            e
+        ),
+    }
+}
+
+fn index_meteora_pool(
+    config: &Config,
+    pool_address: &str,
+    state: &MeteoraState,
+    meteora_by_token: &mut HashMap<String, Vec<String>>,
+    meteora_vault_to_pool: &mut HashMap<String, (String, bool)>,
+    meteora_bin_array_to_pool: &mut HashMap<String, (String, i64)>,
+) {
+    if let Some(token_mint) = state.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    {
+        upsert_index(meteora_by_token, &token_mint, pool_address);
+    }
+    meteora_vault_to_pool.insert(state.reserve_x.clone(), (pool_address.to_string(), true));
+    meteora_vault_to_pool.insert(state.reserve_y.clone(), (pool_address.to_string(), false));
+    if state.is_damm_v2() {
+        return;
+    }
+    match meteora::derive_nearby_bin_array_addresses(
+        pool_address,
+        state.active_id,
+        METEORA_NEARBY_BIN_ARRAYS_EACH_SIDE,
+    ) {
+        Ok(addresses) => {
+            let max_per_pool = max_meteora_tracked_bin_arrays_per_pool();
+            let mut tracked_for_pool = meteora_bin_array_to_pool
+                .values()
+                .filter(|(pool, _)| pool == pool_address)
+                .count();
+            for (address, index) in addresses {
+                let is_new = !meteora_bin_array_to_pool.contains_key(&address);
+                if is_new && tracked_for_pool >= max_per_pool {
+                    continue;
+                }
+                meteora_bin_array_to_pool.insert(address, (pool_address.to_string(), index));
+                if is_new {
+                    tracked_for_pool += 1;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("推导 Meteora bin数组失败：池={}，原因={}", pool_address, e);
+        }
+    }
+}
+
+fn index_whirlpool_pool(
+    config: &Config,
+    pool_address: &str,
+    state: &WhirlpoolState,
+    whirlpool_by_token: &mut HashMap<String, Vec<String>>,
+    whirlpool_tick_array_to_pool: &mut HashMap<String, (String, i32)>,
+) {
+    if let Some(token_mint) = state.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    {
+        upsert_index(whirlpool_by_token, &token_mint, pool_address);
+    }
+
+    match whirlpool::derive_nearby_tick_array_addresses(
+        pool_address,
+        state.tick_current_index,
+        state.tick_spacing,
+        2,
+    ) {
+        Ok(addresses) => {
+            for (address, start_tick_index) in addresses {
+                whirlpool_tick_array_to_pool
+                    .insert(address, (pool_address.to_string(), start_tick_index));
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                "推导 Whirlpool tick数组失败：池={}，原因={}",
+                pool_address,
+                error
+            );
+        }
+    }
+}
+
+fn routeable_token_count(
+    pump_by_token: &HashMap<String, Vec<String>>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+    min_routeable_dex_count: usize,
+) -> usize {
+    let min_routeable_dex_count = min_routeable_dex_count.max(1);
+    let mut tokens = HashSet::new();
+    tokens.extend(pump_by_token.keys().cloned());
+    tokens.extend(pumpswap_by_token.keys().cloned());
+    tokens.extend(raydium_by_token.keys().cloned());
+    tokens.extend(meteora_by_token.keys().cloned());
+    tokens.extend(whirlpool_by_token.keys().cloned());
+
+    tokens
+        .into_iter()
+        .filter(|token| {
+            let mut matched = 0usize;
+            if pump_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if pumpswap_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if raydium_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if meteora_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if whirlpool_by_token.contains_key(token) {
+                matched += 1;
+            }
+            matched >= min_routeable_dex_count
+        })
+        .count()
+}
+
+fn collect_program_pair_routeable_tokens(
+    config: &Config,
+    pump_by_token: &HashMap<String, Vec<String>>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut tokens = HashSet::new();
+    tokens.extend(pump_by_token.keys().cloned());
+    tokens.extend(pumpswap_by_token.keys().cloned());
+    tokens.extend(raydium_by_token.keys().cloned());
+    tokens.extend(meteora_by_token.keys().cloned());
+    tokens.extend(whirlpool_by_token.keys().cloned());
+
+    let mut routeable = tokens
+        .into_iter()
+        .filter(|token| {
+            if !should_scan_direct_token(config, token) {
+                return false;
+            }
+            let mut matched = 0usize;
+            if pump_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if pumpswap_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if raydium_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if meteora_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if whirlpool_by_token.contains_key(token) {
+                matched += 1;
+            }
+            matched >= config.discovery.min_routeable_dex_count.max(2)
+        })
+        .collect::<Vec<_>>();
+    routeable.sort();
+    routeable
+}
+
+fn collect_direct_routeable_tokens(
+    config: &Config,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut tokens = HashSet::new();
+    tokens.extend(pumpswap_by_token.keys().cloned());
+    tokens.extend(raydium_by_token.keys().cloned());
+    tokens.extend(meteora_by_token.keys().cloned());
+    tokens.extend(whirlpool_by_token.keys().cloned());
+
+    let mut routeable = tokens
+        .into_iter()
+        .filter(|token| {
+            if !should_scan_direct_token(config, token) {
+                return false;
+            }
+            let mut matched = 0usize;
+            if pumpswap_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if raydium_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if meteora_by_token.contains_key(token) {
+                matched += 1;
+            }
+            if whirlpool_by_token.contains_key(token) {
+                matched += 1;
+            }
+            matched >= 2
+        })
+        .collect::<Vec<_>>();
+    routeable.sort();
+    routeable
+}
+
+fn should_scan_direct_token(config: &Config, token_mint: &str) -> bool {
+    token_mint != USDT_MINT
+        && token_mint != USD1_MINT
+        && !config
+            .discovery
+            .excluded_target_token_mints
+            .iter()
+            .any(|excluded| excluded == token_mint)
+}
+
+fn mark_token_for_scan(
+    config: &Config,
+    dirty_direct_tokens: &mut HashSet<String>,
+    stats: &mut RuntimeStats,
+    token_mint: &str,
+) {
+    if should_scan_direct_token(config, token_mint) {
+        record_token_update_activity(stats, token_mint);
+        dirty_direct_tokens.insert(token_mint.to_string());
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TokenSelectionScore {
+    total: f64,
+    activity: f64,
+    coverage: f64,
+    depth: f64,
+    dislocation: f64,
+    heat: f64,
+    dex_count: usize,
+    pool_count: usize,
+    recent_updates_1m: usize,
+    recent_updates_5m: usize,
+    total_liquidity_usdc: f64,
+    total_volume_h24: f64,
+}
+
+#[derive(Debug, Clone)]
+struct TokenSelectionDecision {
+    token_mint: String,
+    score: Option<TokenSelectionScore>,
+    blocked_reason: Option<&'static str>,
+}
+
+fn record_token_update_activity(stats: &mut RuntimeStats, token_mint: &str) {
+    const TOKEN_SELECTION_ACTIVITY_WINDOW: Duration = Duration::from_secs(300);
+    let now = Instant::now();
+    let state = stats
+        .token_selection
+        .entry(token_mint.to_string())
+        .or_default();
+    state.recent_updates.push_back(now);
+    while let Some(front) = state.recent_updates.front().copied() {
+        if now.saturating_duration_since(front) > TOKEN_SELECTION_ACTIVITY_WINDOW {
+            state.recent_updates.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+fn record_token_selection_scan(stats: &mut RuntimeStats, token_mint: &str, score: f64) {
+    let state = stats
+        .token_selection
+        .entry(token_mint.to_string())
+        .or_default();
+    state.selection_count = state.selection_count.saturating_add(1);
+    state.last_score = score;
+}
+
+fn record_token_exact_candidate(stats: &mut RuntimeStats, token_mint: &str) {
+    let state = stats
+        .token_selection
+        .entry(token_mint.to_string())
+        .or_default();
+    state.exact_candidate_count = state.exact_candidate_count.saturating_add(1);
+}
+
+fn record_token_send_attempt(stats: &mut RuntimeStats, token_mint: &str) {
+    let state = stats
+        .token_selection
+        .entry(token_mint.to_string())
+        .or_default();
+    state.send_attempt_count = state.send_attempt_count.saturating_add(1);
+}
+
+fn record_token_send_success(stats: &mut RuntimeStats, token_mint: &str) {
+    let state = stats
+        .token_selection
+        .entry(token_mint.to_string())
+        .or_default();
+    state.send_success_count = state.send_success_count.saturating_add(1);
+}
+
+fn token_recent_update_counts(stats: &RuntimeStats, token_mint: &str) -> (usize, usize) {
+    let Some(state) = stats.token_selection.get(token_mint) else {
+        return (0, 0);
+    };
+    let now = Instant::now();
+    let recent_1m = state
+        .recent_updates
+        .iter()
+        .filter(|timestamp| now.saturating_duration_since(**timestamp) <= Duration::from_secs(60))
+        .count();
+    let recent_5m = state
+        .recent_updates
+        .iter()
+        .filter(|timestamp| now.saturating_duration_since(**timestamp) <= Duration::from_secs(300))
+        .count();
+    (recent_1m, recent_5m)
+}
+
+fn token_total_volume_h24(
+    account_metadata: &HashMap<String, market_universe::AccountMetadata>,
+    addresses: &[String],
+) -> f64 {
+    addresses
+        .iter()
+        .filter_map(|address| account_metadata.get(address))
+        .filter_map(|metadata| metadata.volume_h24)
+        .sum()
+}
+
+fn token_total_liquidity_usdc(
+    config: &Config,
+    token_mint: &str,
+    account_metadata: &HashMap<String, market_universe::AccountMetadata>,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+) -> f64 {
+    let pumpswap_liquidity = pumpswap_by_token
+        .get(token_mint)
+        .into_iter()
+        .flatten()
+        .filter_map(|address| pumpswap_state.get(address))
+        .filter_map(|state| cp_pool_from_pumpswap(config, state))
+        .filter_map(|pool| cp_pool_liquidity_score_usdc(config, &pool))
+        .sum::<f64>();
+    let raydium_liquidity = raydium_by_token
+        .get(token_mint)
+        .into_iter()
+        .flatten()
+        .filter_map(|address| raydium_state.get(address))
+        .map(|state| state.get_liquidity_usdc(config.strategy.sol_usdc_price))
+        .sum::<f64>();
+    let meteora_liquidity = meteora_by_token
+        .get(token_mint)
+        .into_iter()
+        .flatten()
+        .filter_map(|address| meteora_state.get(address))
+        .filter_map(|state| meteora_pool_liquidity_score_usdc(config, state))
+        .sum::<f64>();
+    let whirlpool_liquidity = whirlpool_by_token
+        .get(token_mint)
+        .into_iter()
+        .flatten()
+        .filter_map(|address| account_metadata.get(address))
+        .filter_map(|metadata| metadata.liquidity_usd)
+        .sum::<f64>();
+
+    pumpswap_liquidity + raydium_liquidity + meteora_liquidity + whirlpool_liquidity
+}
+
+fn token_selection_score(
+    config: &Config,
+    token_mint: &str,
+    account_metadata: &HashMap<String, market_universe::AccountMetadata>,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+    stats: &RuntimeStats,
+) -> TokenSelectionDecision {
+    let dex_count = [
+        pumpswap_by_token.contains_key(token_mint),
+        raydium_by_token.contains_key(token_mint),
+        meteora_by_token.contains_key(token_mint),
+        whirlpool_by_token.contains_key(token_mint),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    let pool_count = pumpswap_by_token.get(token_mint).map_or(0, Vec::len)
+        + raydium_by_token.get(token_mint).map_or(0, Vec::len)
+        + meteora_by_token.get(token_mint).map_or(0, Vec::len)
+        + whirlpool_by_token.get(token_mint).map_or(0, Vec::len);
+    if dex_count < config.discovery.min_routeable_dex_count.max(2) || pool_count < 2 {
+        return TokenSelectionDecision {
+            token_mint: token_mint.to_string(),
+            score: None,
+            blocked_reason: Some("insufficient_routeable_coverage"),
+        };
+    }
+
+    let mut metadata_addresses = Vec::new();
+    metadata_addresses.extend(
+        pumpswap_by_token
+            .get(token_mint)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    metadata_addresses.extend(
+        raydium_by_token
+            .get(token_mint)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    metadata_addresses.extend(
+        meteora_by_token
+            .get(token_mint)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    metadata_addresses.extend(
+        whirlpool_by_token
+            .get(token_mint)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    {
+        let mut seen = HashSet::new();
+        metadata_addresses.retain(|address| seen.insert(address.clone()));
+    }
+
+    let total_liquidity_usdc = token_total_liquidity_usdc(
+        config,
+        token_mint,
+        account_metadata,
+        pumpswap_state,
+        raydium_state,
+        meteora_state,
+        pumpswap_by_token,
+        raydium_by_token,
+        meteora_by_token,
+        whirlpool_by_token,
+    );
+    if total_liquidity_usdc < config.discovery.token_selection_min_total_liquidity_usdc {
+        return TokenSelectionDecision {
+            token_mint: token_mint.to_string(),
+            score: None,
+            blocked_reason: Some("insufficient_total_liquidity"),
+        };
+    }
+
+    let total_volume_h24 = token_total_volume_h24(account_metadata, &metadata_addresses);
+    let (recent_updates_1m, recent_updates_5m) = token_recent_update_counts(stats, token_mint);
+    if recent_updates_5m == 0 && total_volume_h24 < (config.discovery.min_volume_h24 * 2.0) {
+        return TokenSelectionDecision {
+            token_mint: token_mint.to_string(),
+            score: None,
+            blocked_reason: Some("inactive_token"),
+        };
+    }
+
+    let activity = match recent_updates_1m {
+        count if count >= 8 => 10.0,
+        count if count >= 4 => 7.0,
+        count if count >= 2 => 5.0,
+        count if count >= 1 => 3.0,
+        _ => 0.0,
+    } + match recent_updates_5m {
+        count if count >= 20 => 10.0,
+        count if count >= 10 => 7.0,
+        count if count >= 4 => 4.0,
+        count if count >= 1 => 2.0,
+        _ => 0.0,
+    } + match total_volume_h24 {
+        volume if volume >= 500_000.0 => 10.0,
+        volume if volume >= 100_000.0 => 7.0,
+        volume if volume >= 25_000.0 => 4.0,
+        volume if volume >= 5_000.0 => 2.0,
+        _ => 0.0,
+    };
+
+    let coverage = match dex_count {
+        count if count >= 4 => 20.0,
+        3 => 16.0,
+        2 => 10.0,
+        _ => 0.0,
+    };
+
+    let depth = match total_liquidity_usdc {
+        liquidity if liquidity >= 150_000.0 => 20.0,
+        liquidity if liquidity >= 75_000.0 => 16.0,
+        liquidity if liquidity >= 25_000.0 => 12.0,
+        liquidity if liquidity >= 10_000.0 => 8.0,
+        liquidity if liquidity >= config.discovery.token_selection_min_total_liquidity_usdc => 4.0,
+        _ => 0.0,
+    };
+
+    let dislocation = direct_token_scan_score(
+        config,
+        token_mint,
+        pumpswap_state,
+        raydium_state,
+        meteora_state,
+        pumpswap_by_token,
+        raydium_by_token,
+        meteora_by_token,
+    )
+    .clamp(0.0, 20.0);
+
+    let manual_priority_bonus = preferred_live_token_bonus(token_mint);
+    let update_acceleration_bonus = if recent_updates_1m >= 2
+        && recent_updates_5m > 0
+        && recent_updates_1m.saturating_mul(5) >= recent_updates_5m.saturating_mul(2)
+    {
+        5.0
+    } else {
+        0.0
+    };
+    let feedback_adjustment =
+        (direct_token_feedback_score(stats, token_mint) / 40.0).clamp(-10.0, 5.0);
+    let success_bonus = stats
+        .token_selection
+        .get(token_mint)
+        .filter(|state| state.send_success_count > 0)
+        .map(|state| (state.send_success_count as f64).min(3.0) * 4.0)
+        .unwrap_or(0.0);
+    let active_cooldown_penalty =
+        (direct_token_active_cooldown_count(stats, token_mint) as f64 * 4.0).min(12.0);
+    let stale_exact_penalty = stats
+        .token_selection
+        .get(token_mint)
+        .filter(|state| state.exact_candidate_count >= 5 && state.send_success_count == 0)
+        .map(|_| 6.0)
+        .unwrap_or(0.0);
+    let heat =
+        manual_priority_bonus + update_acceleration_bonus + feedback_adjustment + success_bonus
+            - stale_exact_penalty
+            - active_cooldown_penalty;
+
+    let total = activity + coverage + depth + dislocation + heat;
+
+    TokenSelectionDecision {
+        token_mint: token_mint.to_string(),
+        score: Some(TokenSelectionScore {
+            total,
+            activity,
+            coverage,
+            depth,
+            dislocation,
+            heat,
+            dex_count,
+            pool_count,
+            recent_updates_1m,
+            recent_updates_5m,
+            total_liquidity_usdc,
+            total_volume_h24,
+        }),
+        blocked_reason: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_token_selection_engine(
+    config: &Config,
+    account_metadata: &HashMap<String, market_universe::AccountMetadata>,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+    stats: &mut RuntimeStats,
+    token_mints: Vec<String>,
+    label: &str,
+) -> Vec<String> {
+    if !config.discovery.token_selection_enabled {
+        return token_mints;
+    }
+
+    let mut decisions = token_mints
+        .into_iter()
+        .map(|token_mint| {
+            token_selection_score(
+                config,
+                &token_mint,
+                account_metadata,
+                pumpswap_state,
+                raydium_state,
+                meteora_state,
+                pumpswap_by_token,
+                raydium_by_token,
+                meteora_by_token,
+                whirlpool_by_token,
+                stats,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    decisions.sort_by(|left, right| {
+        let right_score = right
+            .score
+            .as_ref()
+            .map(|score| score.total)
+            .unwrap_or(f64::NEG_INFINITY);
+        let left_score = left
+            .score
+            .as_ref()
+            .map(|score| score.total)
+            .unwrap_or(f64::NEG_INFINITY);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.token_mint.cmp(&right.token_mint))
+    });
+
+    let kept = decisions
+        .iter()
+        .filter_map(|decision| {
+            let score = decision.score.as_ref()?;
+            (score.total >= config.discovery.token_selection_min_score)
+                .then(|| decision.token_mint.clone())
+        })
+        .collect::<Vec<_>>();
+
+    let top_n = config.discovery.token_selection_log_top_n.max(1);
+    let kept_summary = decisions
+        .iter()
+        .filter_map(|decision| {
+            let score = decision.score.as_ref()?;
+            (score.total >= config.discovery.token_selection_min_score).then(|| {
+                format!(
+                    "{}:{:.1}(act={:.1},cov={:.1},depth={:.1},gap={:.1},heat={:.1},dexes={},liq=${:.0},vol=${:.0},upd1m={},upd5m={})",
+                    &decision.token_mint[..decision.token_mint.len().min(8)],
+                    score.total,
+                    score.activity,
+                    score.coverage,
+                    score.depth,
+                    score.dislocation,
+                    score.heat,
+                    score.dex_count,
+                    score.total_liquidity_usdc,
+                    score.total_volume_h24,
+                    score.recent_updates_1m,
+                    score.recent_updates_5m,
+                )
+            })
+        })
+        .take(top_n)
+        .collect::<Vec<_>>();
+
+    let blocked_summary = decisions
+        .iter()
+        .filter_map(|decision| {
+            let score = decision.score.as_ref();
+            if let Some(score) = score {
+                if score.total < config.discovery.token_selection_min_score {
+                    return Some(format!(
+                        "{}:score_{:.1}_below_{:.1}",
+                        &decision.token_mint[..decision.token_mint.len().min(8)],
+                        score.total,
+                        config.discovery.token_selection_min_score
+                    ));
+                }
+            }
+            decision.blocked_reason.map(|reason| {
+                format!(
+                    "{}:{}",
+                    &decision.token_mint[..decision.token_mint.len().min(8)],
+                    reason
+                )
+            })
+        })
+        .take(top_n)
+        .collect::<Vec<_>>();
+
+    tracing::debug!(
+        "🧠 Token selection {}: input={} kept={} min_score={:.1} kept_top=[{}] blocked_top=[{}]",
+        label,
+        decisions.len(),
+        kept.len(),
+        config.discovery.token_selection_min_score,
+        kept_summary.join(","),
+        blocked_summary.join(",")
+    );
+
+    for decision in &decisions {
+        if let Some(score) = &decision.score {
+            if score.total >= config.discovery.token_selection_min_score {
+                record_token_selection_scan(stats, &decision.token_mint, score.total);
+            }
+        }
+    }
+
+    kept
+}
+
+fn short_token_prefix(token: &str) -> &str {
+    &token[..token.len().min(8)]
+}
+
+fn format_token_preview<'a, I>(tokens: I, limit: usize) -> String
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let mut preview = tokens
+        .into_iter()
+        .map(|token| short_token_prefix(token).to_string())
+        .collect::<Vec<_>>();
+    preview.sort();
+    preview.truncate(limit);
+    preview.join(",")
+}
+
+fn token_direct_pool_coverage_summary(
+    token_mint: &str,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+) -> String {
+    let pumpswap_count = pumpswap_by_token.get(token_mint).map_or(0, Vec::len);
+    let raydium_count = raydium_by_token.get(token_mint).map_or(0, Vec::len);
+    let meteora_count = meteora_by_token.get(token_mint).map_or(0, Vec::len);
+    let whirlpool_count = whirlpool_by_token.get(token_mint).map_or(0, Vec::len);
+    let meteora_bin_array_count = meteora_by_token
+        .get(token_mint)
+        .map(|addresses| {
+            addresses
+                .iter()
+                .filter_map(|address| meteora_state.get(address))
+                .map(|pool| {
+                    meteora_bin_arrays
+                        .values()
+                        .filter(|array| array.lb_pair == pool.pool_address)
+                        .count()
+                })
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+
+    format!(
+        "pools={{pumpswap:{},raydium:{},meteora:{},whirlpool:{}}} meteora_bin_arrays={}",
+        pumpswap_count, raydium_count, meteora_count, whirlpool_count, meteora_bin_array_count
+    )
+}
+
+fn direct_token_scan_score(
+    config: &Config,
+    token_mint: &str,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+) -> f64 {
+    let mut best_score: f64 = 0.0;
+
+    if direct_route_family_enabled(config, DirectRouteFamily::PumpSwapMeteora) {
+        if let Some(pumpswap_addresses) = pumpswap_by_token.get(token_mint) {
+            if let Some(meteora_addresses) = meteora_by_token.get(token_mint) {
+                for pumpswap_address in pumpswap_addresses {
+                    let Some(pumpswap) = pumpswap_state.get(pumpswap_address) else {
+                        continue;
+                    };
+                    let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                        continue;
+                    };
+                    let Some(pumpswap_price_usdc) = cp_pool_spot_price_usdc(
+                        &pumpswap_pool,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                        config.strategy.sol_usdc_price,
+                    ) else {
+                        continue;
+                    };
+
+                    for meteora_address in meteora_addresses {
+                        let Some(meteora) = meteora_state.get(meteora_address) else {
+                            continue;
+                        };
+                        let Some(meteora_quote_mint) =
+                            meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+                        else {
+                            continue;
+                        };
+                        if meteora_quote_mint != pumpswap_pool.quote_mint {
+                            continue;
+                        }
+                        let Some(meteora_price_usdc) = meteora_token_price_usdc(
+                            meteora,
+                            &config.tokens.usdc_mint,
+                            &config.tokens.sol_mint,
+                            config.strategy.sol_usdc_price,
+                        ) else {
+                            continue;
+                        };
+                        let Some(gap_pct) = price_gap_pct(pumpswap_price_usdc, meteora_price_usdc)
+                        else {
+                            continue;
+                        };
+                        best_score = best_score.max(gap_pct);
+                    }
+                }
+            }
+        }
+    }
+
+    if direct_route_family_enabled(config, DirectRouteFamily::PumpSwapRaydium) {
+        if let Some(pumpswap_addresses) = pumpswap_by_token.get(token_mint) {
+            if let Some(raydium_addresses) = raydium_by_token.get(token_mint) {
+                for pumpswap_address in pumpswap_addresses {
+                    let Some(pumpswap) = pumpswap_state.get(pumpswap_address) else {
+                        continue;
+                    };
+                    let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                        continue;
+                    };
+                    let Some(pumpswap_price_usdc) = cp_pool_spot_price_usdc(
+                        &pumpswap_pool,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                        config.strategy.sol_usdc_price,
+                    ) else {
+                        continue;
+                    };
+
+                    for raydium_address in raydium_addresses {
+                        let Some(raydium) = raydium_state.get(raydium_address) else {
+                            continue;
+                        };
+                        let Some(raydium_quote_mint) = raydium_counter_mint(raydium, token_mint)
+                        else {
+                            continue;
+                        };
+                        if raydium_quote_mint != pumpswap_pool.quote_mint {
+                            continue;
+                        }
+                        let Some(raydium_price_usdc) =
+                            raydium_token_price_usdc_for_spot(config, raydium, token_mint)
+                        else {
+                            continue;
+                        };
+                        let Some(gap_pct) = price_gap_pct(pumpswap_price_usdc, raydium_price_usdc)
+                        else {
+                            continue;
+                        };
+                        best_score = best_score.max(gap_pct);
+                    }
+                }
+            }
+        }
+    }
+
+    if direct_route_family_enabled(config, DirectRouteFamily::MeteoraMeteora) {
+        if let Some(meteora_addresses) = meteora_by_token.get(token_mint) {
+            for left_address in meteora_addresses {
+                let Some(left_pool) = meteora_state.get(left_address) else {
+                    continue;
+                };
+                let Some(left_quote_mint) =
+                    left_pool.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+                else {
+                    continue;
+                };
+                let Some(left_price_usdc) = meteora_token_price_usdc(
+                    left_pool,
+                    &config.tokens.usdc_mint,
+                    &config.tokens.sol_mint,
+                    config.strategy.sol_usdc_price,
+                ) else {
+                    continue;
+                };
+
+                for right_address in meteora_addresses {
+                    if left_address == right_address {
+                        continue;
+                    }
+                    let Some(right_pool) = meteora_state.get(right_address) else {
+                        continue;
+                    };
+                    let Some(right_quote_mint) =
+                        right_pool.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+                    else {
+                        continue;
+                    };
+                    if left_quote_mint != right_quote_mint {
+                        continue;
+                    }
+                    let Some(right_price_usdc) = meteora_token_price_usdc(
+                        right_pool,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                        config.strategy.sol_usdc_price,
+                    ) else {
+                        continue;
+                    };
+                    let Some(gap_pct) = price_gap_pct(left_price_usdc, right_price_usdc) else {
+                        continue;
+                    };
+                    best_score = best_score.max(gap_pct);
+                }
+            }
+        }
+    }
+
+    best_score
+}
+
+fn direct_token_feedback_score(stats: &RuntimeStats, token_mint: &str) -> f64 {
+    let Some(state) = stats.direct_token_feedback.get(token_mint) else {
+        return 0.0;
+    };
+    let elapsed = Instant::now().saturating_duration_since(state.last_seen);
+    if elapsed >= DIRECT_TOKEN_FEEDBACK_TTL {
+        return 0.0;
+    }
+    let freshness =
+        1.0 - (elapsed.as_secs_f64() / DIRECT_TOKEN_FEEDBACK_TTL.as_secs_f64()).clamp(0.0, 1.0);
+    state.last_net_profit_pct * 100.0 * freshness
+}
+
+fn direct_pair_feedback_score(stats: &RuntimeStats, pair_key: &str) -> f64 {
+    let Some(state) = stats.direct_pair_feedback.get(pair_key) else {
+        return 0.0;
+    };
+    let elapsed = Instant::now().saturating_duration_since(state.last_seen);
+    if elapsed >= DIRECT_PAIR_FEEDBACK_TTL {
+        return 0.0;
+    }
+    let freshness =
+        1.0 - (elapsed.as_secs_f64() / DIRECT_PAIR_FEEDBACK_TTL.as_secs_f64()).clamp(0.0, 1.0);
+    state.last_net_profit_pct * freshness
+}
+
+fn pumpswap_meteora_pair_feedback_key(
+    token_mint: &str,
+    pumpswap_address: &str,
+    meteora_address: &str,
+) -> String {
+    format!("pumpswap_meteora:{token_mint}:{pumpswap_address}:{meteora_address}")
+}
+
+fn record_direct_pair_feedback(stats: &mut RuntimeStats, pair_key: &str, net_profit_pct: f64) {
+    let now = Instant::now();
+    if let Some(state) = stats.direct_pair_feedback.get_mut(pair_key) {
+        if now.saturating_duration_since(state.last_seen) <= Duration::from_secs(1) {
+            state.last_net_profit_pct = state.last_net_profit_pct.max(net_profit_pct);
+        } else {
+            state.last_net_profit_pct = net_profit_pct;
+        }
+        state.last_seen = now;
+        return;
+    }
+
+    stats.direct_pair_feedback.insert(
+        pair_key.to_string(),
+        CandidateLogState {
+            last_seen: now,
+            last_net_profit_pct: net_profit_pct,
+        },
+    );
+}
+
+fn arb_quote_route_key(quote: &ArbQuote) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        quote.token_mint,
+        quote.forward_dex,
+        quote.backward_dex,
+        quote.forward_pool,
+        quote.backward_pool
+    )
+}
+
+fn route_execution_event(
+    event_kind: &'static str,
+    quote: &ArbQuote,
+    opportunity_class: Option<OpportunityClass>,
+    sent: bool,
+    landed: bool,
+    success: bool,
+    fail_reason: Option<String>,
+    cu_used: Option<u64>,
+    real_profit_usdc: f64,
+) -> RouteExecutionEvent {
+    RouteExecutionEvent {
+        event_kind,
+        token: quote.token_mint.clone(),
+        dex_route: format!("{}->{}", quote.forward_dex, quote.backward_dex),
+        forward_pool: quote.forward_pool.clone(),
+        backward_pool: quote.backward_pool.clone(),
+        opportunity_class: opportunity_class.map(|class| class.label()),
+        expected_forward_out: quote.expected_base_out_safe,
+        expected_backward_out: quote.expected_quote_back_safe,
+        expected_profit_usdc: quote.real_net_profit_usdc,
+        real_profit_usdc,
+        sent,
+        landed,
+        success,
+        fail_reason,
+        cu_used,
+        priority_fee_raw: quote.fees.priority_fee_raw,
+        jito_tip_raw: quote.fees.jito_tip_raw,
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    }
+}
+
+fn record_route_execution_event(
+    stats: &mut RuntimeStats,
+    quote: &ArbQuote,
+    event: RouteExecutionEvent,
+) {
+    let key = arb_quote_route_key(quote);
+    let state = stats
+        .route_hit_rate
+        .entry(key)
+        .or_insert_with(RouteHitRateState::default);
+    state.last_seen = Instant::now();
+    if event.event_kind == "discovered" {
+        state.discovery_count = state.discovery_count.saturating_add(1);
+        state.total_expected_profit_usdc += event.expected_profit_usdc;
+    }
+    if event.sent {
+        state.sent_count = state.sent_count.saturating_add(1);
+    }
+    if event.landed {
+        state.landed_count = state.landed_count.saturating_add(1);
+    }
+    if route_event_counts_as_send_success(&event) {
+        state.success_count = state.success_count.saturating_add(1);
+    }
+    if let Some(cu_used) = event.cu_used {
+        state.total_cu_used = state.total_cu_used.saturating_add(cu_used);
+        state.cu_samples = state.cu_samples.saturating_add(1);
+    }
+    if event.sent && !event.success {
+        state.failure_count = state.failure_count.saturating_add(1);
+        state.last_fail_reason = event.fail_reason.clone();
+    }
+    if event.real_profit_usdc < 0.0 {
+        state.negative_real_profit_count = state.negative_real_profit_count.saturating_add(1);
+    }
+    if event.event_kind != "discovered" {
+        state.total_real_profit_usdc += event.real_profit_usdc;
+    }
+}
+
+fn route_event_counts_as_send_success(event: &RouteExecutionEvent) -> bool {
+    event.sent && event.success
+}
+
+fn route_hit_rate_snapshot(stats: &RuntimeStats, quote: &ArbQuote) -> (f64, u64) {
+    let Some(state) = stats.route_hit_rate.get(&arb_quote_route_key(quote)) else {
+        return (1.0, 0);
+    };
+    let samples = state.sent_count.max(state.discovery_count);
+    if state.sent_count == 0 {
+        return (1.0, samples);
+    }
+    let hit_rate = state.success_count as f64 / state.sent_count as f64;
+    (hit_rate.clamp(0.0, 1.0), samples)
+}
+
+fn program_pair_route_feedback_key(
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        candidate.token_mint,
+        candidate.buy_market.kind.as_str(),
+        candidate.sell_market.kind.as_str(),
+        candidate.buy_market.address,
+        candidate.sell_market.address
+    )
+}
+
+fn program_pair_trade_size_usdc(
+    config: &Config,
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) -> Option<f64> {
+    if candidate.quote_mint == config.tokens.sol_mint {
+        Some(candidate.trade_size_quote * config.strategy.sol_usdc_price)
+    } else if candidate.quote_mint == config.tokens.usdc_mint {
+        Some(candidate.trade_size_quote)
+    } else {
+        None
+    }
+}
+
+fn program_pair_candidate_gate_profit_pct(
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) -> f64 {
+    candidate
+        .gate
+        .as_ref()
+        .map(|gate| gate.gate_profit_pct)
+        .unwrap_or(candidate.net_profit_pct)
+}
+
+fn record_program_pair_path_evaluation(
+    config: &Config,
+    stats: &mut RuntimeStats,
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) {
+    let now = Instant::now();
+    let trade_size_usdc = program_pair_trade_size_usdc(config, candidate).unwrap_or(0.0);
+    let gate_profit_pct = program_pair_candidate_gate_profit_pct(candidate);
+    let key = program_pair_route_feedback_key(candidate);
+    let state = stats
+        .program_pair_path_feedback
+        .entry(key)
+        .or_insert_with(|| ProgramPairPathFeedbackState {
+            last_seen: now,
+            evaluation_count: 0,
+            exact_successful_quote_count: 0,
+            exact_missing_quote_count: 0,
+            near_profit_count: 0,
+            profitable_selection_count: 0,
+            last_gate_profit_pct: gate_profit_pct,
+            best_gate_profit_pct: gate_profit_pct,
+            last_trade_size_usdc: trade_size_usdc,
+        });
+    state.last_seen = now;
+    state.evaluation_count = state.evaluation_count.saturating_add(1);
+    state.last_gate_profit_pct = gate_profit_pct;
+    state.best_gate_profit_pct = state.best_gate_profit_pct.max(gate_profit_pct);
+    state.last_trade_size_usdc = trade_size_usdc;
+
+    if candidate.pricing_mode == strategy::program_pairs::ProgramPairPricingMode::ExactQuote
+        || candidate
+            .exact_search
+            .as_ref()
+            .map(|search| search.successful_size_count > 0)
+            .unwrap_or(false)
+    {
+        state.exact_successful_quote_count = state.exact_successful_quote_count.saturating_add(1);
+    }
+
+    if candidate
+        .exact_search
+        .as_ref()
+        .map(|search| search.requested_size_count > 0 && search.successful_size_count == 0)
+        .unwrap_or(false)
+    {
+        state.exact_missing_quote_count = state.exact_missing_quote_count.saturating_add(1);
+    }
+}
+
+fn record_program_pair_path_near_profit(
+    stats: &mut RuntimeStats,
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) {
+    let now = Instant::now();
+    let key = program_pair_route_feedback_key(candidate);
+    let state = stats
+        .program_pair_path_feedback
+        .entry(key)
+        .or_insert_with(|| ProgramPairPathFeedbackState {
+            last_seen: now,
+            evaluation_count: 0,
+            exact_successful_quote_count: 0,
+            exact_missing_quote_count: 0,
+            near_profit_count: 0,
+            profitable_selection_count: 0,
+            last_gate_profit_pct: program_pair_candidate_gate_profit_pct(candidate),
+            best_gate_profit_pct: program_pair_candidate_gate_profit_pct(candidate),
+            last_trade_size_usdc: 0.0,
+        });
+    state.last_seen = now;
+    state.near_profit_count = state.near_profit_count.saturating_add(1);
+    state.last_gate_profit_pct = program_pair_candidate_gate_profit_pct(candidate);
+    state.best_gate_profit_pct = state
+        .best_gate_profit_pct
+        .max(program_pair_candidate_gate_profit_pct(candidate));
+}
+
+fn record_program_pair_profitable_selection(
+    stats: &mut RuntimeStats,
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) {
+    let now = Instant::now();
+    let key = program_pair_route_feedback_key(candidate);
+    let state = stats
+        .program_pair_path_feedback
+        .entry(key)
+        .or_insert_with(|| ProgramPairPathFeedbackState {
+            last_seen: now,
+            evaluation_count: 0,
+            exact_successful_quote_count: 0,
+            exact_missing_quote_count: 0,
+            near_profit_count: 0,
+            profitable_selection_count: 0,
+            last_gate_profit_pct: program_pair_candidate_gate_profit_pct(candidate),
+            best_gate_profit_pct: program_pair_candidate_gate_profit_pct(candidate),
+            last_trade_size_usdc: 0.0,
+        });
+    state.last_seen = now;
+    state.profitable_selection_count = state.profitable_selection_count.saturating_add(1);
+    state.last_gate_profit_pct = program_pair_candidate_gate_profit_pct(candidate);
+    state.best_gate_profit_pct = state
+        .best_gate_profit_pct
+        .max(program_pair_candidate_gate_profit_pct(candidate));
+}
+
+fn program_pair_dynamic_gate_adjustment_pct(
+    config: &Config,
+    stats: &RuntimeStats,
+    route_key: &str,
+) -> f64 {
+    let Some(state) = stats.program_pair_path_feedback.get(route_key) else {
+        return 0.0;
+    };
+    let elapsed = Instant::now().saturating_duration_since(state.last_seen);
+    if elapsed >= PROGRAM_PAIR_PATH_FEEDBACK_TTL {
+        return 0.0;
+    }
+    let freshness = 1.0
+        - (elapsed.as_secs_f64() / PROGRAM_PAIR_PATH_FEEDBACK_TTL.as_secs_f64()).clamp(0.0, 1.0);
+
+    let mut adjustment_pct = 0.0;
+    adjustment_pct -= (state.profitable_selection_count.min(3) as f64) * 0.05;
+    if state.near_profit_count >= 2 && state.best_gate_profit_pct > -0.35 {
+        adjustment_pct -= 0.05;
+    }
+    if state.exact_missing_quote_count >= 3 && state.exact_successful_quote_count == 0 {
+        adjustment_pct += 0.10;
+    }
+    if state.evaluation_count >= 4 && state.best_gate_profit_pct < -0.75 {
+        adjustment_pct += 0.10;
+    }
+
+    let max_adjustment = config
+        .strategy
+        .program_pair_dynamic_gate_max_adjustment_pct
+        .abs();
+    (adjustment_pct * freshness).clamp(-max_adjustment, max_adjustment)
+}
+
+fn apply_program_pair_gate_state(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    stats: &RuntimeStats,
+    mut candidate: strategy::program_pairs::ProgramPairCandidate,
+) -> strategy::program_pairs::ProgramPairCandidate {
+    let route_key = program_pair_route_feedback_key(&candidate);
+    let base_threshold_pct = active_offchain_profit_threshold_pct(Some(execution_manager), config);
+    let dynamic_adjustment_pct =
+        program_pair_dynamic_gate_adjustment_pct(config, stats, &route_key);
+    let effective_threshold_pct = base_threshold_pct + dynamic_adjustment_pct;
+    candidate.gate = Some(strategy::program_pairs::ProgramPairGateState {
+        base_threshold_pct,
+        dynamic_adjustment_pct,
+        effective_threshold_pct,
+        gate_profit_pct: candidate.net_profit_pct - effective_threshold_pct,
+    });
+    candidate
+}
+
+fn cp_pool_liquidity_score_usdc(
+    config: &Config,
+    pool: &strategy::quote::ConstantProductPool,
+) -> Option<f64> {
+    let quote_usdc = raw_to_usdc_for_mint(
+        &pool.quote_mint,
+        pool.quote_reserve as f64,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_price_usdc = cp_pool_spot_price_usdc(
+        pool,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_ui = pool.token_reserve as f64 / 10_f64.powi(default_decimals(&pool.token_mint));
+    Some(quote_usdc + (token_ui * token_price_usdc))
+}
+
+fn meteora_pool_liquidity_score_usdc(config: &Config, state: &MeteoraState) -> Option<f64> {
+    let token_mint = state.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    let quote_mint = state.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    let (quote_raw, token_raw) = if state.token_x_mint == quote_mint {
+        (state.token_x_amount as f64, state.token_y_amount as f64)
+    } else {
+        (state.token_y_amount as f64, state.token_x_amount as f64)
+    };
+    let quote_usdc = raw_to_usdc_for_mint(
+        &quote_mint,
+        quote_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_price_usdc = meteora_token_price_usdc(
+        state,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_ui = token_raw / 10_f64.powi(default_decimals(&token_mint));
+    Some(quote_usdc + (token_ui * token_price_usdc))
+}
+
+fn direct_pair_probe_trade_size_usdc(config: &Config) -> Option<f64> {
+    configured_live_trade_sizes_usdc(config)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            direct_candidate_search_trade_sizes_usdc(config)
+                .into_iter()
+                .next()
+        })
+}
+
+fn pumpswap_meteora_pair_rank_score(
+    config: &Config,
+    token_mint: &str,
+    pumpswap_address: &str,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora_address: &str,
+    meteora: &MeteoraState,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    stats: &RuntimeStats,
+) -> Option<f64> {
+    if pumpswap_pool.token_mint != token_mint {
+        return None;
+    }
+    if meteora.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)? != token_mint {
+        return None;
+    }
+    if !pumpswap_meteora_direct_candidate_allowed(config, pumpswap_pool, meteora) {
+        return None;
+    }
+
+    let pumpswap_price_usdc = cp_pool_spot_price_usdc(
+        pumpswap_pool,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let meteora_price_usdc = meteora_token_price_usdc(
+        meteora,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let spot_gap_pct = price_gap_pct(pumpswap_price_usdc, meteora_price_usdc).unwrap_or(0.0);
+
+    let pumpswap_liquidity_usdc = cp_pool_liquidity_score_usdc(config, pumpswap_pool)?;
+    let meteora_liquidity_usdc = meteora_pool_liquidity_score_usdc(config, meteora)?;
+    let paired_depth_score = pumpswap_liquidity_usdc.min(meteora_liquidity_usdc).ln_1p();
+    let dynamic_fee_bps = if meteora.is_damm_v2() {
+        meteora.fee_bps
+    } else {
+        meteora.current_total_fee_rate() as f64 / 100_000.0
+    };
+    let pair_feedback_key =
+        pumpswap_meteora_pair_feedback_key(token_mint, pumpswap_address, meteora_address);
+    let pair_feedback_score = direct_pair_feedback_score(stats, &pair_feedback_key);
+
+    let mut score = (spot_gap_pct * 8.0) + paired_depth_score + (pair_feedback_score * 25.0)
+        - (dynamic_fee_bps * 0.25);
+
+    let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+        .values()
+        .filter(|array| array.lb_pair == meteora.pool_address)
+        .collect();
+    if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+        return Some(score - 200.0);
+    }
+
+    let Some(probe_trade_size_usdc) = direct_pair_probe_trade_size_usdc(config) else {
+        return Some(score);
+    };
+
+    let mut best_exact_probe_pct: Option<f64> = None;
+    for direction in [
+        MeteoraPumpSwapDirection::PumpSwapToMeteora,
+        MeteoraPumpSwapDirection::MeteoraToPumpSwap,
+    ] {
+        let exact = match direction {
+            MeteoraPumpSwapDirection::PumpSwapToMeteora => quote_pumpswap_buy_meteora_sell(
+                config,
+                pumpswap_pool,
+                meteora,
+                token_mint,
+                &pool_bin_arrays,
+                probe_trade_size_usdc,
+            ),
+            MeteoraPumpSwapDirection::MeteoraToPumpSwap => quote_meteora_buy_pumpswap_sell(
+                config,
+                pumpswap_pool,
+                meteora,
+                token_mint,
+                &pool_bin_arrays,
+                probe_trade_size_usdc,
+            ),
+        };
+        if let Some(exact) = exact {
+            best_exact_probe_pct = Some(
+                best_exact_probe_pct
+                    .map(|current| current.max(exact.net_profit_pct))
+                    .unwrap_or(exact.net_profit_pct),
+            );
+        }
+    }
+
+    if let Some(best_exact_probe_pct) = best_exact_probe_pct {
+        score += 40.0 + (best_exact_probe_pct * 80.0);
+    } else {
+        score -= 80.0;
+    }
+
+    Some(score)
+}
+
+fn ranked_meteora_pool_addresses_for_pumpswap_pair_scan<'a>(
+    config: &Config,
+    token_mint: &str,
+    pumpswap_address: &str,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora_by_token: &'a HashMap<String, Vec<String>>,
+    meteora_state: &'a HashMap<String, MeteoraState>,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    stats: &RuntimeStats,
+) -> Vec<&'a String> {
+    let Some(addresses) = meteora_by_token.get(token_mint) else {
+        return Vec::new();
+    };
+    let mut ranked = addresses.iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        let right_score = meteora_state
+            .get(*right)
+            .and_then(|state| {
+                pumpswap_meteora_pair_rank_score(
+                    config,
+                    token_mint,
+                    pumpswap_address,
+                    pumpswap_pool,
+                    right,
+                    state,
+                    meteora_bin_arrays,
+                    stats,
+                )
+            })
+            .unwrap_or(f64::NEG_INFINITY);
+        let left_score = meteora_state
+            .get(*left)
+            .and_then(|state| {
+                pumpswap_meteora_pair_rank_score(
+                    config,
+                    token_mint,
+                    pumpswap_address,
+                    pumpswap_pool,
+                    left,
+                    state,
+                    meteora_bin_arrays,
+                    stats,
+                )
+            })
+            .unwrap_or(f64::NEG_INFINITY);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.cmp(right))
+    });
+    if config.strategy.max_meteora_pools_per_token_for_direct_scan > 0
+        && ranked.len() > config.strategy.max_meteora_pools_per_token_for_direct_scan
+    {
+        ranked.truncate(config.strategy.max_meteora_pools_per_token_for_direct_scan);
+    }
+    ranked
+}
+
+fn record_direct_token_feedback(stats: &mut RuntimeStats, token_mint: &str, net_profit_pct: f64) {
+    stats.direct_token_feedback.insert(
+        token_mint.to_string(),
+        CandidateLogState {
+            last_seen: Instant::now(),
+            last_net_profit_pct: net_profit_pct,
+        },
+    );
+}
+
+fn price_gap_pct(left_price_usdc: f64, right_price_usdc: f64) -> Option<f64> {
+    if !left_price_usdc.is_finite()
+        || !right_price_usdc.is_finite()
+        || left_price_usdc <= 0.0
+        || right_price_usdc <= 0.0
+    {
+        return None;
+    }
+    let midpoint = (left_price_usdc + right_price_usdc) / 2.0;
+    if midpoint <= 0.0 || !midpoint.is_finite() {
+        return None;
+    }
+    Some(((left_price_usdc - right_price_usdc).abs() / midpoint) * 100.0)
+}
+
+fn direct_route_family_enabled(config: &Config, family: DirectRouteFamily) -> bool {
+    let program_enabled = |kind| config.program_by_kind(kind).is_some();
+    match family {
+        DirectRouteFamily::PumpSwapRaydium => {
+            program_enabled(config::ProgramKind::Pumpswap)
+                && program_enabled(config::ProgramKind::RaydiumClmm)
+        }
+        DirectRouteFamily::PumpSwapMeteora => {
+            program_enabled(config::ProgramKind::Pumpswap)
+                && program_enabled(config::ProgramKind::MeteoraDlmm)
+        }
+        DirectRouteFamily::PumpSwapWhirlpool => {
+            program_enabled(config::ProgramKind::Pumpswap)
+                && program_enabled(config::ProgramKind::Whirlpool)
+        }
+        DirectRouteFamily::MeteoraRaydium => {
+            program_enabled(config::ProgramKind::MeteoraDlmm)
+                && program_enabled(config::ProgramKind::RaydiumClmm)
+        }
+        DirectRouteFamily::MeteoraWhirlpool => {
+            program_enabled(config::ProgramKind::MeteoraDlmm)
+                && program_enabled(config::ProgramKind::Whirlpool)
+        }
+        DirectRouteFamily::RaydiumWhirlpool => {
+            program_enabled(config::ProgramKind::Whirlpool)
+                && (program_enabled(config::ProgramKind::RaydiumClmm)
+                    || program_enabled(config::ProgramKind::RaydiumAmmV4)
+                    || program_enabled(config::ProgramKind::RaydiumCpmm))
+        }
+        DirectRouteFamily::MeteoraMeteora => false,
+    }
+}
+
+fn record_route_snapshot(stats: &mut RuntimeStats, snapshot: RouteSnapshot) {
+    if !route_snapshot_is_best_route_eligible(&snapshot) {
+        return;
+    }
+
+    let should_replace = stats
+        .best_route
+        .as_ref()
+        .map(|best| snapshot.net_profit_pct > best.net_profit_pct)
+        .unwrap_or(true);
+
+    if should_replace {
+        stats.best_route = Some(snapshot);
+    }
+}
+
+fn route_snapshot_is_best_route_eligible(snapshot: &RouteSnapshot) -> bool {
+    snapshot.route_kind.contains("exact")
+        && snapshot.gross_profit_pct.is_finite()
+        && snapshot.net_profit_pct.is_finite()
+        && snapshot.net_profit_pct > 0.0
+}
+
+fn format_best_route(snapshot: Option<&RouteSnapshot>) -> String {
+    let Some(route) = snapshot else {
+        return "暂无".to_string();
+    };
+
+    format!(
+        "{} {} 到 {}，毛利={:.2}%，净利={:.2}%",
+        &route.token_mint[..route.token_mint.len().min(8)],
+        route.buy_venue,
+        route.sell_venue,
+        route.gross_profit_pct,
+        route.net_profit_pct
+    )
+}
+
+fn format_optional_log_value(value: Option<&str>) -> String {
+    match value {
+        Some(value) => {
+            let sanitized = value.replace(['\n', '\r'], " ");
+            let max_len = 220;
+            if sanitized.len() > max_len {
+                format!("{}...", &sanitized[..max_len])
+            } else {
+                sanitized
+            }
+        }
+        None => "none".to_string(),
+    }
+}
+
+fn log_monitor_candidate(
+    stats: &mut RuntimeStats,
+    route_kind: &'static str,
+    token_mint: &str,
+    buy_venue: &str,
+    sell_venue: &str,
+    trade_size_usdc: Option<f64>,
+    gross_profit_pct: f64,
+    net_profit_pct: f64,
+    route_instance_label: Option<&str>,
+) {
+    if !gross_profit_pct.is_finite() || !net_profit_pct.is_finite() || net_profit_pct <= 0.0 {
+        return;
+    }
+
+    let size_key = trade_size_usdc
+        .map(|size| format!("{size:.2}"))
+        .unwrap_or_else(|| "spot".to_string());
+    let route_instance_key = route_instance_label.unwrap_or("default");
+    let key = format!(
+        "monitor_candidate:{route_kind}:{token_mint}:{buy_venue}:{sell_venue}:{size_key}:{route_instance_key}"
+    );
+    if !should_log_candidate_key(stats, key, net_profit_pct) {
+        return;
+    }
+
+    let size_label = trade_size_usdc
+        .map(|size| format!(" size=${size:.2}"))
+        .unwrap_or_else(|| " spot".to_string());
+    let route_instance_suffix = route_instance_label
+        .map(|value| format!(" pair={value}"))
+        .unwrap_or_default();
+    tracing::debug!(
+        "监控候选：路线={}，币种={}，{}到{}{}{}，毛利={:.2}%，净利={:.2}%",
+        route_kind,
+        token_mint,
+        buy_venue,
+        sell_venue,
+        size_label,
+        route_instance_suffix,
+        gross_profit_pct,
+        net_profit_pct
+    );
+}
+
+fn should_log_candidate(
+    stats: &mut RuntimeStats,
+    route_kind: &'static str,
+    token_mint: &str,
+    net_profit_pct: f64,
+) -> bool {
+    let key = format!("{route_kind}:{token_mint}");
+    should_log_candidate_key(stats, key, net_profit_pct)
+}
+
+fn should_log_candidate_key(stats: &mut RuntimeStats, key: String, net_profit_pct: f64) -> bool {
+    let now = Instant::now();
+    let Some(last) = stats.candidate_logs.get_mut(&key) else {
+        stats.candidate_logs.insert(
+            key,
+            CandidateLogState {
+                last_seen: now,
+                last_net_profit_pct: net_profit_pct,
+            },
+        );
+        return true;
+    };
+
+    let elapsed = now.duration_since(last.last_seen);
+    let net_change = (net_profit_pct - last.last_net_profit_pct).abs();
+    if elapsed >= Duration::from_secs(10) || net_change >= 0.25 {
+        last.last_seen = now;
+        last.last_net_profit_pct = net_profit_pct;
+        true
+    } else {
+        false
+    }
+}
+
+fn second_leg_input_observed_account(
+    path_label: &str,
+    token_mint: &str,
+    first_leg_output_account: Pubkey,
+    second_leg_input_account: Pubkey,
+) -> Pubkey {
+    if first_leg_output_account != second_leg_input_account {
+        tracing::debug!(
+            "{} 账户接线不一致：币种={}，第一腿账户={}，第二腿账户={}，按第二腿账户校准金额",
+            path_label,
+            token_mint,
+            first_leg_output_account,
+            second_leg_input_account
+        );
+    }
+    second_leg_input_account
+}
+
+fn disable_direct_send_skip_checks() -> bool {
+    std::env::var("DISABLE_DIRECT_SEND_SKIP")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn fast_path_direct_send_enabled() -> bool {
+    std::env::var("FAST_PATH_DIRECT_SEND")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn disable_local_profit_checks() -> bool {
+    std::env::var("DISABLE_LOCAL_PROFIT_CHECKS")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn disable_fast_path_spot_profit_filter() -> bool {
+    std::env::var("DISABLE_FAST_PATH_SPOT_PROFIT_FILTER")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn send_on_positive_spot_enabled() -> bool {
+    std::env::var("SEND_ON_POSITIVE_SPOT")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn direct_token_process_delay(execution_manager: &ExecutionManager) -> Duration {
+    if execution_manager.live_send_enabled() && !execution_manager.require_pre_send_simulation() {
+        DIRECT_TOKEN_PROCESS_DELAY_LIVE_NO_SIM
+    } else {
+        DIRECT_TOKEN_PROCESS_DELAY
+    }
+}
+
+fn passes_local_profit_threshold(net_profit_pct: f64, min_profit_threshold: f64) -> bool {
+    net_profit_pct.is_finite()
+        && if disable_local_profit_checks() {
+            true
+        } else {
+            net_profit_pct >= min_profit_threshold
+        }
+}
+
+fn active_offchain_profit_threshold_pct(
+    execution_manager: Option<&ExecutionManager>,
+    config: &Config,
+) -> f64 {
+    execution_manager
+        .filter(|manager| manager.live_send_enabled())
+        .map(|manager| manager.live_send_min_profit_pct())
+        .unwrap_or(config.strategy.min_profit_threshold)
+}
+
+fn passes_active_offchain_profit_threshold(
+    net_profit_pct: f64,
+    execution_manager: Option<&ExecutionManager>,
+    config: &Config,
+) -> bool {
+    passes_local_profit_threshold(
+        net_profit_pct,
+        active_offchain_profit_threshold_pct(execution_manager, config),
+    )
+}
+
+fn meteora_clmm_live_send_enabled() -> bool {
+    std::env::var("ENABLE_METEORA_CLMM_LIVE_SEND")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn meteora_meteora_live_send_enabled() -> bool {
+    std::env::var("ENABLE_METEORA_METEORA_LIVE_SEND")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn should_log_direct_skip(
+    stats: &mut RuntimeStats,
+    path_label: &str,
+    token_mint: &str,
+    reason_key: &str,
+    net_profit_pct: f64,
+) -> bool {
+    should_log_candidate_key(
+        stats,
+        format!("direct_skip:{path_label}:{token_mint}:{reason_key}"),
+        net_profit_pct,
+    )
+}
+
+fn direct_route_path_key(
+    route_kind: &'static str,
+    path_label: &str,
+    token_mint: &str,
+    route_instance: &str,
+) -> String {
+    format!("{route_kind}:{path_label}:{token_mint}:{route_instance}")
+}
+
+fn set_direct_path_cooldown(
+    stats: &mut RuntimeStats,
+    key: String,
+    cooldown: Duration,
+    reason_key: &'static str,
+    gate_profit_pct: f64,
+) {
+    stats.direct_path_cooldowns.insert(
+        key,
+        DirectPathCooldownState {
+            cooldown_until: Instant::now() + cooldown,
+            reason_key,
+            last_gate_profit_pct: gate_profit_pct,
+        },
+    );
+}
+
+fn direct_route_token_path_key(
+    route_kind: &'static str,
+    path_label: &str,
+    token_mint: &str,
+) -> String {
+    format!("{route_kind}:{path_label}:{token_mint}:*")
+}
+
+fn direct_path_cooldown_active<'a>(
+    stats: &'a RuntimeStats,
+    key: &str,
+) -> Option<&'a DirectPathCooldownState> {
+    let now = Instant::now();
+    stats
+        .direct_path_cooldowns
+        .get(key)
+        .filter(|state| state.cooldown_until > now)
+}
+
+fn direct_send_max_state_age() -> Option<Duration> {
+    let millis = parse_non_negative_env_u64(
+        "DIRECT_SEND_MAX_STATE_AGE_MS",
+        DEFAULT_DIRECT_SEND_MAX_STATE_AGE_MS,
+    );
+    if millis == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(millis))
+    }
+}
+
+fn block_stale_unsimulated_direct_send(
+    execution_manager: &ExecutionManager,
+    stats: &mut RuntimeStats,
+    route_kind: &'static str,
+    path_label: &str,
+    token_mint: &str,
+    cooldown_key: &str,
+    net_profit_pct_hint: f64,
+    histories: &[(&str, &[PriceSnapshot])],
+) -> bool {
+    if execution_manager.require_pre_send_simulation() || !execution_manager.live_send_enabled() {
+        return false;
+    }
+
+    let now = Instant::now();
+    let Some(max_state_age) = direct_send_max_state_age() else {
+        return false;
+    };
+    for (label, history) in histories {
+        let Some(last) = history.last() else {
+            set_direct_path_cooldown(
+                stats,
+                cooldown_key.to_string(),
+                Duration::from_secs(30),
+                "stale_route_state",
+                net_profit_pct_hint,
+            );
+            if should_log_direct_skip(
+                stats,
+                path_label,
+                token_mint,
+                "stale_route_state",
+                net_profit_pct_hint,
+            ) {
+                tracing::info!(
+                    "跳过直发：路线={}，路径={}，币种={}，原因={}，缺少近期状态更新，阈值={}毫秒",
+                    route_kind,
+                    path_label,
+                    token_mint,
+                    label,
+                    max_state_age.as_millis()
+                );
+            }
+            return true;
+        };
+        let age = now.saturating_duration_since(last.timestamp);
+        if age > max_state_age {
+            set_direct_path_cooldown(
+                stats,
+                cooldown_key.to_string(),
+                Duration::from_secs(30),
+                "stale_route_state",
+                net_profit_pct_hint,
+            );
+            if should_log_direct_skip(
+                stats,
+                path_label,
+                token_mint,
+                "stale_route_state",
+                net_profit_pct_hint,
+            ) {
+                tracing::info!(
+                    "跳过直发：路线={}，路径={}，币种={}，原因={}，状态已过期，延迟={}毫秒，阈值={}毫秒",
+                    route_kind,
+                    path_label,
+                    token_mint,
+                    label,
+                    age.as_millis(),
+                    max_state_age.as_millis()
+                );
+            }
+            return true;
+        }
+    }
+
+    false
+}
+
+fn classify_unsimulated_send_failure(error: &str) -> Option<(&'static str, Duration, f64)> {
+    let lower = error.to_ascii_lowercase();
+    if is_transaction_too_large_error(error) {
+        return Some((
+            "serialized_transaction_too_large",
+            Duration::from_secs(1_800),
+            -8.0,
+        ));
+    }
+    if is_too_many_account_locks_error(error) {
+        return Some(("too_many_account_locks", Duration::from_secs(900), -6.0));
+    }
+    if is_raydium_not_enough_tick_array_error(error) || is_invalid_first_tick_array_error(error) {
+        return Some((
+            "raydium_tick_array_shortage",
+            Duration::from_secs(300),
+            -3.0,
+        ));
+    }
+    if is_meteora_non_zero_liquidity_bin_array_error(error)
+        || is_meteora_bin_array_account_not_enough_keys_error(error)
+    {
+        return Some((
+            "meteora_bin_array_window_miss",
+            Duration::from_secs(1_800),
+            -8.0,
+        ));
+    }
+    if is_pumpswap_buy_slippage_error(error) {
+        return Some(("pumpswap_buy_slippage", Duration::from_secs(900), -8.0));
+    }
+    if is_meteora_swap_slippage_error(error) {
+        return Some(("meteora_swap_slippage", Duration::from_secs(900), -8.0));
+    }
+    if error.contains("TooLittleOutputReceived") {
+        return Some(("too_little_output_received", Duration::from_secs(900), -6.0));
+    }
+    if error.contains("链上利润不足")
+        || error.contains("profit below threshold")
+        || contains_anchor_or_custom_error_code(error, 7)
+    {
+        return Some((
+            "onchain_profit_below_threshold",
+            Duration::from_secs(900),
+            -6.0,
+        ));
+    }
+    if lower.contains("blockhash not found") {
+        return Some(("blockhash_expired", Duration::from_secs(45), -3.0));
+    }
+    if lower.contains("transaction confirmed failed on-chain") {
+        return Some(("onchain_execution_failed", Duration::from_secs(600), -5.0));
+    }
+    None
+}
+
+fn apply_unsimulated_send_failure_backoff(
+    execution_manager: &ExecutionManager,
+    stats: &mut RuntimeStats,
+    token_mint: &str,
+    cooldown_key: &str,
+    gate_profit_pct: f64,
+    error: &str,
+) {
+    if execution_manager.require_pre_send_simulation() || !execution_manager.live_send_enabled() {
+        return;
+    }
+    let Some((reason_key, cooldown, feedback_pct)) = classify_unsimulated_send_failure(error)
+    else {
+        return;
+    };
+
+    set_direct_path_cooldown(
+        stats,
+        cooldown_key.to_string(),
+        cooldown,
+        reason_key,
+        gate_profit_pct,
+    );
+    record_direct_token_feedback(stats, token_mint, feedback_pct);
+}
+
+fn maybe_bump_raydium_execution_tick_arrays(
+    raydium: &RaydiumState,
+    route_kind: &'static str,
+    path_label: &str,
+    token_mint: &str,
+    error: &str,
+) {
+    if !is_raydium_not_enough_tick_array_error(error) {
+        return;
+    }
+    let Some((current, next)) = bump_raydium_execution_tick_array_count(&raydium.pool_address)
+    else {
+        return;
+    };
+    tracing::debug!(
+        "扩大 Raydium tick数组窗口：路线={}，路径={}，币种={}，池={}，{}到{}",
+        route_kind,
+        path_label,
+        token_mint,
+        raydium.pool_address,
+        current,
+        next
+    );
+}
+
+fn maybe_reduce_raydium_execution_tick_arrays(
+    raydium: &RaydiumState,
+    route_kind: &'static str,
+    path_label: &str,
+    token_mint: &str,
+    error: &str,
+) -> bool {
+    if !is_setup_split_send_error(error) {
+        return false;
+    }
+    let Some((current, next)) = reduce_raydium_execution_tick_array_count(&raydium.pool_address)
+    else {
+        return false;
+    };
+    tracing::debug!(
+        "收缩 Raydium tick数组窗口：路线={}，路径={}，币种={}，池={}，原因=交易过大，{}到{}",
+        route_kind,
+        path_label,
+        token_mint,
+        raydium.pool_address,
+        current,
+        next
+    );
+    true
+}
+
+fn ceil_mul_div_u64(value: u64, multiplier: u64, denominator: u64) -> u64 {
+    if value == 0 || multiplier == 0 || denominator == 0 {
+        return 0;
+    }
+    let numerator = (value as u128).saturating_mul(multiplier as u128);
+    let rounded =
+        numerator.saturating_add(denominator.saturating_sub(1) as u128) / denominator as u128;
+    u64::try_from(rounded).unwrap_or(u64::MAX)
+}
+
+fn floor_mul_div_u64(value: u64, multiplier: u64, denominator: u64) -> u64 {
+    if value == 0 || multiplier == 0 || denominator == 0 {
+        return 0;
+    }
+    let scaled = (value as u128).saturating_mul(multiplier as u128) / denominator as u128;
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+fn pump_buy_max_quote_amount_in(quote_amount_in: u64) -> u64 {
+    ceil_mul_div_u64(
+        quote_amount_in,
+        PUMPSWAP_RAYDIUM_PUMP_BUY_MAX_QUOTE_BPS,
+        BPS_DENOMINATOR_U64,
+    )
+}
+
+fn is_pumpswap_raydium_clmm_plan(plan: &SimulationInstructionPlan) -> bool {
+    let setup_len = plan.setup_instructions.len();
+    let Some(first_instruction) = plan.atomic_instructions.get(setup_len) else {
+        return false;
+    };
+    let Some(second_instruction) = plan.atomic_instructions.get(setup_len + 1) else {
+        return false;
+    };
+
+    let first_program = first_instruction.program_id.to_string();
+    let second_program = second_instruction.program_id.to_string();
+    first_program == executor::swap::PUMP_AMM_PROGRAM_ID
+        && second_program == executor::swap::RAYDIUM_CLMM_PROGRAM_ID
+}
+
+fn atomic_only_instructions_for_plan(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    path_label: &str,
+    trade_size_usdc: f64,
+    plan: &SimulationInstructionPlan,
+) -> Result<Vec<Instruction>> {
+    atomic_only_instructions_for_plan_with_min_profit_raw(
+        execution_manager,
+        config,
+        path_label,
+        trade_size_usdc,
+        plan,
+        None,
+    )
+}
+
+fn atomic_only_instructions_for_plan_with_min_profit_raw(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    path_label: &str,
+    trade_size_usdc: f64,
+    plan: &SimulationInstructionPlan,
+    min_profit_raw_override: Option<u64>,
+) -> Result<Vec<Instruction>> {
+    if is_pumpswap_raydium_clmm_plan(plan) {
+        let setup_len = plan.setup_instructions.len();
+        if plan.atomic_instructions.len() <= setup_len {
+            anyhow::bail!(
+                "client-constructed plan has no executable instructions after setup; total={} setup={}",
+                plan.atomic_instructions.len(),
+                setup_len
+            );
+        }
+        return Ok(plan.atomic_instructions[setup_len..].to_vec());
+    }
+
+    wrap_plan_with_two_hop_executor_atomic_only(
+        execution_manager,
+        config,
+        path_label,
+        trade_size_usdc,
+        plan,
+        min_profit_raw_override,
+    )
+}
+
+fn should_attempt_candidate_key(
+    stats: &mut RuntimeStats,
+    key: String,
+    net_profit_pct: f64,
+) -> bool {
+    let now = Instant::now();
+    let Some(last) = stats.execution_attempts.get_mut(&key) else {
+        stats.execution_attempts.insert(
+            key,
+            CandidateLogState {
+                last_seen: now,
+                last_net_profit_pct: net_profit_pct,
+            },
+        );
+        return true;
+    };
+
+    let elapsed = now.duration_since(last.last_seen);
+    let net_change = (net_profit_pct - last.last_net_profit_pct).abs();
+    if elapsed >= EXECUTION_ATTEMPT_MIN_INTERVAL
+        || net_change >= EXECUTION_ATTEMPT_MIN_NET_CHANGE_PCT
+    {
+        last.last_seen = now;
+        last.last_net_profit_pct = net_profit_pct;
+        true
+    } else {
+        false
+    }
+}
+
+fn parse_u64_after_marker(text: &str, marker: &str) -> Option<u64> {
+    text.split(marker)
+        .nth(1)?
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+fn atomic_execution_gas_cost_usdc(preflight_gas_cost_sol: f64, sol_usdc_price: f64) -> f64 {
+    preflight_gas_cost_sol * sol_usdc_price
+}
+
+fn summarize_simulation_error(error: &str) -> String {
+    if error.contains("serialized transaction too large") {
+        return "交易体积超限: 当前两腿指令账户过多，换金额无效，需减少账户/指令体积".to_string();
+    }
+
+    if is_too_many_account_locks_error(error) {
+        return "账户锁超限: 当前原子交易可写账户过多，需拆分 setup 或缩小 Meteora bin array 窗口"
+            .to_string();
+    }
+
+    if error.contains("InvalidFirstTickArrayAccount") || error.contains("Error Number: 6028") {
+        return "Raydium CLMM 首个 tick array 账户无效: 当前 tick array / remaining tick arrays 顺序不对"
+            .to_string();
+    }
+
+    if is_meteora_bitmap_extension_missing_error(error) {
+        return "Meteora bitmap extension 缺失: 需要先初始化 bitmap extension 账户".to_string();
+    }
+
+    if is_meteora_non_zero_liquidity_bin_array_error(error) {
+        return "Meteora bin array 窗口不足: 当前 remaining bin arrays 没覆盖到非零流动性区间"
+            .to_string();
+    }
+
+    if is_meteora_bin_array_account_not_enough_keys_error(error) {
+        return "Meteora bin array 账户不足: 当前 Swap2 需要更多 remaining bin arrays".to_string();
+    }
+
+    if is_pumpswap_buy_slippage_error(error) {
+        let left = parse_u64_after_marker(error, "Program log: Left: ");
+        let right = parse_u64_after_marker(error, "Program log: Right: ");
+        if let (Some(left), Some(right)) = (left, right) {
+            let shortfall_bps = if right > 0 && right > left {
+                ((right - left) as f64 / right as f64) * 10_000.0
+            } else {
+                0.0
+            };
+            return format!(
+                "PumpSwap 买入滑点超限: 实际买到={} 最低要求={} 差额={:.1}bps",
+                left, right, shortfall_bps
+            );
+        }
+        return "PumpSwap 买入滑点超限: 链上实际买到数量低于最低要求".to_string();
+    }
+
+    if is_meteora_swap_slippage_error(error) {
+        let left = parse_u64_after_marker(error, "Program log: Left: ");
+        let right = parse_u64_after_marker(error, "Program log: Right: ");
+        if let (Some(left), Some(right)) = (left, right) {
+            let shortfall_bps = if right > 0 && right > left {
+                ((right - left) as f64 / right as f64) * 10_000.0
+            } else {
+                0.0
+            };
+            return format!(
+                "Meteora 兑换滑点超限: 实际输出={} 最低要求={} 差额={:.1}bps",
+                left, right, shortfall_bps
+            );
+        }
+        return "Meteora 兑换滑点超限: 链上实际输出低于最低要求".to_string();
+    }
+
+    if error.contains("custom program error: 7") || error.contains("profit below threshold") {
+        let quote_before = parse_u64_after_marker(error, "quote_before=");
+        let quote_after = parse_u64_after_marker(error, "quote_after=");
+        let min_quote_after = parse_u64_after_marker(error, "min_quote_after=");
+        let shortfall = parse_u64_after_marker(error, "shortfall=");
+        if let (Some(quote_before), Some(quote_after), Some(min_quote_after), Some(shortfall)) =
+            (quote_before, quote_after, min_quote_after, shortfall)
+        {
+            return format!(
+                "链上利润不足: 起始报价余额={} 结束报价余额={} 最低要求={} 差额={}",
+                quote_before, quote_after, min_quote_after, shortfall
+            );
+        }
+        return "链上利润不足".to_string();
+    }
+
+    if error.contains("TooLittleOutputReceived") {
+        let left = parse_u64_after_marker(error, "Program log: Left: ");
+        let right = parse_u64_after_marker(error, "Program log: Right: ");
+        if let (Some(left), Some(right)) = (left, right) {
+            let shortfall_bps = if right > 0 && right > left {
+                ((right - left) as f64 / right as f64) * 10_000.0
+            } else {
+                0.0
+            };
+            return format!(
+                "输出过低: 实际输出={} 最低要求={} 差额={:.1}bps",
+                left, right, shortfall_bps
+            );
+        }
+        return "输出过低".to_string();
+    }
+
+    if error.contains("simulateTransaction HTTP status") {
+        return "RPC 模拟请求失败: HTTP 状态异常".to_string();
+    }
+    if error.contains("getMultipleAccounts HTTP status") {
+        return "RPC 拉账户失败: HTTP 状态异常".to_string();
+    }
+    if error.contains("request simulateTransaction") {
+        return "RPC 模拟请求失败".to_string();
+    }
+    if error.contains("request getMultipleAccounts") {
+        return "RPC 拉账户请求失败".to_string();
+    }
+
+    error.to_string()
+}
+
+fn is_transaction_too_large_error(error: &str) -> bool {
+    error.contains("serialized transaction too large")
+}
+
+fn is_too_many_account_locks_error(error: &str) -> bool {
+    error.contains("TooManyAccountLocks")
+        || error
+            .to_ascii_lowercase()
+            .contains("too many account locks")
+}
+
+fn is_setup_split_send_error(error: &str) -> bool {
+    is_transaction_too_large_error(error) || is_too_many_account_locks_error(error)
+}
+
+fn is_invalid_first_tick_array_error(error: &str) -> bool {
+    error.contains("InvalidFirstTickArrayAccount")
+        || contains_anchor_or_custom_error_code(error, 6028)
+}
+
+fn is_raydium_not_enough_tick_array_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    error.contains("NotEnoughTickArrayAccount")
+        || lower.contains("not enough tick array account")
+        || lower.contains("not enought tick array account")
+        || contains_anchor_or_custom_error_code(error, 6027)
+}
+
+fn is_raydium_tick_array_coverage_error(error: &str) -> bool {
+    is_raydium_not_enough_tick_array_error(error)
+        || is_invalid_first_tick_array_error(error)
+        || error.contains("Raydium CLMM 首个 tick array 账户无效")
+}
+
+fn is_meteora_bitmap_extension_missing_error(error: &str) -> bool {
+    error.contains("BitmapExtensionAccountIsNotProvided")
+        || error
+            .to_ascii_lowercase()
+            .contains("bitmap extension account is not provided")
+        || contains_anchor_or_custom_error_code(error, 6036)
+}
+
+fn is_meteora_non_zero_liquidity_bin_array_error(error: &str) -> bool {
+    error.contains("CannotFindNonZeroLiquidityBinArrayId")
+        || error
+            .to_ascii_lowercase()
+            .contains("cannot find non-zero liquidity binarrayid")
+        || error
+            .to_ascii_lowercase()
+            .contains("cannot find non-zero liquidity bin array id")
+        || contains_anchor_or_custom_error_code(error, 6037)
+}
+
+fn is_meteora_bin_array_account_not_enough_keys_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    let account_not_enough_keys =
+        lower.contains("accountnotenoughkeys") || contains_anchor_or_custom_error_code(error, 3005);
+    if !account_not_enough_keys {
+        return false;
+    }
+
+    lower.contains("bin_array")
+        || lower.contains("bin array")
+        || contains_anchor_or_custom_error_code(error, 3005)
+}
+
+fn is_pumpswap_buy_slippage_error(error: &str) -> bool {
+    error.contains("BuySlippageBelowMinBaseAmountOut")
+        || contains_anchor_or_custom_error_code(error, 6040)
+}
+
+fn is_meteora_swap_slippage_error(error: &str) -> bool {
+    error.contains("ExceededAmountSlippageTolerance")
+        || contains_anchor_or_custom_error_code(error, 6003)
+}
+
+fn contains_anchor_or_custom_error_code(error: &str, code: u64) -> bool {
+    let decimal = code.to_string();
+    let hex = format!("{code:x}");
+    let lower = error.to_ascii_lowercase();
+    error.contains(&format!("Error Number: {decimal}"))
+        || error.contains(&format!("\"Custom\": Number({decimal})"))
+        || error.contains(&format!("\"Custom\":Number({decimal})"))
+        || error.contains(&format!("\"Custom\": {decimal}"))
+        || error.contains(&format!("\"Custom\":{decimal}"))
+        || lower.contains(&format!("custom program error: {decimal}"))
+        || lower.contains(&format!("custom program error: 0x{hex}"))
+}
+
+fn should_expand_meteora_execution_bin_arrays(error: &str) -> bool {
+    is_meteora_bitmap_extension_missing_error(error)
+        || is_meteora_non_zero_liquidity_bin_array_error(error)
+        || is_meteora_bin_array_account_not_enough_keys_error(error)
+}
+
+fn should_reduce_meteora_execution_bin_arrays(error: &str) -> bool {
+    is_too_many_account_locks_error(error) || is_transaction_too_large_error(error)
+}
+
+fn execution_pre_send_simulation_enabled(execution_manager: &ExecutionManager) -> bool {
+    execution_manager.require_pre_send_simulation()
+}
+
+fn summarize_live_send_skip_reason(reason: &str) -> &'static str {
+    match reason {
+        "live_send_disabled" => "已关闭实盘发送",
+        "negative_simulated_profit" => "原子模拟后净利润为负",
+        _ => "未满足发送条件",
+    }
+}
+
+fn log_send_success(
+    route_kind: &str,
+    path_label: &str,
+    token_mint: &str,
+    bundle_id: &str,
+    profit_pct: f64,
+) {
+    println!(
+        "交易发送：路线={}，路径={}，币种={}，预计收益={:.2}%，bundleid={}",
+        route_kind, path_label, token_mint, profit_pct, bundle_id
+    );
+}
+
+async fn try_auto_extend_alt(
+    execution_manager: &ExecutionManager,
+    route_kind: &str,
+    path_label: &str,
+    token_mint: &str,
+    instructions: &[Instruction],
+) -> bool {
+    let candidate_pubkeys = collect_instruction_account_pubkeys(instructions);
+    match execution_manager
+        .extend_lookup_tables(&candidate_pubkeys)
+        .await
+    {
+        Ok(added) if added > 0 => {
+            tracing::warn!(
+                "地址表已自动补充：路线={}，路径={}，币种={}，新增地址={}",
+                route_kind,
+                path_label,
+                token_mint,
+                added
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            tracing::warn!(
+                "地址表自动补充失败：路线={}，路径={}，币种={}，原因={}",
+                route_kind,
+                path_label,
+                token_mint,
+                error
+            );
+            false
+        }
+    }
+}
+
+async fn send_direct_plan_with_optional_setup_split(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    route_kind: &str,
+    path_label: &str,
+    token_mint: &str,
+    trade_size_usdc: f64,
+    plan: &SimulationInstructionPlan,
+) -> Result<String> {
+    send_direct_plan_with_optional_setup_split_and_units(
+        execution_manager,
+        config,
+        route_kind,
+        path_label,
+        token_mint,
+        trade_size_usdc,
+        plan,
+        None,
+    )
+    .await
+}
+
+async fn send_direct_plan_with_optional_setup_split_and_units(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    route_kind: &str,
+    path_label: &str,
+    token_mint: &str,
+    trade_size_usdc: f64,
+    plan: &SimulationInstructionPlan,
+    simulated_units_consumed: Option<u64>,
+) -> Result<String> {
+    send_direct_plan_with_optional_setup_split_and_units_with_fee_plan(
+        execution_manager,
+        config,
+        route_kind,
+        path_label,
+        token_mint,
+        trade_size_usdc,
+        plan,
+        simulated_units_consumed,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_direct_plan_with_optional_setup_split_and_units_with_fee_plan(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    route_kind: &str,
+    path_label: &str,
+    token_mint: &str,
+    trade_size_usdc: f64,
+    plan: &SimulationInstructionPlan,
+    simulated_units_consumed: Option<u64>,
+    send_fee_plan: Option<SendFeePlan>,
+) -> Result<String> {
+    let min_profit_raw_override = send_fee_plan.map(|plan| plan.min_profit_raw);
+    let wrapped_instructions = maybe_wrap_plan_with_two_hop_executor_with_min_profit_raw(
+        execution_manager,
+        config,
+        path_label,
+        trade_size_usdc,
+        plan,
+        min_profit_raw_override,
+    )?;
+    let jito_tip_lamports = send_fee_plan
+        .map(|plan| plan.jito_tip_lamports)
+        .unwrap_or_else(|| execution_manager.jito_tip_lamports());
+    match execution_manager
+        .send_instructions_with_simulated_units_and_tip(
+            wrapped_instructions.clone(),
+            simulated_units_consumed,
+            jito_tip_lamports,
+        )
+        .await
+    {
+        Ok(signature) => Ok(signature),
+        Err(error) if is_setup_split_send_error(&error.to_string()) => {
+            let error_text = error.to_string();
+            if is_transaction_too_large_error(&error_text) {
+                if try_auto_extend_alt(
+                    execution_manager,
+                    route_kind,
+                    path_label,
+                    token_mint,
+                    &wrapped_instructions,
+                )
+                .await
+                {
+                    match execution_manager
+                        .send_instructions_with_simulated_units_and_tip(
+                            wrapped_instructions.clone(),
+                            simulated_units_consumed,
+                            jito_tip_lamports,
+                        )
+                        .await
+                    {
+                        Ok(signature) => return Ok(signature),
+                        Err(retry_error)
+                            if !is_setup_split_send_error(&retry_error.to_string()) =>
+                        {
+                            return Err(retry_error);
+                        }
+                        Err(retry_error) => {
+                            tracing::warn!(
+                                "补充地址表后仍无法发送：路线={}，路径={}，币种={}，原因={}",
+                                route_kind,
+                                path_label,
+                                token_mint,
+                                retry_error
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "交易过大且地址表无法自动补充：路线={}，路径={}，币种={}，请检查 ADDRESS_LOOKUP_TABLES 或减少账户数量",
+                        route_kind,
+                        path_label,
+                        token_mint
+                    );
+                }
+            }
+            if is_too_many_account_locks_error(&error_text) {
+                log_instruction_account_lock_summary(
+                    route_kind,
+                    path_label,
+                    token_mint,
+                    &wrapped_instructions,
+                );
+            }
+            if !plan.setup_instructions.is_empty() {
+                let atomic_only = atomic_only_instructions_for_plan_with_min_profit_raw(
+                    execution_manager,
+                    config,
+                    path_label,
+                    trade_size_usdc,
+                    plan,
+                    min_profit_raw_override,
+                )?;
+                tracing::warn!(
+                    "单笔交易过大或锁账户过多，改用 Jito 拆分包：路线={}，路径={}，币种={}，准备指令={}，交易指令={}",
+                    route_kind,
+                    path_label,
+                    token_mint,
+                    plan.setup_instructions.len(),
+                    atomic_only.len()
+                );
+                return execution_manager
+                    .send_instruction_bundle_with_simulated_units_and_tip(
+                        vec![plan.setup_instructions.clone(), atomic_only],
+                        vec![None, simulated_units_consumed],
+                        jito_tip_lamports,
+                    )
+                    .await;
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn block_unsimulated_direct_send(
+    execution_manager: &ExecutionManager,
+    stats: &mut RuntimeStats,
+    route_kind: &'static str,
+    path_label: &str,
+    token_mint: &str,
+    estimated_net_profit_pct: f64,
+) -> bool {
+    if !execution_manager.require_pre_send_simulation() {
+        return false;
+    }
+    if should_log_direct_skip(
+        stats,
+        path_label,
+        token_mint,
+        "pre_send_simulation_required",
+        estimated_net_profit_pct,
+    ) {
+        tracing::debug!(
+            "跳过直发：路线={}，路径={}，币种={}，原因=要求发送前模拟通过",
+            route_kind,
+            path_label,
+            token_mint
+        );
+    }
+    true
+}
+
+fn conservative_meteora_local_quote_amount(raw_amount: f64) -> f64 {
+    raw_amount * (1.0 - METEORA_LOCAL_QUOTE_SAFETY_BPS / 10_000.0)
+}
+
+fn direct_execution_live_min_profit_usdc(
+    execution_manager: &ExecutionManager,
+    trade_size_usdc: f64,
+) -> f64 {
+    if disable_local_profit_checks() {
+        return 0.0;
+    }
+    trade_size_usdc * execution_manager.live_send_min_profit_pct() / 100.0
+}
+
+fn direct_execution_jito_tip_usdc(execution_manager: &ExecutionManager, config: &Config) -> f64 {
+    let jito_tip_usdc = (execution_manager.jito_tip_lamports() as f64 / 1_000_000_000.0)
+        * config.strategy.sol_usdc_price;
+    if disable_local_profit_checks() {
+        0.0
+    } else {
+        jito_tip_usdc
+    }
+}
+
+fn direct_execution_gas_cost_usdc(execution_manager: &ExecutionManager, config: &Config) -> f64 {
+    if disable_local_profit_checks() {
+        return 0.0;
+    }
+    let gas_cost_sol = execution_manager
+        .estimated_send_gas_cost_sol()
+        .unwrap_or(config.strategy.preflight_gas_cost_sol);
+    gas_cost_sol * config.strategy.sol_usdc_price
+}
+
+fn direct_send_extra_edge_pct() -> f64 {
+    parse_non_negative_env_f64(
+        "DIRECT_SEND_EXTRA_EDGE_PCT",
+        DEFAULT_DIRECT_SEND_EXTRA_EDGE_PCT,
+    )
+}
+
+fn direct_send_extra_edge_usdc() -> f64 {
+    parse_non_negative_env_f64(
+        "DIRECT_SEND_EXTRA_EDGE_USDC",
+        DEFAULT_DIRECT_SEND_EXTRA_EDGE_USDC,
+    )
+}
+
+fn direct_send_min_gate_pct() -> f64 {
+    parse_non_negative_env_f64("DIRECT_SEND_MIN_GATE_PCT", DEFAULT_DIRECT_SEND_MIN_GATE_PCT)
+}
+
+fn direct_send_extra_edge_required_profit_usdc(trade_size_usdc: f64) -> f64 {
+    if disable_local_profit_checks() || trade_size_usdc <= 0.0 || !trade_size_usdc.is_finite() {
+        return 0.0;
+    }
+    let pct_edge_usdc = trade_size_usdc * direct_send_extra_edge_pct() / 100.0;
+    pct_edge_usdc.max(direct_send_extra_edge_usdc())
+}
+
+fn direct_execution_safety_buffer_usdc(trade_size_usdc: f64) -> f64 {
+    if disable_local_profit_checks() {
+        return 0.0;
+    }
+    (trade_size_usdc * TWO_HOP_PROFIT_GUARD_BPS / 10_000.0).max(two_hop_profit_guard_min_usdc())
+}
+
+fn direct_execution_required_profit_usdc_from_gross_profit(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    trade_size_usdc: f64,
+) -> f64 {
+    direct_execution_live_min_profit_usdc(execution_manager, trade_size_usdc)
+        + direct_execution_gas_cost_usdc(execution_manager, config)
+        + direct_execution_jito_tip_usdc(execution_manager, config)
+        + direct_execution_safety_buffer_usdc(trade_size_usdc)
+        + direct_send_extra_edge_required_profit_usdc(trade_size_usdc)
+}
+
+fn direct_execution_required_profit_usdc_from_estimated_net_before_gas(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    trade_size_usdc: f64,
+) -> f64 {
+    direct_execution_live_min_profit_usdc(execution_manager, trade_size_usdc)
+        + direct_execution_gas_cost_usdc(execution_manager, config)
+        + direct_execution_jito_tip_usdc(execution_manager, config)
+        + direct_send_extra_edge_required_profit_usdc(trade_size_usdc)
+}
+
+fn direct_execution_required_profit_usdc_from_exact_net_after_gas(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    trade_size_usdc: f64,
+) -> f64 {
+    direct_execution_live_min_profit_usdc(execution_manager, trade_size_usdc)
+        + direct_execution_jito_tip_usdc(execution_manager, config)
+        + direct_send_extra_edge_required_profit_usdc(trade_size_usdc)
+}
+
+fn direct_execution_gate_profit_pct_from_gross_profit_usdc(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    trade_size_usdc: f64,
+    gross_profit_usdc: f64,
+) -> f64 {
+    if trade_size_usdc <= 0.0 || !trade_size_usdc.is_finite() {
+        return f64::NEG_INFINITY;
+    }
+    let required_profit_usdc = direct_execution_required_profit_usdc_from_gross_profit(
+        execution_manager,
+        config,
+        trade_size_usdc,
+    );
+    ((gross_profit_usdc - required_profit_usdc) / trade_size_usdc) * 100.0
+}
+
+fn direct_execution_gate_profit_pct_from_estimated_net_profit_usdc(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    trade_size_usdc: f64,
+    estimated_net_profit_usdc: f64,
+) -> f64 {
+    if trade_size_usdc <= 0.0 || !trade_size_usdc.is_finite() {
+        return f64::NEG_INFINITY;
+    }
+    let required_profit_usdc = direct_execution_required_profit_usdc_from_estimated_net_before_gas(
+        execution_manager,
+        config,
+        trade_size_usdc,
+    );
+    ((estimated_net_profit_usdc - required_profit_usdc) / trade_size_usdc) * 100.0
+}
+
+fn direct_execution_gate_profit_pct_from_exact_net_profit_usdc(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    trade_size_usdc: f64,
+    exact_net_profit_usdc: f64,
+) -> f64 {
+    if trade_size_usdc <= 0.0 || !trade_size_usdc.is_finite() {
+        return f64::NEG_INFINITY;
+    }
+    let required_profit_usdc = direct_execution_required_profit_usdc_from_exact_net_after_gas(
+        execution_manager,
+        config,
+        trade_size_usdc,
+    );
+    ((exact_net_profit_usdc - required_profit_usdc) / trade_size_usdc) * 100.0
+}
+
+fn passes_direct_execution_gate(gate_profit_pct: f64) -> bool {
+    gate_profit_pct.is_finite()
+        && if disable_local_profit_checks() {
+            true
+        } else {
+            gate_profit_pct >= direct_send_min_gate_pct()
+        }
+}
+
+fn block_negative_unsimulated_fast_path_send(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    stats: &mut RuntimeStats,
+    route_kind: &'static str,
+    path_label: &str,
+    token_mint: &str,
+    estimated_net_profit_pct: f64,
+    trade_size_usdc: f64,
+) -> bool {
+    if execution_manager.require_pre_send_simulation() || disable_local_profit_checks() {
+        return false;
+    }
+    if send_on_positive_spot_enabled()
+        && estimated_net_profit_pct.is_finite()
+        && estimated_net_profit_pct > 0.0
+    {
+        return false;
+    }
+    let estimated_net_profit_usdc = trade_size_usdc * estimated_net_profit_pct / 100.0;
+    let gate_profit_pct = direct_execution_gate_profit_pct_from_estimated_net_profit_usdc(
+        execution_manager,
+        config,
+        trade_size_usdc,
+        estimated_net_profit_usdc,
+    );
+    if !estimated_net_profit_pct.is_finite() || !passes_direct_execution_gate(gate_profit_pct) {
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            "negative_unsimulated_fast_path_profit",
+            estimated_net_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发：路线={}，路径={}，币种={}，原因=未通过发送前模拟，现货收益={:.2}%，门槛后={:.2}%，金额=${:.2}",
+                route_kind,
+                path_label,
+                token_mint,
+                estimated_net_profit_pct,
+                gate_profit_pct,
+                trade_size_usdc
+            );
+        }
+        return true;
+    }
+    false
+}
+
+fn passes_unsimulated_exact_profit_pct(net_profit_pct: f64) -> bool {
+    net_profit_pct.is_finite()
+        && if disable_local_profit_checks() {
+            true
+        } else {
+            net_profit_pct > 0.0
+        }
+}
+
+fn summarize_block_reason(reason: &str) -> String {
+    if reason.contains("official swap instruction builders are present") {
+        return "执行准备未完成: 还需要钱包输入/输出 ATA、coin creator vault ATA、两腿原子模拟通过"
+            .to_string();
+    }
+
+    summarize_simulation_error(reason)
+}
+
+async fn simulate_raydium_execution_accounts_best_effort(
+    execution_manager: &ExecutionManager,
+    instructions: Vec<Instruction>,
+    account_addresses: &[String],
+    raydium: &RaydiumState,
+    route_kind: &'static str,
+    path_label: &str,
+    token_mint: &str,
+    stage_label: &str,
+) -> Result<Option<HashMap<String, Vec<u8>>>> {
+    match execution_manager
+        .simulate_instructions_with_accounts(instructions, account_addresses)
+        .await
+    {
+        Ok((_, accounts)) => Ok(Some(accounts)),
+        Err(error) => {
+            let error_text = error.to_string();
+            if is_raydium_not_enough_tick_array_error(&error_text)
+                || is_invalid_first_tick_array_error(&error_text)
+            {
+                maybe_bump_raydium_execution_tick_arrays(
+                    raydium,
+                    route_kind,
+                    path_label,
+                    token_mint,
+                    &error_text,
+                );
+                anyhow::bail!("{}: {}", stage_label, summarize_block_reason(&error_text));
+            }
+            tracing::debug!(
+                "忽略 Raydium 执行探测失败: 路线={} 路径={} 币种={} stage={} 原因={}",
+                route_kind,
+                path_label,
+                token_mint,
+                stage_label,
+                summarize_block_reason(&error_text)
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn log_preflight_blocked(
+    stats: &mut RuntimeStats,
+    route_kind: &'static str,
+    token_mint: &str,
+    buy_venue: &str,
+    sell_venue: &str,
+    reason_key: &str,
+    reason: &str,
+) {
+    let key = format!(
+        "preflight_blocked:{route_kind}:{token_mint}:{buy_venue}:{sell_venue}:{reason_key}"
+    );
+    let label = if route_kind.ends_with("_direct") {
+        "能力检查拦截"
+    } else {
+        "精确预检被拦截"
+    };
+    if should_log_candidate_key(stats, key, 0.0) {
+        tracing::debug!(
+            "{}：路线={}，币种={}，{} 到 {}，原因={}",
+            label,
+            route_kind,
+            token_mint,
+            buy_venue,
+            sell_venue,
+            summarize_block_reason(reason)
+        );
+    }
+}
+
+fn record_tx_build_blocked(
+    stats: &mut RuntimeStats,
+    route_kind: &'static str,
+    token_mint: &str,
+    buy_venue: &str,
+    sell_venue: &str,
+    reason: &str,
+) {
+    stats.tx_build_required += 1;
+    stats.tx_build_blocked += 1;
+
+    let key = format!("tx_blocked:{route_kind}:{token_mint}:{buy_venue}:{sell_venue}:{reason}");
+    if should_log_candidate_key(stats, key, 0.0) {
+        tracing::debug!(
+            "实盘准备未通过：路线={}，币种={}，{} 到 {}，原因={}",
+            route_kind,
+            token_mint,
+            buy_venue,
+            sell_venue,
+            summarize_block_reason(reason)
+        );
+    }
+}
+
+fn pumpswap_clmm_send_blocker(
+    pumpswap: Option<&PumpSwapState>,
+    raydium: &RaydiumState,
+    tick_array_count: usize,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+) -> String {
+    let mut missing = Vec::new();
+    if pumpswap
+        .and_then(|state| state.coin_creator.as_ref())
+        .is_none()
+    {
+        missing.push("PumpSwap coin_creator");
+    }
+    if pumpswap_protocol_fee_recipient.is_none() {
+        missing.push("Pump AMM protocol_fee_recipient");
+    }
+    if raydium.amm_config.is_none() {
+        missing.push("Raydium CLMM amm_config");
+    }
+    if raydium.base_vault.is_none() {
+        missing.push("Raydium CLMM base_vault");
+    }
+    if raydium.quote_vault.is_none() {
+        missing.push("Raydium CLMM quote_vault");
+    }
+    if raydium.observation_key.is_none() {
+        missing.push("Raydium CLMM observation_key");
+    }
+    if tick_array_count == 0 {
+        missing.push("Raydium CLMM tick_array");
+    }
+
+    let dynamic_accounts = [
+        "钱包输入/输出 ATA",
+        "coin creator vault ATA",
+        "两腿原子模拟通过",
+    ];
+
+    if missing.is_empty() {
+        format!("执行准备未完成: 还需要 {}", dynamic_accounts.join("、"))
+    } else {
+        format!(
+            "执行准备未完成: 缺少 {}；另外还需要 {}",
+            missing.join("、"),
+            dynamic_accounts.join("、")
+        )
+    }
+}
+
+fn pumpswap_meteora_send_blocker(
+    pumpswap: Option<&PumpSwapState>,
+    meteora_bin_array_count: usize,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+) -> String {
+    let mut missing = Vec::new();
+    if pumpswap
+        .and_then(|state| state.coin_creator.as_ref())
+        .is_none()
+    {
+        missing.push("PumpSwap coin_creator");
+    }
+    if pumpswap_protocol_fee_recipient.is_none() {
+        missing.push("Pump AMM protocol_fee_recipient");
+    }
+    if meteora_bin_array_count == 0 {
+        missing.push("Meteora bin_array");
+    }
+
+    let dynamic_accounts = ["钱包输入/输出 ATA", "两腿原子模拟通过"];
+
+    if missing.is_empty() {
+        format!("执行准备未完成: 还需要 {}", dynamic_accounts.join("、"))
+    } else {
+        format!(
+            "执行准备未完成: 缺少 {}；另外还需要 {}",
+            missing.join("、"),
+            dynamic_accounts.join("、")
+        )
+    }
+}
+
+fn log_missing_routes(
+    config: &Config,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    metadata: &HashMap<String, market_universe::AccountMetadata>,
+) {
+    let min_routeable_dex_count = config.discovery.min_routeable_dex_count.max(1);
+    let mut all_tokens = HashSet::new();
+    all_tokens.extend(pumpswap_by_token.keys().cloned());
+    all_tokens.extend(raydium_by_token.keys().cloned());
+    all_tokens.extend(meteora_by_token.keys().cloned());
+    all_tokens.extend(whirlpool_by_token.keys().cloned());
+
+    for token_mint in all_tokens {
+        let pumpswap_count = pumpswap_by_token.get(&token_mint).map_or(0, Vec::len);
+        let raydium_count = raydium_by_token.get(&token_mint).map_or(0, Vec::len);
+        let meteora_count = meteora_by_token.get(&token_mint).map_or(0, Vec::len);
+        let whirlpool_count = whirlpool_by_token.get(&token_mint).map_or(0, Vec::len);
+        let mut dexes = Vec::new();
+        if pumpswap_count > 0 {
+            dexes.push("pumpswap");
+        }
+        if raydium_count > 0 {
+            dexes.push("raydium");
+        }
+        if meteora_count > 0 {
+            dexes.push("meteora");
+        }
+        if whirlpool_count > 0 {
+            dexes.push("whirlpool");
+        }
+
+        if dexes.len() >= min_routeable_dex_count {
+            tracing::debug!(
+                "路由覆盖已满足：币种={}，DEX=[{}]，池数=PumpSwap {}、Raydium {}、Meteora {}、Whirlpool {}",
+                token_mint,
+                dexes.join(","),
+                pumpswap_count,
+                raydium_count,
+                meteora_count,
+                whirlpool_count
+            );
+            continue;
+        }
+
+        if let Some(raydium_addresses) = raydium_by_token.get(&token_mint) {
+            for address in raydium_addresses {
+                let label = metadata
+                    .get(address)
+                    .map(|meta| meta.label.as_str())
+                    .unwrap_or("unknown");
+                let pool_address = raydium_state
+                    .get(address)
+                    .map(|state| state.pool_address.as_str())
+                    .unwrap_or(address);
+                tracing::debug!(
+                    "路由覆盖不足：币种={}，DEX=[{}]，最低={}，池={}，标签={}",
+                    token_mint,
+                    dexes.join(","),
+                    min_routeable_dex_count,
+                    pool_address,
+                    label
+                );
+            }
+        }
+    }
+}
+
+async fn run_startup_pumpswap_raydium_probes(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    pumpswap_fee_config: Option<&pumpswap::PumpSwapGlobalFeeConfig>,
+    stats: &mut RuntimeStats,
+) {
+    let mut route_pairs = 0usize;
+
+    for (token_mint, raydium_addresses) in raydium_by_token {
+        let Some(pumpswap_addresses) = pumpswap_by_token.get(token_mint) else {
+            continue;
+        };
+
+        for raydium_address in raydium_addresses {
+            let Some(raydium) = raydium_state.get(raydium_address) else {
+                continue;
+            };
+
+            for pumpswap_address in pumpswap_addresses {
+                let Some(pumpswap) = pumpswap_state.get(pumpswap_address) else {
+                    continue;
+                };
+
+                route_pairs += 1;
+                if raydium.venue == RaydiumVenue::Clmm {
+                    run_startup_bidirectional_clmm_probes(
+                        execution_manager,
+                        config,
+                        pumpswap,
+                        raydium,
+                        raydium_clmm_tick_arrays,
+                        select_pumpswap_protocol_fee_recipient(Some(pumpswap), pumpswap_fee_config),
+                        stats,
+                    )
+                    .await;
+                } else {
+                    evaluate_pumpswap_raydium(
+                        execution_manager,
+                        config,
+                        pumpswap,
+                        raydium,
+                        raydium_clmm_tick_arrays,
+                        select_pumpswap_protocol_fee_recipient(Some(pumpswap), pumpswap_fee_config),
+                        stats,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    if route_pairs > 0 {
+        tracing::debug!("启动预检完成：PumpSwap/Raydium 路径数={}", route_pairs);
+    }
+}
+
+async fn run_startup_pumpswap_meteora_probes(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_fee_config: Option<&pumpswap::PumpSwapGlobalFeeConfig>,
+    stats: &mut RuntimeStats,
+) {
+    let mut route_pairs = 0usize;
+
+    for (token_mint, meteora_addresses) in meteora_by_token {
+        let Some(pumpswap_addresses) = pumpswap_by_token.get(token_mint) else {
+            continue;
+        };
+
+        for meteora_address in meteora_addresses {
+            let Some(meteora) = meteora_state.get(meteora_address) else {
+                continue;
+            };
+
+            for pumpswap_address in pumpswap_addresses {
+                let Some(pumpswap) = pumpswap_state.get(pumpswap_address) else {
+                    continue;
+                };
+
+                route_pairs += 1;
+                evaluate_pumpswap_meteora_spot(
+                    execution_manager,
+                    config,
+                    pumpswap,
+                    meteora,
+                    meteora_bin_arrays,
+                    select_pumpswap_protocol_fee_recipient(Some(pumpswap), pumpswap_fee_config),
+                    stats,
+                )
+                .await;
+            }
+        }
+    }
+
+    if route_pairs > 0 {
+        tracing::debug!("启动预检完成：PumpSwap/Meteora 路径数={}", route_pairs);
+    }
+}
+
+async fn run_startup_bidirectional_clmm_probes(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    raydium: &RaydiumState,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    stats: &mut RuntimeStats,
+) {
+    evaluate_pumpswap_raydium_clmm_spot(
+        execution_manager,
+        config,
+        pumpswap,
+        raydium,
+        true,
+        raydium_clmm_tick_arrays,
+        pumpswap_protocol_fee_recipient,
+        stats,
+    )
+    .await;
+
+    let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+        return;
+    };
+    let Some(raydium_token) = strategy::quote::raydium_traded_token(
+        raydium,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+    ) else {
+        return;
+    };
+    if pumpswap_pool.token_mint != raydium_token {
+        return;
+    }
+
+    preflight_pumpswap_clmm(
+        Some(execution_manager),
+        config,
+        Some(pumpswap),
+        &pumpswap_pool,
+        raydium,
+        &raydium_token,
+        ClmmSpotDirection::PumpSwapToClmm,
+        raydium_clmm_tick_arrays,
+        pumpswap_protocol_fee_recipient,
+        stats,
+    )
+    .await;
+}
+
+fn select_pumpswap_protocol_fee_recipient<'a>(
+    pumpswap: Option<&PumpSwapState>,
+    fee_config: Option<&'a pumpswap::PumpSwapGlobalFeeConfig>,
+) -> Option<&'a str> {
+    let fee_config = fee_config?;
+    if pumpswap.is_some_and(|pool| pool.is_mayhem_mode) {
+        fee_config
+            .reserved_fee_recipient
+            .as_deref()
+            .or_else(|| {
+                fee_config
+                    .reserved_fee_recipients
+                    .first()
+                    .map(String::as_str)
+            })
+            .or(Some(fee_config.protocol_fee_recipient.as_str()))
+    } else {
+        Some(fee_config.protocol_fee_recipient.as_str())
+    }
+}
+
+async fn evaluate_and_execute(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pump: &PumpState,
+    raydium: &RaydiumState,
+    stats: &mut RuntimeStats,
+) {
+    for trade_size_usdc in effective_trade_sizes_usdc(Some(execution_manager), config) {
+        let Some(opportunity) = strategy::execution::validate_arbitrage_with_mints(
+            pump,
+            raydium,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+            trade_size_usdc,
+        ) else {
+            stats.no_match_checks += 1;
+            continue;
+        };
+        stats.validated_checks += 1;
+
+        if !passes_local_profit_threshold(
+            opportunity.profit_pct,
+            config.strategy.min_profit_threshold,
+        ) {
+            stats.rejected_below_threshold += 1;
+            tracing::debug!(
+                "Opportunity below threshold: {:.2}% < {:.2}%",
+                opportunity.profit_pct,
+                config.strategy.min_profit_threshold
+            );
+            continue;
+        }
+
+        log_monitor_candidate(
+            stats,
+            "pump_raydium",
+            &pump.token_mint,
+            &opportunity.buy_venue,
+            &opportunity.sell_venue,
+            Some(opportunity.trade_size_usdc),
+            (opportunity.profit_usdc / opportunity.trade_size_usdc) * 100.0,
+            opportunity.profit_pct,
+            None,
+        );
+
+        let risk = strategy::risk::assess_risk(
+            pump,
+            raydium,
+            trade_size_usdc,
+            config.strategy.sol_usdc_price,
+        );
+
+        if !disable_local_profit_checks()
+            && !strategy::risk::should_execute(
+                &risk,
+                opportunity.profit_pct,
+                config.strategy.min_profit_threshold,
+            )
+        {
+            stats.rejected_risk += 1;
+            tracing::debug!(
+                "Opportunity rejected by risk: score={:.1}, warnings={:?}",
+                risk.risk_score,
+                risk.warnings
+            );
+            continue;
+        }
+        stats.executable_opportunities += 1;
+
+        tracing::debug!("Valid arbitrage opportunity detected!");
+        tracing::debug!(
+            "   {} @ ${:.6} → {} @ ${:.6}",
+            opportunity.buy_venue,
+            opportunity.buy_price,
+            opportunity.sell_venue,
+            opportunity.sell_price
+        );
+        tracing::debug!(
+            "   Size: ${:.2}, net profit: ${:.2} ({:.2}%), impact: {:.2}%, risk: {:.1}",
+            opportunity.trade_size_usdc,
+            opportunity.profit_usdc,
+            opportunity.profit_pct,
+            opportunity.price_impact,
+            risk.risk_score
+        );
+
+        match execution_manager
+            .execute_arbitrage(&opportunity, pump, raydium, config.strategy.sol_usdc_price)
+            .await
+        {
+            Ok(bundle_id) => {
+                log_send_success(
+                    "pump_raydium",
+                    &format!("{}->{}", opportunity.buy_venue, opportunity.sell_venue),
+                    &pump.token_mint,
+                    &bundle_id,
+                    opportunity.profit_pct,
+                );
+            }
+            Err(e) => {
+                record_tx_build_blocked(
+                    stats,
+                    "pump_raydium",
+                    &pump.token_mint,
+                    &opportunity.buy_venue,
+                    &opportunity.sell_venue,
+                    &e.to_string(),
+                );
+            }
+        }
+    }
+}
+
+async fn evaluate_pumpswap_raydium(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    raydium: &RaydiumState,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    stats: &mut RuntimeStats,
+) {
+    if raydium.venue == RaydiumVenue::Clmm {
+        evaluate_pumpswap_raydium_clmm_spot(
+            execution_manager,
+            config,
+            pumpswap,
+            raydium,
+            false,
+            raydium_clmm_tick_arrays,
+            pumpswap_protocol_fee_recipient,
+            stats,
+        )
+        .await;
+        return;
+    }
+
+    let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+    let Some(raydium_pool) = cp_pool_from_raydium(config, raydium) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+
+    for trade_size_usdc in effective_trade_sizes_usdc(Some(execution_manager), config) {
+        let Some(opportunity) = strategy::quote::quote_best_cp_arbitrage(
+            &pumpswap_pool,
+            &raydium_pool,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+            trade_size_usdc,
+        ) else {
+            stats.no_match_checks += 1;
+            continue;
+        };
+
+        stats.validated_checks += 1;
+        record_route_snapshot(
+            stats,
+            RouteSnapshot {
+                token_mint: opportunity.token_mint.clone(),
+                buy_venue: opportunity.buy_venue.as_str().to_string(),
+                sell_venue: opportunity.sell_venue.as_str().to_string(),
+                buy_price_usdc: opportunity.buy_price_usdc,
+                sell_price_usdc: opportunity.sell_price_usdc,
+                gross_profit_pct: (opportunity.costs.gross_profit_usdc
+                    / opportunity.trade_size_usdc)
+                    * 100.0,
+                net_profit_pct: opportunity.profit_pct,
+                route_kind: "cp",
+            },
+        );
+        if !passes_local_profit_threshold(
+            opportunity.profit_pct,
+            config.strategy.min_profit_threshold,
+        ) {
+            stats.rejected_below_threshold += 1;
+            continue;
+        }
+
+        if opportunity.total_price_impact_bps > 300.0 {
+            stats.rejected_risk += 1;
+            continue;
+        }
+
+        stats.non_executable_opportunities += 1;
+        log_monitor_candidate(
+            stats,
+            "cp",
+            &opportunity.token_mint,
+            opportunity.buy_venue.as_str(),
+            opportunity.sell_venue.as_str(),
+            Some(opportunity.trade_size_usdc),
+            (opportunity.costs.gross_profit_usdc / opportunity.trade_size_usdc) * 100.0,
+            opportunity.profit_pct,
+            None,
+        );
+    }
+}
+
+async fn evaluate_pumpswap_raydium_clmm_spot(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    raydium: &RaydiumState,
+    force_diagnostic_probe: bool,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    stats: &mut RuntimeStats,
+) {
+    let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+    let Some(raydium_token) = strategy::quote::raydium_traded_token(
+        raydium,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+    ) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+    if pumpswap_pool.token_mint != raydium_token {
+        stats.no_match_checks += 1;
+        return;
+    }
+
+    let Some(pumpswap_price_usdc) = cp_pool_spot_price_usdc(
+        &pumpswap_pool,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    ) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+    let Some(raydium_price_usdc) = clmm_token_price_usdc(
+        raydium,
+        &raydium_token,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    ) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+
+    let low = pumpswap_price_usdc.min(raydium_price_usdc);
+    let high = pumpswap_price_usdc.max(raydium_price_usdc);
+    if low <= 0.0 || !low.is_finite() || !high.is_finite() {
+        stats.no_match_checks += 1;
+        return;
+    }
+
+    stats.validated_checks += 1;
+    let fee_pct =
+        (PUMPSWAP_FEE_BPS + raydium.fee_bps + strategy::quote::SLIPPAGE_BUFFER_BPS) / 100.0;
+    let gross_profit_pct = ((high - low) / low) * 100.0;
+    let net_profit_pct = gross_profit_pct - fee_pct;
+    let (buy_venue, sell_venue) = if pumpswap_price_usdc < raydium_price_usdc {
+        ("PumpSwap", raydium.venue.label())
+    } else {
+        (raydium.venue.label(), "PumpSwap")
+    };
+    let direction = if pumpswap_price_usdc < raydium_price_usdc {
+        ClmmSpotDirection::PumpSwapToClmm
+    } else {
+        ClmmSpotDirection::ClmmToPumpSwap
+    };
+    record_route_snapshot(
+        stats,
+        RouteSnapshot {
+            token_mint: raydium_token.clone(),
+            buy_venue: buy_venue.to_string(),
+            sell_venue: sell_venue.to_string(),
+            buy_price_usdc: low,
+            sell_price_usdc: high,
+            gross_profit_pct,
+            net_profit_pct,
+            route_kind: "clmm_spot",
+        },
+    );
+
+    if executor_direct_send_ready(execution_manager) {
+        maybe_send_pumpswap_clmm_direct(
+            execution_manager,
+            config,
+            pumpswap,
+            &pumpswap_pool,
+            raydium,
+            &raydium_token,
+            direction,
+            raydium_clmm_tick_arrays,
+            pumpswap_protocol_fee_recipient,
+            net_profit_pct,
+            stats,
+        )
+        .await;
+        return;
+    }
+
+    if !should_attempt_simulation_after_preflight(
+        net_profit_pct,
+        active_offchain_profit_threshold_pct(Some(execution_manager), config),
+    ) {
+        stats.rejected_below_threshold += 1;
+        if !force_diagnostic_probe {
+            return;
+        }
+        let candidate_key = format!(
+            "clmm_spot_force_preflight:{}:{}",
+            raydium.pool_address, raydium_token
+        );
+        if should_log_candidate_key(stats, candidate_key, net_profit_pct) {
+            tracing::debug!(
+                "{}CLMM 粗筛低于策略阈值，继续做启动诊断：币种={}，路径={} 到 {}，毛利={:.2}%，净利={:.2}%，阈值={:.2}%",
+                if force_diagnostic_probe { "启动 " } else { "" },
+                raydium_token,
+                buy_venue,
+                sell_venue,
+                gross_profit_pct,
+                net_profit_pct,
+                config.strategy.min_profit_threshold
+            );
+        }
+    }
+
+    stats.non_executable_opportunities += 1;
+    stats.exact_quote_required += 1;
+    log_monitor_candidate(
+        stats,
+        "clmm_spot",
+        &raydium_token,
+        buy_venue,
+        sell_venue,
+        None,
+        gross_profit_pct,
+        net_profit_pct,
+        None,
+    );
+    preflight_pumpswap_clmm(
+        Some(execution_manager),
+        config,
+        Some(pumpswap),
+        &pumpswap_pool,
+        raydium,
+        &raydium_token,
+        direction,
+        raydium_clmm_tick_arrays,
+        pumpswap_protocol_fee_recipient,
+        stats,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_send_pumpswap_clmm_direct(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap_state: &PumpSwapState,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+    direction: ClmmSpotDirection,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let Some(trade_size_usdc) = direct_execution_trade_size_usdc(config) else {
+        return false;
+    };
+    maybe_send_pumpswap_clmm_direct_with_trade_size(
+        execution_manager,
+        config,
+        pumpswap_state,
+        pumpswap_pool,
+        raydium,
+        raydium_token,
+        direction,
+        raydium_clmm_tick_arrays,
+        pumpswap_protocol_fee_recipient,
+        trade_size_usdc,
+        estimated_net_profit_pct,
+        stats,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_send_pumpswap_clmm_direct_with_trade_size(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap_state: &PumpSwapState,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+    direction: ClmmSpotDirection,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    trade_size_usdc: f64,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let path_label = pumpswap_clmm_direction_label(direction);
+    if !pumpswap_clmm_execution_direction_enabled(direction) {
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            raydium_token,
+            "pumpswap_clmm_reverse_disabled",
+            estimated_net_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=当前只允许 PumpSwap->Raydium CLMM 单向执行",
+                path_label,
+                raydium_token
+            );
+        }
+        return true;
+    }
+    let route_instance = format!("{}/{}", pumpswap_state.pool_address, raydium.pool_address);
+    let cooldown_key =
+        direct_route_path_key("pumpswap_clmm", path_label, raydium_token, &route_instance);
+    if let Some(cooldown) = direct_path_cooldown_active(stats, &cooldown_key) {
+        let reason_key = cooldown.reason_key;
+        let last_gate_profit_pct = cooldown.last_gate_profit_pct;
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            raydium_token,
+            reason_key,
+            last_gate_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=路径冷却中 原因={} gate={:.2}%",
+                path_label,
+                raydium_token,
+                reason_key,
+                last_gate_profit_pct
+            );
+        }
+        return true;
+    }
+    if block_stale_unsimulated_direct_send(
+        execution_manager,
+        stats,
+        "pumpswap_clmm",
+        path_label,
+        raydium_token,
+        &cooldown_key,
+        estimated_net_profit_pct,
+        &[
+            ("PumpSwap", &pumpswap_state.price_history),
+            (raydium.venue.label(), &raydium.price_history),
+        ],
+    ) {
+        return true;
+    }
+    let offchain_threshold_pct =
+        active_offchain_profit_threshold_pct(Some(execution_manager), config);
+    if fast_path_direct_send_enabled()
+        && !disable_fast_path_spot_profit_filter()
+        && !(send_on_positive_spot_enabled() && estimated_net_profit_pct > 0.0)
+        && estimated_net_profit_pct <= offchain_threshold_pct
+    {
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            raydium_token,
+            "fast_path_spot_below_threshold",
+            estimated_net_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=快速路径 spot 未过阈值 spot={:.2}% threshold={:.2}% size=${:.2}",
+                path_label,
+                raydium_token,
+                estimated_net_profit_pct,
+                offchain_threshold_pct,
+                trade_size_usdc
+            );
+        }
+        return true;
+    }
+    if !should_attempt_direct_send(
+        stats,
+        "pumpswap_clmm",
+        raydium_token,
+        estimated_net_profit_pct,
+    ) {
+        return true;
+    }
+    if block_negative_unsimulated_fast_path_send(
+        execution_manager,
+        config,
+        stats,
+        "pumpswap_clmm",
+        path_label,
+        raydium_token,
+        estimated_net_profit_pct,
+        trade_size_usdc,
+    ) {
+        return true;
+    }
+    if let Some((matches_spot, spot_direction, pumpswap_price_usdc, raydium_price_usdc)) =
+        pumpswap_clmm_direction_matches_spot(
+            config,
+            pumpswap_pool,
+            raydium,
+            raydium_token,
+            direction,
+        )
+    {
+        if !matches_spot {
+            if should_log_direct_skip(
+                stats,
+                "pumpswap_clmm",
+                raydium_token,
+                "wrong_spot_direction",
+                estimated_net_profit_pct,
+            ) {
+                tracing::debug!(
+                    "跳过直发: 路径={} 币种={} 原因=当前只允许 PumpSwap->Raydium CLMM，现货方向不是低买高卖 spot_direction={:?} pumpswap_price=${:.10} raydium_price=${:.10}",
+                    path_label,
+                    raydium_token,
+                    spot_direction,
+                    pumpswap_price_usdc,
+                    raydium_price_usdc
+                );
+            }
+            return true;
+        }
+    }
+
+    const PUMPSWAP_CLMM_BUILD_ATTEMPTS: usize = 3;
+    stats.tx_build_required += 1;
+    let mut plan = None;
+    let mut last_build_error = None;
+    for attempt in 0..PUMPSWAP_CLMM_BUILD_ATTEMPTS {
+        match build_pumpswap_clmm_direct_execution_instructions(
+            config,
+            execution_manager,
+            pumpswap_state,
+            pumpswap_pool,
+            raydium,
+            raydium_token,
+            direction,
+            raydium_clmm_tick_arrays,
+            pumpswap_protocol_fee_recipient,
+            trade_size_usdc,
+        )
+        .await
+        {
+            Ok(built_plan) => {
+                plan = Some(built_plan);
+                break;
+            }
+            Err(error) => {
+                let error_text = error.to_string();
+                last_build_error = Some(error_text.clone());
+                if attempt + 1 < PUMPSWAP_CLMM_BUILD_ATTEMPTS
+                    && is_raydium_tick_array_coverage_error(&error_text)
+                {
+                    tracing::debug!(
+                        "Raydium tick数组不足，扩大后重试：路径={}，币种={}，次数={}/{}，原因={}",
+                        path_label,
+                        raydium_token,
+                        attempt + 1,
+                        PUMPSWAP_CLMM_BUILD_ATTEMPTS,
+                        summarize_block_reason(&error_text)
+                    );
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    let Some(plan) = plan else {
+        stats.tx_build_blocked += 1;
+        let error_text = last_build_error.unwrap_or_else(|| "unknown build error".to_string());
+        tracing::debug!(
+            "构建 PumpSwap 到 Raydium CLMM 交易失败：路径={}，币种={}，原因={}",
+            path_label,
+            raydium_token,
+            summarize_block_reason(&error_text)
+        );
+        return false;
+    };
+
+    if block_unsimulated_direct_send(
+        execution_manager,
+        stats,
+        "pumpswap_clmm",
+        path_label,
+        raydium_token,
+        estimated_net_profit_pct,
+    ) {
+        return true;
+    }
+
+    match send_direct_plan_with_optional_setup_split_and_units(
+        execution_manager,
+        config,
+        "pumpswap_clmm",
+        path_label,
+        raydium_token,
+        trade_size_usdc,
+        &plan,
+        None,
+    )
+    .await
+    {
+        Ok(signature) => {
+            record_token_send_success(stats, raydium_token);
+            log_send_success(
+                "pumpswap_clmm",
+                path_label,
+                raydium_token,
+                &signature,
+                estimated_net_profit_pct,
+            );
+            true
+        }
+        Err(error) => {
+            if error.to_string().contains("rate-limited") {
+                tracing::debug!(
+                    "跳过直发: 路径={} 币种={} 原因=发送冷却中 收益提示={:.2}%",
+                    path_label,
+                    raydium_token,
+                    estimated_net_profit_pct
+                );
+                return true;
+            } else {
+                maybe_bump_raydium_execution_tick_arrays(
+                    raydium,
+                    "pumpswap_clmm",
+                    path_label,
+                    raydium_token,
+                    &error.to_string(),
+                );
+                apply_unsimulated_send_failure_backoff(
+                    execution_manager,
+                    stats,
+                    raydium_token,
+                    &cooldown_key,
+                    estimated_net_profit_pct,
+                    &error.to_string(),
+                );
+                tracing::debug!(
+                    "发送构建失败：路线=PumpSwap到Raydium CLMM，路径={}，币种={}，原因={}",
+                    path_label,
+                    raydium_token,
+                    error
+                );
+            }
+            false
+        }
+    }
+}
+
+fn pumpswap_clmm_spot_candidate(
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    raydium: &RaydiumState,
+) -> Option<(ClmmSpotDirection, f64)> {
+    if raydium.venue != RaydiumVenue::Clmm {
+        return None;
+    }
+    let pumpswap_pool = cp_pool_from_pumpswap(config, pumpswap)?;
+    let raydium_token = strategy::quote::raydium_traded_token(
+        raydium,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+    )?;
+    if pumpswap_pool.token_mint != raydium_token {
+        return None;
+    }
+    pumpswap_clmm_spot_direction_and_profit(config, &pumpswap_pool, raydium, &raydium_token)
+        .and_then(|(direction, net_profit_pct, _, _)| {
+            pumpswap_clmm_execution_direction_enabled(direction)
+                .then_some((direction, net_profit_pct))
+        })
+}
+
+fn pumpswap_clmm_direct_candidate_for_token(
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    raydium: &RaydiumState,
+    token_mint: &str,
+) -> Option<(ClmmSpotDirection, f64)> {
+    if raydium.venue != RaydiumVenue::Clmm {
+        return None;
+    }
+    let pumpswap_pool = cp_pool_from_pumpswap(config, pumpswap)?;
+    if pumpswap_pool.token_mint != token_mint {
+        return None;
+    }
+    if raydium.base_mint != token_mint && raydium.quote_mint != token_mint {
+        return None;
+    }
+
+    let spot = pumpswap_clmm_spot_direction_and_profit(config, &pumpswap_pool, raydium, token_mint);
+    if disable_local_profit_checks() {
+        return Some((
+            ClmmSpotDirection::PumpSwapToClmm,
+            spot.map(|(_, net_profit_pct, _, _)| net_profit_pct)
+                .unwrap_or(0.0),
+        ));
+    }
+    spot.and_then(|(direction, net_profit_pct, _, _)| {
+        pumpswap_clmm_execution_direction_enabled(direction).then_some((direction, net_profit_pct))
+    })
+}
+
+fn pumpswap_clmm_spot_direction_and_profit(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+) -> Option<(ClmmSpotDirection, f64, f64, f64)> {
+    if pumpswap_pool.token_mint != raydium_token {
+        return None;
+    }
+    let pumpswap_price_usdc = cp_pool_spot_price_usdc(
+        pumpswap_pool,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let raydium_price_usdc = clmm_token_price_usdc(
+        raydium,
+        raydium_token,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let low = pumpswap_price_usdc.min(raydium_price_usdc);
+    let high = pumpswap_price_usdc.max(raydium_price_usdc);
+    if low <= 0.0 || !low.is_finite() || !high.is_finite() {
+        return None;
+    }
+    let fee_pct =
+        (PUMPSWAP_FEE_BPS + raydium.fee_bps + strategy::quote::SLIPPAGE_BUFFER_BPS) / 100.0;
+    let gross_profit_pct = ((high - low) / low) * 100.0;
+    let net_profit_pct = gross_profit_pct - fee_pct;
+    let direction = if pumpswap_price_usdc < raydium_price_usdc {
+        ClmmSpotDirection::PumpSwapToClmm
+    } else {
+        ClmmSpotDirection::ClmmToPumpSwap
+    };
+    Some((
+        direction,
+        net_profit_pct,
+        pumpswap_price_usdc,
+        raydium_price_usdc,
+    ))
+}
+
+fn pumpswap_clmm_direction_matches_spot(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+    direction: ClmmSpotDirection,
+) -> Option<(bool, ClmmSpotDirection, f64, f64)> {
+    let (spot_direction, _, pumpswap_price_usdc, raydium_price_usdc) =
+        pumpswap_clmm_spot_direction_and_profit(config, pumpswap_pool, raydium, raydium_token)?;
+    Some((
+        spot_direction == direction,
+        spot_direction,
+        pumpswap_price_usdc,
+        raydium_price_usdc,
+    ))
+}
+
+fn pumpswap_meteora_direction_labels(
+    direction: MeteoraPumpSwapDirection,
+) -> (&'static str, &'static str, &'static str) {
+    match direction {
+        MeteoraPumpSwapDirection::PumpSwapToMeteora => {
+            ("PumpSwap", "Meteora", "PumpSwap->Meteora Pool")
+        }
+        MeteoraPumpSwapDirection::MeteoraToPumpSwap => {
+            ("Meteora", "PumpSwap", "Meteora Pool->PumpSwap")
+        }
+    }
+}
+
+fn pumpswap_meteora_direct_candidate_allowed(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+) -> bool {
+    if meteora.is_damm_v2() {
+        return false;
+    }
+
+    let Some(meteora_quote_mint) =
+        meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    else {
+        return false;
+    };
+
+    // Direct PumpSwap <-> Meteora execution currently assumes a SOL quote round-trip.
+    meteora_quote_mint == config.tokens.sol_mint
+        && pumpswap_pool.quote_mint == config.tokens.sol_mint
+}
+
+fn pumpswap_meteora_spot_direction_and_profit(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+) -> Option<(MeteoraPumpSwapDirection, f64, f64, f64)> {
+    if !pumpswap_meteora_direct_candidate_allowed(config, pumpswap_pool, meteora) {
+        return None;
+    }
+    let pumpswap_price_usdc = cp_pool_spot_price_usdc(
+        pumpswap_pool,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let meteora_price_usdc = meteora_token_price_usdc(
+        meteora,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    if !pumpswap_price_usdc.is_finite()
+        || !meteora_price_usdc.is_finite()
+        || pumpswap_price_usdc <= 0.0
+        || meteora_price_usdc <= 0.0
+    {
+        return None;
+    }
+    let low = pumpswap_price_usdc.min(meteora_price_usdc);
+    let high = pumpswap_price_usdc.max(meteora_price_usdc);
+    let estimated_cost_pct =
+        (PUMPSWAP_FEE_BPS + meteora.fee_bps + strategy::quote::SLIPPAGE_BUFFER_BPS) / 100.0;
+    let gross_profit_pct = ((high - low) / low) * 100.0;
+    let net_profit_pct = gross_profit_pct - estimated_cost_pct;
+    let direction = if pumpswap_price_usdc < meteora_price_usdc {
+        MeteoraPumpSwapDirection::PumpSwapToMeteora
+    } else {
+        MeteoraPumpSwapDirection::MeteoraToPumpSwap
+    };
+    Some((
+        direction,
+        pumpswap_price_usdc,
+        meteora_price_usdc,
+        net_profit_pct,
+    ))
+}
+
+fn pumpswap_meteora_spot_candidate(
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    meteora: &MeteoraState,
+) -> Option<(MeteoraPumpSwapDirection, f64)> {
+    let pumpswap_pool = cp_pool_from_pumpswap(config, pumpswap)?;
+    let meteora_token = meteora.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    if pumpswap_pool.token_mint != meteora_token {
+        return None;
+    }
+    let (direction, _, _, net_profit_pct) =
+        pumpswap_meteora_spot_direction_and_profit(config, &pumpswap_pool, meteora)?;
+    Some((direction, net_profit_pct))
+}
+
+async fn evaluate_pumpswap_meteora_spot(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    meteora: &MeteoraState,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    stats: &mut RuntimeStats,
+) {
+    let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+    let Some(meteora_token) =
+        meteora.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    else {
+        stats.no_match_checks += 1;
+        return;
+    };
+    if pumpswap_pool.token_mint != meteora_token {
+        stats.no_match_checks += 1;
+        return;
+    }
+
+    let Some(pumpswap_price_usdc) = cp_pool_spot_price_usdc(
+        &pumpswap_pool,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    ) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+    let Some(meteora_price_usdc) = meteora_token_price_usdc(
+        meteora,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    ) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+
+    if !pumpswap_price_usdc.is_finite()
+        || !meteora_price_usdc.is_finite()
+        || pumpswap_price_usdc <= 0.0
+        || meteora_price_usdc <= 0.0
+    {
+        stats.no_match_checks += 1;
+        return;
+    }
+
+    stats.validated_checks += 1;
+    let low = pumpswap_price_usdc.min(meteora_price_usdc);
+    let high = pumpswap_price_usdc.max(meteora_price_usdc);
+    let gross_profit_pct = ((high - low) / low) * 100.0;
+    let estimated_cost_pct =
+        (PUMPSWAP_FEE_BPS + meteora.fee_bps + strategy::quote::SLIPPAGE_BUFFER_BPS) / 100.0;
+    let net_profit_pct = gross_profit_pct - estimated_cost_pct;
+    let direction = if pumpswap_price_usdc < meteora_price_usdc {
+        MeteoraPumpSwapDirection::PumpSwapToMeteora
+    } else {
+        MeteoraPumpSwapDirection::MeteoraToPumpSwap
+    };
+    let (buy_venue, sell_venue, _) = pumpswap_meteora_direction_labels(direction);
+    record_route_snapshot(
+        stats,
+        RouteSnapshot {
+            token_mint: meteora_token.clone(),
+            buy_venue: buy_venue.to_string(),
+            sell_venue: sell_venue.to_string(),
+            buy_price_usdc: low,
+            sell_price_usdc: high,
+            gross_profit_pct,
+            net_profit_pct,
+            route_kind: "pumpswap_meteora_spot",
+        },
+    );
+
+    if executor_direct_send_ready(execution_manager) {
+        maybe_send_pumpswap_meteora_direct(
+            execution_manager,
+            config,
+            pumpswap,
+            &pumpswap_pool,
+            meteora,
+            &meteora_token,
+            direction,
+            meteora_bin_arrays,
+            pumpswap_protocol_fee_recipient,
+            net_profit_pct,
+            stats,
+        )
+        .await;
+        return;
+    }
+
+    if !passes_local_profit_threshold(net_profit_pct, config.strategy.min_profit_threshold) {
+        stats.rejected_below_threshold += 1;
+        return;
+    }
+
+    stats.non_executable_opportunities += 1;
+    stats.exact_quote_required += 1;
+    let route_instance = format!(
+        "{}/{}",
+        &pumpswap.pool_address[..pumpswap.pool_address.len().min(8)],
+        &meteora.pool_address[..meteora.pool_address.len().min(8)]
+    );
+    log_monitor_candidate(
+        stats,
+        "pumpswap_meteora_spot",
+        &meteora_token,
+        buy_venue,
+        sell_venue,
+        None,
+        gross_profit_pct,
+        net_profit_pct,
+        Some(route_instance.as_str()),
+    );
+
+    preflight_pumpswap_meteora(
+        Some(execution_manager),
+        config,
+        Some(pumpswap),
+        &pumpswap_pool,
+        meteora,
+        &meteora_token,
+        direction,
+        meteora_bin_arrays,
+        pumpswap_protocol_fee_recipient,
+        stats,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_send_pumpswap_meteora_direct(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    direction: MeteoraPumpSwapDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let Some(trade_size_usdc) = direct_execution_trade_size_usdc(config) else {
+        return false;
+    };
+    maybe_send_pumpswap_meteora_direct_with_trade_size(
+        execution_manager,
+        config,
+        pumpswap,
+        pumpswap_pool,
+        meteora,
+        token_mint,
+        direction,
+        meteora_bin_arrays,
+        pumpswap_protocol_fee_recipient,
+        trade_size_usdc,
+        estimated_net_profit_pct,
+        stats,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_send_pumpswap_meteora_direct_with_trade_size(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    direction: MeteoraPumpSwapDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    trade_size_usdc: f64,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    maybe_send_pumpswap_meteora_direct_with_trade_size_inner(
+        execution_manager,
+        config,
+        pumpswap,
+        pumpswap_pool,
+        meteora,
+        token_mint,
+        direction,
+        meteora_bin_arrays,
+        pumpswap_protocol_fee_recipient,
+        trade_size_usdc,
+        estimated_net_profit_pct,
+        stats,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_send_pumpswap_meteora_direct_with_trade_size_inner(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    direction: MeteoraPumpSwapDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    trade_size_usdc: f64,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+    bypass_direct_send_rate_limit: bool,
+) -> bool {
+    let (_, _, path_label) = pumpswap_meteora_direction_labels(direction);
+    let Some((low_to_high_direction, pumpswap_price_usdc, meteora_price_usdc, spot_net_profit_pct)) =
+        pumpswap_meteora_spot_direction_and_profit(config, pumpswap_pool, meteora)
+    else {
+        if should_log_direct_skip(stats, path_label, token_mint, "spot_price_unavailable", 0.0) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=无法判断 PumpSwap/Meteora 便宜市场",
+                path_label,
+                token_mint
+            );
+        }
+        return true;
+    };
+    if direction != low_to_high_direction {
+        let (_, _, low_to_high_label) = pumpswap_meteora_direction_labels(low_to_high_direction);
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            "not_low_to_high_direction",
+            spot_net_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=方向不是低买高卖 low_to_high={} pump_price=${:.10} meteora_price=${:.10} spot={:.2}%",
+                path_label,
+                token_mint,
+                low_to_high_label,
+                pumpswap_price_usdc,
+                meteora_price_usdc,
+                spot_net_profit_pct
+            );
+        }
+        return true;
+    }
+    let route_instance = format!("{}/{}", pumpswap.pool_address, meteora.pool_address);
+    let cooldown_key =
+        direct_route_path_key("pumpswap_meteora", path_label, token_mint, &route_instance);
+    if let Some(cooldown) = direct_path_cooldown_active(stats, &cooldown_key) {
+        let reason_key = cooldown.reason_key;
+        let last_gate_profit_pct = cooldown.last_gate_profit_pct;
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            reason_key,
+            last_gate_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=路径冷却中 原因={} gate={:.2}%",
+                path_label,
+                token_mint,
+                reason_key,
+                last_gate_profit_pct
+            );
+        }
+        return true;
+    }
+    if block_stale_unsimulated_direct_send(
+        execution_manager,
+        stats,
+        "pumpswap_meteora",
+        path_label,
+        token_mint,
+        &cooldown_key,
+        estimated_net_profit_pct,
+        &[
+            ("PumpSwap", &pumpswap.price_history),
+            ("Meteora", &meteora.price_history),
+        ],
+    ) {
+        return true;
+    }
+    if let Some(block) = pumpswap_meteora_executable_block_reason(
+        config,
+        pumpswap_pool,
+        meteora,
+        token_mint,
+        direction,
+    )
+    .await
+    {
+        log_preflight_blocked(
+            stats,
+            "pumpswap_meteora_direct",
+            token_mint,
+            match direction {
+                MeteoraPumpSwapDirection::PumpSwapToMeteora => "PumpSwap",
+                MeteoraPumpSwapDirection::MeteoraToPumpSwap => "Meteora",
+            },
+            match direction {
+                MeteoraPumpSwapDirection::PumpSwapToMeteora => "Meteora",
+                MeteoraPumpSwapDirection::MeteoraToPumpSwap => "PumpSwap",
+            },
+            block.reason_key,
+            &block.reason,
+        );
+        return true;
+    }
+    let (meteora_input_mint, meteora_output_mint) = match direction {
+        MeteoraPumpSwapDirection::PumpSwapToMeteora => {
+            (token_mint, pumpswap_pool.quote_mint.as_str())
+        }
+        MeteoraPumpSwapDirection::MeteoraToPumpSwap => {
+            (pumpswap_pool.quote_mint.as_str(), token_mint)
+        }
+    };
+    if let Some(block) = meteora_direct_swap_executable_block_reason(
+        config,
+        meteora,
+        meteora_bin_arrays,
+        meteora_input_mint,
+        meteora_output_mint,
+    )
+    .await
+    {
+        log_preflight_blocked(
+            stats,
+            "pumpswap_meteora_direct",
+            token_mint,
+            match direction {
+                MeteoraPumpSwapDirection::PumpSwapToMeteora => "PumpSwap",
+                MeteoraPumpSwapDirection::MeteoraToPumpSwap => "Meteora",
+            },
+            match direction {
+                MeteoraPumpSwapDirection::PumpSwapToMeteora => "Meteora",
+                MeteoraPumpSwapDirection::MeteoraToPumpSwap => "PumpSwap",
+            },
+            block.reason_key,
+            &block.reason,
+        );
+        return true;
+    }
+    let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+        .values()
+        .filter(|array| array.lb_pair == meteora.pool_address)
+        .collect();
+    if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+        if should_log_direct_skip(stats, path_label, token_mint, "missing_bin_arrays", 0.0) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=缺少 Meteora bin arrays",
+                path_label,
+                token_mint
+            );
+        }
+        return true;
+    }
+    // For PumpSwap/Meteora, spot only selects the path. The send decision must come from
+    // a same-size exact quote so the off-chain gate matches the on-chain executor.
+    let Some(mut exact) = (match direction {
+        MeteoraPumpSwapDirection::PumpSwapToMeteora => quote_pumpswap_buy_meteora_sell(
+            config,
+            pumpswap_pool,
+            meteora,
+            token_mint,
+            &pool_bin_arrays,
+            trade_size_usdc,
+        ),
+        MeteoraPumpSwapDirection::MeteoraToPumpSwap => quote_meteora_buy_pumpswap_sell(
+            config,
+            pumpswap_pool,
+            meteora,
+            token_mint,
+            &pool_bin_arrays,
+            trade_size_usdc,
+        ),
+    }) else {
+        set_direct_path_cooldown(
+            stats,
+            cooldown_key.clone(),
+            Duration::from_secs(300),
+            "exact_quote_unavailable",
+            estimated_net_profit_pct,
+        );
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            "exact_quote_unavailable",
+            0.0,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=exact quote 不可得 size=${:.2}",
+                path_label,
+                token_mint,
+                trade_size_usdc
+            );
+        }
+        return true;
+    };
+    let mut assessment = None;
+    if let Some(arb_quote) = exact.arb_quote.as_mut() {
+        arb_quote.forward_pool = pumpswap.pool_address.clone();
+        arb_quote.backward_pool = meteora.pool_address.clone();
+        let current_assessment = assess_pumpswap_meteora_opportunity(config, stats, arb_quote);
+        record_route_execution_event(
+            stats,
+            arb_quote,
+            route_execution_event(
+                "discovered",
+                arb_quote,
+                Some(current_assessment.opportunity_class),
+                false,
+                false,
+                false,
+                (!current_assessment.send_allowed)
+                    .then(|| current_assessment.filter_reasons.join(",")),
+                None,
+                arb_quote.real_net_profit_usdc,
+            ),
+        );
+        if !current_assessment.send_allowed {
+            set_direct_path_cooldown(
+                stats,
+                cooldown_key.clone(),
+                Duration::from_secs(60),
+                "class_c_observe_only",
+                exact.net_profit_pct,
+            );
+            log_pumpswap_meteora_quote_decision(
+                path_label,
+                token_mint,
+                trade_size_usdc,
+                arb_quote,
+                &current_assessment,
+                "观察",
+                "",
+            );
+            return true;
+        }
+        log_pumpswap_meteora_quote_decision(
+            path_label,
+            token_mint,
+            trade_size_usdc,
+            arb_quote,
+            &current_assessment,
+            "候选",
+            "",
+        );
+        assessment = Some(current_assessment);
+    }
+    let exact_direct_gate_profit_pct = direct_execution_gate_profit_pct_from_gross_profit_usdc(
+        execution_manager,
+        config,
+        trade_size_usdc,
+        exact.gross_profit_usdc,
+    );
+    let positive_exact_override = !execution_manager.require_pre_send_simulation()
+        && passes_unsimulated_exact_profit_pct(exact.net_profit_pct);
+    if !positive_exact_override
+        && !disable_direct_send_skip_checks()
+        && !passes_direct_execution_gate(exact_direct_gate_profit_pct)
+    {
+        if let Some(arb_quote) = exact.arb_quote.as_ref() {
+            let assessment = assessment
+                .clone()
+                .unwrap_or_else(|| assess_pumpswap_meteora_opportunity(config, stats, arb_quote));
+            record_route_execution_event(
+                stats,
+                arb_quote,
+                route_execution_event(
+                    "gate_rejected",
+                    arb_quote,
+                    Some(assessment.opportunity_class),
+                    false,
+                    false,
+                    false,
+                    Some("exact_quote_below_threshold".to_string()),
+                    None,
+                    arb_quote.real_net_profit_usdc,
+                ),
+            );
+        }
+        if exact_direct_gate_profit_pct <= -2.0 {
+            set_direct_path_cooldown(
+                stats,
+                cooldown_key.clone(),
+                Duration::from_secs(300),
+                "exact_quote_below_threshold",
+                exact_direct_gate_profit_pct,
+            );
+        }
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            "exact_quote_below_threshold",
+            exact.net_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=exact quote 未过阈值 spot={:.2}% exact={:.2}% direct_exact={:.2}% gate={:.2}% size=${:.2}",
+                path_label,
+                token_mint,
+                estimated_net_profit_pct,
+                exact.net_profit_pct,
+                exact.net_profit_pct,
+                exact_direct_gate_profit_pct,
+                trade_size_usdc
+            );
+        }
+        stats.rejected_below_threshold += 1;
+        return true;
+    }
+    if !allow_direct_send_attempt(
+        stats,
+        "pumpswap_meteora",
+        token_mint,
+        exact_direct_gate_profit_pct,
+        bypass_direct_send_rate_limit,
+    ) {
+        return true;
+    }
+
+    let use_calibrated_send_plan = execution_manager.require_pre_send_simulation();
+    stats.tx_build_required += 1;
+    let plan = match if use_calibrated_send_plan {
+        build_pumpswap_meteora_simulation_instructions(
+            config,
+            execution_manager,
+            Some(pumpswap),
+            pumpswap_pool,
+            meteora,
+            token_mint,
+            direction,
+            meteora_bin_arrays,
+            pumpswap_protocol_fee_recipient,
+            &exact,
+            trade_size_usdc,
+        )
+        .await
+    } else {
+        build_pumpswap_meteora_direct_execution_instructions(
+            config,
+            execution_manager,
+            pumpswap,
+            pumpswap_pool,
+            meteora,
+            token_mint,
+            direction,
+            meteora_bin_arrays,
+            pumpswap_protocol_fee_recipient,
+            &exact,
+            trade_size_usdc,
+        )
+        .await
+    } {
+        Ok(plan) => plan,
+        Err(error) => {
+            stats.tx_build_blocked += 1;
+            if let Some(retried) = retry_pumpswap_meteora_with_expanded_bin_arrays(
+                execution_manager,
+                config,
+                pumpswap,
+                pumpswap_pool,
+                meteora,
+                token_mint,
+                direction,
+                meteora_bin_arrays,
+                pumpswap_protocol_fee_recipient,
+                trade_size_usdc,
+                exact.net_profit_pct,
+                stats,
+                "pumpswap_meteora",
+                path_label,
+                &error.to_string(),
+            )
+            .await
+            {
+                return retried;
+            }
+            if let Some(retried) = retry_pumpswap_meteora_with_reduced_bin_arrays(
+                execution_manager,
+                config,
+                pumpswap,
+                pumpswap_pool,
+                meteora,
+                token_mint,
+                direction,
+                meteora_bin_arrays,
+                pumpswap_protocol_fee_recipient,
+                trade_size_usdc,
+                exact.net_profit_pct,
+                stats,
+                "pumpswap_meteora",
+                path_label,
+                &error.to_string(),
+            )
+            .await
+            {
+                return retried;
+            }
+            if let Some(arb_quote) = exact.arb_quote.as_ref() {
+                record_route_execution_event(
+                    stats,
+                    arb_quote,
+                    route_execution_event(
+                        "build_failed",
+                        arb_quote,
+                        assessment.as_ref().map(|current| current.opportunity_class),
+                        false,
+                        false,
+                        false,
+                        Some(error.to_string()),
+                        None,
+                        arb_quote.real_net_profit_usdc,
+                    ),
+                );
+            }
+            tracing::debug!(
+                "构建 PumpSwap 到 Meteora 交易失败：路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                summarize_block_reason(&error.to_string())
+            );
+            return false;
+        }
+    };
+
+    let guard = match compute_two_hop_profit_guard(
+        execution_manager,
+        config,
+        trade_size_usdc,
+        &plan.net_quote_mint,
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            stats.tx_build_blocked += 1;
+            if let Some(arb_quote) = exact.arb_quote.as_ref() {
+                record_route_execution_event(
+                    stats,
+                    arb_quote,
+                    route_execution_event(
+                        "guard_failed",
+                        arb_quote,
+                        assessment.as_ref().map(|current| current.opportunity_class),
+                        false,
+                        false,
+                        false,
+                        Some(error.to_string()),
+                        None,
+                        arb_quote.real_net_profit_usdc,
+                    ),
+                );
+            }
+            tracing::debug!(
+                "计算两跳利润保护失败：路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                error
+            );
+            return false;
+        }
+    };
+    if let Some(expected_quote_after_raw) = usdc_to_raw_for_mint(
+        &plan.net_quote_mint,
+        exact.final_amount_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )
+    .map(ceil_u64)
+    {
+        log_two_hop_profit_guard(
+            path_label,
+            token_mint,
+            trade_size_usdc,
+            estimated_net_profit_pct,
+            exact.net_profit_pct,
+            exact.net_profit_pct,
+            exact_direct_gate_profit_pct,
+            plan.net_quote_start_balance,
+            expected_quote_after_raw,
+            &guard,
+        );
+    }
+
+    let Some(send_fee_plan) =
+        send_fee_plan_for_exact_quote(config, &exact, &plan.net_quote_mint, trade_size_usdc)
+    else {
+        stats.rejected_below_threshold += 1;
+        tracing::info!(
+            "跳过发送：路径={}，币种={}，原因=无法计算动态小费和基础费",
+            path_label,
+            token_mint
+        );
+        return true;
+    };
+    tracing::debug!(
+        "发送费用计划：路径={}，币种={}，毛利raw={}，tip={} lamports，tip比例={:.1}%，基础费={} lamports，扣费后raw={}，本地不拦截，交给链上保护",
+        path_label,
+        token_mint,
+        send_fee_plan.gross_profit_raw,
+        send_fee_plan.jito_tip_lamports,
+        send_fee_plan.tip_share * 100.0,
+        send_fee_plan.base_fee_lamports,
+        send_fee_plan.net_after_tip_and_base_raw
+    );
+
+    let mut simulated_units_consumed = None;
+    let mut simulated_real_profit_usdc = exact
+        .arb_quote
+        .as_ref()
+        .map(|arb_quote| arb_quote.real_net_profit_usdc)
+        .unwrap_or(exact.net_profit_usdc);
+    let mut send_profit_pct = exact_direct_gate_profit_pct;
+    if use_calibrated_send_plan {
+        let atomic_instructions = match maybe_wrap_plan_with_two_hop_executor(
+            execution_manager,
+            config,
+            path_label,
+            trade_size_usdc,
+            &plan,
+        ) {
+            Ok(instructions) => instructions,
+            Err(error) => {
+                stats.tx_build_blocked += 1;
+                if let Some(arb_quote) = exact.arb_quote.as_ref() {
+                    record_route_execution_event(
+                        stats,
+                        arb_quote,
+                        route_execution_event(
+                            "wrap_failed",
+                            arb_quote,
+                            assessment.as_ref().map(|current| current.opportunity_class),
+                            false,
+                            false,
+                            false,
+                            Some(error.to_string()),
+                            None,
+                            simulated_real_profit_usdc,
+                        ),
+                    );
+                }
+                tracing::debug!(
+                    "构建链上两腿指令失败：路径={}，币种={}，原因={}",
+                    path_label,
+                    token_mint,
+                    summarize_block_reason(&error.to_string())
+                );
+                return false;
+            }
+        };
+
+        match execution_manager
+            .simulate_instructions_with_accounts(
+                atomic_instructions,
+                &[plan.net_quote_token_account.to_string()],
+            )
+            .await
+        {
+            Ok((report, accounts)) => {
+                let simulated_quote_net_change_raw = simulated_token_account_net_change(
+                    &accounts,
+                    &plan.net_quote_token_account,
+                    plan.net_quote_start_balance,
+                );
+                let simulated_quote_net_change_usdc = simulated_quote_net_change_raw
+                    .and_then(|amount| {
+                        raw_to_usdc_for_mint(
+                            &plan.net_quote_mint,
+                            amount as f64,
+                            &config.tokens.usdc_mint,
+                            &config.tokens.sol_mint,
+                            config.strategy.sol_usdc_price,
+                        )
+                    })
+                    .unwrap_or(f64::NEG_INFINITY);
+                let simulated_gate_profit_pct =
+                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                        execution_manager,
+                        config,
+                        trade_size_usdc,
+                        simulated_quote_net_change_usdc,
+                    );
+                simulated_real_profit_usdc = simulated_quote_net_change_usdc;
+                tracing::debug!(
+                    "PumpSwap/Meteora 直发前原子模拟: 路径={} 币种={} CU={:?} exact_gate={:.2}% simulated_gate={:.2}% net_change_raw={:?}",
+                    path_label,
+                    token_mint,
+                    report.units_consumed,
+                    exact_direct_gate_profit_pct,
+                    simulated_gate_profit_pct,
+                    simulated_quote_net_change_raw
+                );
+                if !passes_direct_execution_gate(simulated_gate_profit_pct) {
+                    if let Some(arb_quote) = exact.arb_quote.as_ref() {
+                        record_route_execution_event(
+                            stats,
+                            arb_quote,
+                            route_execution_event(
+                                "simulation_rejected",
+                                arb_quote,
+                                assessment.as_ref().map(|current| current.opportunity_class),
+                                false,
+                                false,
+                                false,
+                                Some("negative_simulated_profit".to_string()),
+                                report.units_consumed,
+                                simulated_real_profit_usdc,
+                            ),
+                        );
+                    }
+                    set_direct_path_cooldown(
+                        stats,
+                        cooldown_key.clone(),
+                        Duration::from_secs(180),
+                        "negative_simulated_profit",
+                        simulated_gate_profit_pct,
+                    );
+                    if should_log_direct_skip(
+                        stats,
+                        path_label,
+                        token_mint,
+                        "negative_simulated_profit",
+                        simulated_gate_profit_pct,
+                    ) {
+                        tracing::debug!(
+                            "跳过直发: 路径={} 币种={} 原因=原子模拟后净利润不足 exact={:.2}% simulated={:.2}% size=${:.2}",
+                            path_label,
+                            token_mint,
+                            exact_direct_gate_profit_pct,
+                            simulated_gate_profit_pct,
+                            trade_size_usdc
+                        );
+                    }
+                    return true;
+                }
+                simulated_units_consumed = report.units_consumed;
+                send_profit_pct = simulated_gate_profit_pct;
+            }
+            Err(error) => {
+                stats.simulation_failed += 1;
+                stats.last_simulation_error = Some(error.to_string());
+                if let Some(arb_quote) = exact.arb_quote.as_ref() {
+                    record_route_execution_event(
+                        stats,
+                        arb_quote,
+                        route_execution_event(
+                            "simulation_failed",
+                            arb_quote,
+                            assessment.as_ref().map(|current| current.opportunity_class),
+                            false,
+                            false,
+                            false,
+                            Some(error.to_string()),
+                            None,
+                            simulated_real_profit_usdc,
+                        ),
+                    );
+                }
+                tracing::debug!(
+                    "PumpSwap 到 Meteora 发送前模拟失败：路径={}，币种={}，原因={}",
+                    path_label,
+                    token_mint,
+                    summarize_simulation_error(&error.to_string())
+                );
+                return false;
+            }
+        }
+    }
+
+    match send_direct_plan_with_optional_setup_split_and_units_with_fee_plan(
+        execution_manager,
+        config,
+        "pumpswap_meteora",
+        path_label,
+        token_mint,
+        trade_size_usdc,
+        &plan,
+        simulated_units_consumed,
+        Some(send_fee_plan),
+    )
+    .await
+    {
+        Ok(signature) => {
+            record_token_send_success(stats, token_mint);
+            if let Some(arb_quote) = exact.arb_quote.as_ref() {
+                record_route_execution_event(
+                    stats,
+                    arb_quote,
+                    route_execution_event(
+                        "submitted",
+                        arb_quote,
+                        assessment.as_ref().map(|current| current.opportunity_class),
+                        true,
+                        true,
+                        true,
+                        None,
+                        simulated_units_consumed,
+                        simulated_real_profit_usdc,
+                    ),
+                );
+            }
+            log_send_success(
+                "pumpswap_meteora",
+                path_label,
+                token_mint,
+                &signature,
+                send_profit_pct,
+            );
+            true
+        }
+        Err(error) => {
+            if error.to_string().contains("rate-limited") {
+                tracing::debug!(
+                    "跳过直发: 路径={} 币种={} 原因=发送冷却中 收益提示={:.2}%",
+                    path_label,
+                    token_mint,
+                    estimated_net_profit_pct
+                );
+                return true;
+            } else {
+                if is_transaction_too_large_error(&error.to_string()) {
+                    set_direct_path_cooldown(
+                        stats,
+                        cooldown_key.clone(),
+                        Duration::from_secs(1800),
+                        "serialized_transaction_too_large",
+                        send_profit_pct,
+                    );
+                }
+                if let Some(retried) = retry_pumpswap_meteora_with_expanded_bin_arrays(
+                    execution_manager,
+                    config,
+                    pumpswap,
+                    pumpswap_pool,
+                    meteora,
+                    token_mint,
+                    direction,
+                    meteora_bin_arrays,
+                    pumpswap_protocol_fee_recipient,
+                    trade_size_usdc,
+                    exact.net_profit_pct,
+                    stats,
+                    "pumpswap_meteora",
+                    path_label,
+                    &error.to_string(),
+                )
+                .await
+                {
+                    return retried;
+                }
+                if let Some(retried) = retry_pumpswap_meteora_with_reduced_bin_arrays(
+                    execution_manager,
+                    config,
+                    pumpswap,
+                    pumpswap_pool,
+                    meteora,
+                    token_mint,
+                    direction,
+                    meteora_bin_arrays,
+                    pumpswap_protocol_fee_recipient,
+                    trade_size_usdc,
+                    exact.net_profit_pct,
+                    stats,
+                    "pumpswap_meteora",
+                    path_label,
+                    &error.to_string(),
+                )
+                .await
+                {
+                    return retried;
+                }
+                apply_unsimulated_send_failure_backoff(
+                    execution_manager,
+                    stats,
+                    token_mint,
+                    &cooldown_key,
+                    send_profit_pct,
+                    &error.to_string(),
+                );
+                record_direct_pair_feedback(
+                    stats,
+                    &pumpswap_meteora_pair_feedback_key(
+                        token_mint,
+                        &pumpswap.pool_address,
+                        &meteora.pool_address,
+                    ),
+                    -6.0,
+                );
+                maybe_bump_meteora_execution_bin_arrays(
+                    meteora,
+                    "pumpswap_meteora",
+                    path_label,
+                    token_mint,
+                    &error.to_string(),
+                );
+                if let Some(arb_quote) = exact.arb_quote.as_ref() {
+                    record_route_execution_event(
+                        stats,
+                        arb_quote,
+                        route_execution_event(
+                            "send_failed",
+                            arb_quote,
+                            assessment.as_ref().map(|current| current.opportunity_class),
+                            true,
+                            false,
+                            false,
+                            Some(error.to_string()),
+                            simulated_units_consumed,
+                            simulated_real_profit_usdc,
+                        ),
+                    );
+                }
+                tracing::debug!(
+                    "发送构建失败：路线=PumpSwap到Meteora，路径={}，币种={}，原因={}",
+                    path_label,
+                    token_mint,
+                    error
+                );
+            }
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_pumpswap_meteora_direct_execution_instructions(
+    config: &Config,
+    execution_manager: &ExecutionManager,
+    pumpswap: &PumpSwapState,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora_pool: &MeteoraState,
+    token_mint: &str,
+    direction: MeteoraPumpSwapDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    quote: &ExactPreflightQuote,
+    trade_size_usdc: f64,
+) -> Result<SimulationInstructionPlan> {
+    let meteora_quote_mint = meteora_pool
+        .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        .ok_or_else(|| anyhow::anyhow!("Meteora quote mint not found"))?;
+    if pumpswap_pool.quote_mint != meteora_quote_mint {
+        anyhow::bail!(
+            "PumpSwap/Meteora quote mint mismatch: pumpswap={} meteora={}",
+            pumpswap_pool.quote_mint,
+            meteora_quote_mint
+        );
+    }
+
+    let user = execution_manager
+        .wallet_pubkey()
+        .ok_or_else(|| anyhow::anyhow!("executor wallet is not configured"))?;
+    let protocol_fee_recipient = Pubkey::from_str(
+        pumpswap_protocol_fee_recipient
+            .ok_or_else(|| anyhow::anyhow!("missing Pump AMM protocol_fee_recipient"))?,
+    )?;
+    let base_token_program = token_program_for_simulation(config, &pumpswap.base_mint).await?;
+    let quote_token_program = token_program_for_simulation(config, &pumpswap.quote_mint).await?;
+    let base_mint = Pubkey::from_str(&pumpswap.base_mint)?;
+    let quote_mint = Pubkey::from_str(&pumpswap.quote_mint)?;
+    let max_sol_input_lamports = max_sol_input_lamports_for_trade_size(config, trade_size_usdc)?;
+    let pump_accounts = executor::swap::derive_pump_amm_accounts_with_token_programs(
+        pumpswap,
+        &user,
+        &protocol_fee_recipient,
+        &base_token_program,
+        &quote_token_program,
+    )?;
+    let net_quote_start_balance = token_account_balance(
+        &config.rpc.http_url,
+        &pump_accounts.user_quote_token_account,
+    )
+    .await?;
+    let mut prepared_atas = HashSet::new();
+    let mut instructions = Vec::new();
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &base_mint,
+        &base_token_program,
+        &mut prepared_atas,
+    )?;
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &quote_mint,
+        &quote_token_program,
+        &mut prepared_atas,
+    )?;
+    let quote_amount_in = quote
+        .arb_quote
+        .as_ref()
+        .map(|arb_quote| arb_quote.quote_in_raw)
+        .unwrap_or_else(|| {
+            ceil_u64(
+                usdc_to_raw_for_mint(
+                    &pumpswap.quote_mint,
+                    trade_size_usdc,
+                    &config.tokens.usdc_mint,
+                    &config.tokens.sol_mint,
+                    config.strategy.sol_usdc_price,
+                )
+                .unwrap_or_default(),
+            )
+        });
+    if pumpswap.quote_mint == config.tokens.sol_mint {
+        ensure_simulation_sol_input_within_cap(
+            "direct PumpSwap/Meteora SOL input",
+            quote_amount_in,
+            max_sol_input_lamports,
+        )?;
+        prepare_wrapped_sol_input(
+            &config.rpc.http_url,
+            &user,
+            &quote_mint,
+            &quote_token_program,
+            &mut prepared_atas,
+            &mut instructions,
+            quote_amount_in,
+        )
+        .await?;
+    }
+    let use_meteora_bitmap_extension = maybe_prepare_meteora_bitmap_extension_setup(
+        config,
+        meteora_pool,
+        &user,
+        &mut instructions,
+    )
+    .await?;
+    let setup_instructions = instructions.clone();
+
+    match direction {
+        MeteoraPumpSwapDirection::PumpSwapToMeteora => {
+            let arb_quote = quote.arb_quote.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("missing PumpSwap->Meteora arb quote for direct plan")
+            })?;
+            let use_final_guard_only = use_final_guard_only_min_out(execution_manager);
+            let min_profit_pct = pumpswap_meteora_enforced_profit_pct(execution_manager);
+            let profitable_quote_min_out =
+                quote_min_out_above_input(arb_quote.quote_in_raw.max(1), min_profit_pct);
+            let pump_min_base_out = if use_final_guard_only {
+                1
+            } else {
+                execution_quote_min_output(arb_quote.expected_base_out_safe, 1)
+            };
+            let meteora_min_quote_out = if use_final_guard_only {
+                1
+            } else {
+                execution_quote_min_output(
+                    arb_quote.expected_quote_back_safe,
+                    profitable_quote_min_out,
+                )
+            };
+            let pump_buy_instruction = build_pumpswap_dynamic_buy_instruction(
+                config,
+                pumpswap,
+                &pump_accounts,
+                arb_quote,
+                false,
+                Some(pump_min_base_out),
+            )?;
+            let estimated_meteora_input_amount = arb_quote.expected_base_out_safe.max(1);
+            let meteora_remaining_arrays =
+                meteora_swap_remaining_bin_arrays_for_exact_input_execution_async(
+                    config,
+                    meteora_pool,
+                    meteora_bin_arrays,
+                    token_mint,
+                    &pumpswap.quote_mint,
+                    estimated_meteora_input_amount,
+                )
+                .await
+                .context("Meteora execution bin arrays unavailable")?;
+            let meteora_accounts =
+                executor::swap::derive_meteora_dlmm_accounts_with_token_programs(
+                    meteora_pool,
+                    &user,
+                    token_mint,
+                    &base_token_program,
+                    &quote_token_program,
+                    use_meteora_bitmap_extension,
+                )?;
+            if meteora_accounts.user_token_in != pump_accounts.user_base_token_account {
+                anyhow::bail!(
+                    "PumpSwap->Meteora token ATA mismatch: pump token ATA={} meteora input ATA={}",
+                    pump_accounts.user_base_token_account,
+                    meteora_accounts.user_token_in
+                );
+            }
+            if meteora_accounts.user_token_out != pump_accounts.user_quote_token_account {
+                anyhow::bail!(
+                    "PumpSwap->Meteora quote ATA mismatch: pump quote ATA={} meteora output ATA={}",
+                    pump_accounts.user_quote_token_account,
+                    meteora_accounts.user_token_out
+                );
+            }
+
+            instructions = setup_instructions.clone();
+            instructions.push(pump_buy_instruction);
+            tracing::debug!(
+                "Pump->Meteora 直发组装: 币种={} spend_quote_in={} min_profit_pct={:.2}% min_base_out={} swap2_amount_in={} swap2_min_out={} quoted_safe_out={}",
+                token_mint,
+                arb_quote.quote_in_raw,
+                min_profit_pct,
+                pump_min_base_out,
+                arb_quote.expected_base_out_safe,
+                meteora_min_quote_out,
+                arb_quote.expected_quote_back_safe
+            );
+            instructions.push(executor::swap::build_meteora_dlmm_swap_v2(
+                &meteora_accounts.swap_v2_accounts(),
+                &meteora_remaining_arrays
+                    .iter()
+                    .map(|(_, pubkey)| *pubkey)
+                    .collect::<Vec<_>>(),
+                arb_quote.expected_base_out_safe.max(1),
+                meteora_min_quote_out,
+            )?);
+
+            Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions: setup_instructions.clone(),
+                fallback_label: "Pump AMM buy",
+                setup_instructions,
+                net_quote_token_account: pump_accounts.user_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: pumpswap.quote_mint.clone(),
+                intermediate_token_account: pump_accounts.user_base_token_account,
+            })
+        }
+        MeteoraPumpSwapDirection::MeteoraToPumpSwap => {
+            let meteora_remaining_arrays =
+                meteora_swap_remaining_bin_arrays_for_exact_input_execution_async(
+                    config,
+                    meteora_pool,
+                    meteora_bin_arrays,
+                    &pumpswap.quote_mint,
+                    token_mint,
+                    quote_amount_in,
+                )
+                .await
+                .context("Meteora execution bin arrays unavailable")?;
+            let meteora_accounts =
+                executor::swap::derive_meteora_dlmm_accounts_with_token_programs(
+                    meteora_pool,
+                    &user,
+                    &pumpswap.quote_mint,
+                    &quote_token_program,
+                    &base_token_program,
+                    use_meteora_bitmap_extension,
+                )?;
+            if meteora_accounts.user_token_in != pump_accounts.user_quote_token_account {
+                anyhow::bail!(
+                    "Meteora->PumpSwap quote ATA mismatch: pump quote ATA={} meteora input ATA={}",
+                    pump_accounts.user_quote_token_account,
+                    meteora_accounts.user_token_in
+                );
+            }
+            if meteora_accounts.user_token_out != pump_accounts.user_base_token_account {
+                anyhow::bail!(
+                    "Meteora->PumpSwap token ATA mismatch: pump token ATA={} meteora output ATA={}",
+                    pump_accounts.user_base_token_account,
+                    meteora_accounts.user_token_out
+                );
+            }
+            let use_final_guard_only = use_final_guard_only_min_out(execution_manager);
+            let min_profit_pct = pumpswap_meteora_enforced_profit_pct(execution_manager);
+            let meteora_min_token_out = if use_final_guard_only {
+                1
+            } else {
+                guarded_leg_min_out(execution_manager, floor_u64(quote.token_amount).max(1))
+            };
+            let pumpswap_min_quote_out = if use_final_guard_only {
+                1
+            } else {
+                guarded_quote_min_out(
+                    execution_manager,
+                    1,
+                    quote_min_out_above_input(quote_amount_in.max(1), min_profit_pct),
+                )
+            };
+            let mut pump_sell_instruction = executor::swap::build_pump_amm_sell(
+                &pump_accounts.sell_accounts(),
+                1,
+                pumpswap_min_quote_out,
+            )?;
+            pump_sell_instruction
+                .accounts
+                .extend(pump_amm_sell_remaining_accounts(
+                    config,
+                    pumpswap,
+                    &pump_accounts,
+                )?);
+
+            instructions = setup_instructions.clone();
+            tracing::debug!(
+                "Meteora->Pump 直发组装: 币种={} quote_in={} min_profit_pct={:.2}% swap2_min_token_out={} pump_min_quote_out={}",
+                token_mint,
+                quote_amount_in,
+                min_profit_pct,
+                meteora_min_token_out,
+                pumpswap_min_quote_out
+            );
+            instructions.push(executor::swap::build_meteora_dlmm_swap_v2(
+                &meteora_accounts.swap_v2_accounts(),
+                &meteora_remaining_arrays
+                    .iter()
+                    .map(|(_, pubkey)| *pubkey)
+                    .collect::<Vec<_>>(),
+                quote_amount_in,
+                meteora_min_token_out,
+            )?);
+            instructions.push(pump_sell_instruction);
+
+            Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions: setup_instructions.clone(),
+                fallback_label: "Meteora DLMM swap",
+                setup_instructions,
+                net_quote_token_account: pump_accounts.user_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: pumpswap.quote_mint.clone(),
+                intermediate_token_account: pump_accounts.user_base_token_account,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn preflight_pumpswap_meteora(
+    execution_manager: Option<&ExecutionManager>,
+    config: &Config,
+    pumpswap_state: Option<&PumpSwapState>,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    direction: MeteoraPumpSwapDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    stats: &mut RuntimeStats,
+) {
+    let (buy_venue, sell_venue, path_label) = pumpswap_meteora_direction_labels(direction);
+    let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+        .values()
+        .filter(|array| array.lb_pair == meteora.pool_address)
+        .collect();
+
+    if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+        log_preflight_blocked(
+            stats,
+            "pumpswap_meteora_exact",
+            token_mint,
+            buy_venue,
+            sell_venue,
+            "missing_bin_arrays",
+            "missing Meteora bin arrays for the selected pool",
+        );
+        return;
+    }
+
+    let Some(meteora_quote_mint) =
+        meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    else {
+        log_preflight_blocked(
+            stats,
+            "pumpswap_meteora_exact",
+            token_mint,
+            buy_venue,
+            sell_venue,
+            "missing_quote_mint",
+            "Meteora quote mint not found",
+        );
+        return;
+    };
+    if pumpswap_pool.quote_mint != meteora_quote_mint {
+        log_preflight_blocked(
+            stats,
+            "pumpswap_meteora_exact",
+            token_mint,
+            buy_venue,
+            sell_venue,
+            "quote_mint_mismatch",
+            &format!(
+                "PumpSwap/Meteora quote mint mismatch: pumpswap={} meteora={}",
+                pumpswap_pool.quote_mint, meteora_quote_mint
+            ),
+        );
+        return;
+    }
+
+    let mut exact_quote_found = false;
+    let mut threshold_passed = false;
+    for trade_size_usdc in effective_trade_sizes_usdc(execution_manager, config) {
+        let exact = match direction {
+            MeteoraPumpSwapDirection::PumpSwapToMeteora => quote_pumpswap_buy_meteora_sell(
+                config,
+                pumpswap_pool,
+                meteora,
+                token_mint,
+                &pool_bin_arrays,
+                trade_size_usdc,
+            ),
+            MeteoraPumpSwapDirection::MeteoraToPumpSwap => quote_meteora_buy_pumpswap_sell(
+                config,
+                pumpswap_pool,
+                meteora,
+                token_mint,
+                &pool_bin_arrays,
+                trade_size_usdc,
+            ),
+        };
+
+        let Some(mut exact) = exact else {
+            continue;
+        };
+        exact_quote_found = true;
+        let mut assessment = None;
+        if let Some(arb_quote) = exact.arb_quote.as_mut() {
+            arb_quote.forward_pool = pumpswap_state
+                .map(|state| state.pool_address.clone())
+                .unwrap_or_else(|| "unknown_pumpswap".to_string());
+            arb_quote.backward_pool = meteora.pool_address.clone();
+            let current_assessment = assess_pumpswap_meteora_opportunity(config, stats, arb_quote);
+            record_route_execution_event(
+                stats,
+                arb_quote,
+                route_execution_event(
+                    "discovered",
+                    arb_quote,
+                    Some(current_assessment.opportunity_class),
+                    false,
+                    false,
+                    false,
+                    (!current_assessment.send_allowed)
+                        .then(|| current_assessment.filter_reasons.join(",")),
+                    None,
+                    arb_quote.real_net_profit_usdc,
+                ),
+            );
+            if !current_assessment.send_allowed {
+                log_pumpswap_meteora_quote_decision(
+                    path_label,
+                    token_mint,
+                    trade_size_usdc,
+                    arb_quote,
+                    &current_assessment,
+                    "观察",
+                    "",
+                );
+                continue;
+            }
+            assessment = Some(current_assessment);
+        }
+        let gate_profit_pct = execution_manager
+            .map(|manager| {
+                direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                    manager,
+                    config,
+                    trade_size_usdc,
+                    exact.gross_profit_usdc,
+                )
+            })
+            .unwrap_or(exact.net_profit_pct);
+
+        let threshold_pass = execution_manager
+            .map(|_| passes_direct_execution_gate(gate_profit_pct))
+            .unwrap_or_else(|| {
+                passes_active_offchain_profit_threshold(
+                    exact.net_profit_pct,
+                    execution_manager,
+                    config,
+                )
+            });
+        if !threshold_pass {
+            if let Some(arb_quote) = exact.arb_quote.as_ref() {
+                let current_assessment = assessment.clone().unwrap_or_else(|| {
+                    assess_pumpswap_meteora_opportunity(config, stats, arb_quote)
+                });
+                log_pumpswap_meteora_quote_decision(
+                    path_label,
+                    token_mint,
+                    trade_size_usdc,
+                    arb_quote,
+                    &current_assessment,
+                    "跳过",
+                    "exact_quote_below_threshold",
+                );
+                record_route_execution_event(
+                    stats,
+                    arb_quote,
+                    route_execution_event(
+                        "gate_rejected",
+                        arb_quote,
+                        Some(current_assessment.opportunity_class),
+                        false,
+                        false,
+                        false,
+                        Some("exact_quote_below_threshold".to_string()),
+                        None,
+                        arb_quote.real_net_profit_usdc,
+                    ),
+                );
+            }
+            stats.rejected_below_threshold += 1;
+            continue;
+        }
+
+        threshold_passed = true;
+        stats.exact_quote_passed += 1;
+        record_route_snapshot(
+            stats,
+            RouteSnapshot {
+                token_mint: token_mint.to_string(),
+                buy_venue: buy_venue.to_string(),
+                sell_venue: sell_venue.to_string(),
+                buy_price_usdc: trade_size_usdc / exact.token_amount,
+                sell_price_usdc: exact.final_amount_usdc / exact.token_amount,
+                gross_profit_pct: exact.gross_profit_pct,
+                net_profit_pct: exact.net_profit_pct,
+                route_kind: "pumpswap_meteora_exact",
+            },
+        );
+
+        let candidate_key = format!(
+            "pumpswap_meteora_exact:{}:{}:{}",
+            token_mint,
+            pumpswap_state
+                .map(|state| state.pool_address.as_str())
+                .unwrap_or("unknown_pumpswap"),
+            meteora.pool_address
+        );
+        if should_log_candidate_key(stats, candidate_key, exact.net_profit_pct) {
+            if let Some(arb_quote) = exact.arb_quote.as_ref() {
+                let current_assessment = assessment.clone().unwrap_or_else(|| {
+                    assess_pumpswap_meteora_opportunity(config, stats, arb_quote)
+                });
+                log_pumpswap_meteora_quote_decision(
+                    path_label,
+                    token_mint,
+                    trade_size_usdc,
+                    arb_quote,
+                    &current_assessment,
+                    "通过",
+                    &format!("gate={:.2}%", gate_profit_pct),
+                );
+            } else {
+                tracing::debug!(
+                    "PumpSwap/Meteora exact preflight passed: {} 币种={} size=${:.2} final=${:.4} net=${:.4} ({:.2}%) gate={:.2}%",
+                    path_label,
+                    token_mint,
+                    trade_size_usdc,
+                    exact.final_amount_usdc,
+                    exact.net_profit_usdc,
+                    exact.net_profit_pct,
+                    gate_profit_pct
+                );
+            }
+        }
+
+        let simulated = if let Some(execution_manager) = execution_manager {
+            maybe_simulate_pumpswap_meteora(
+                execution_manager,
+                config,
+                pumpswap_state,
+                pumpswap_pool,
+                meteora,
+                token_mint,
+                direction,
+                meteora_bin_arrays,
+                pumpswap_protocol_fee_recipient,
+                &exact,
+                trade_size_usdc,
+                stats,
+            )
+            .await
+        } else {
+            false
+        };
+        if !simulated {
+            record_tx_build_blocked(
+                stats,
+                "pumpswap_meteora_exact",
+                token_mint,
+                buy_venue,
+                sell_venue,
+                &pumpswap_meteora_send_blocker(
+                    pumpswap_state,
+                    pool_bin_arrays.len(),
+                    pumpswap_protocol_fee_recipient,
+                ),
+            );
+        }
+    }
+
+    if !exact_quote_found {
+        log_preflight_blocked(
+            stats,
+            "pumpswap_meteora_exact",
+            token_mint,
+            buy_venue,
+            sell_venue,
+            "quote_unavailable",
+            "exact quote unavailable with current PumpSwap/Meteora state",
+        );
+    } else if !threshold_passed {
+        log_preflight_blocked(
+            stats,
+            "pumpswap_meteora_exact",
+            token_mint,
+            buy_venue,
+            sell_venue,
+            "below_threshold",
+            &format!(
+                "exact quote stayed below min_profit_threshold ({:.2}%) after fees/slippage",
+                active_offchain_profit_threshold_pct(execution_manager, config)
+            ),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_simulate_pumpswap_meteora(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap_state: Option<&PumpSwapState>,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    direction: MeteoraPumpSwapDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    quote: &ExactPreflightQuote,
+    trade_size_usdc: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let Some(pumpswap_state) = pumpswap_state else {
+        return false;
+    };
+    if !execution_pre_send_simulation_enabled(execution_manager) {
+        return maybe_send_pumpswap_meteora_direct_with_trade_size(
+            execution_manager,
+            config,
+            pumpswap_state,
+            pumpswap_pool,
+            meteora,
+            token_mint,
+            direction,
+            meteora_bin_arrays,
+            pumpswap_protocol_fee_recipient,
+            trade_size_usdc,
+            quote.net_profit_pct,
+            stats,
+        )
+        .await;
+    }
+
+    let (_, _, path_label) = pumpswap_meteora_direction_labels(direction);
+    let net_profit_pct = quote.net_profit_pct;
+    let quoted_gate_profit_pct = direct_execution_gate_profit_pct_from_gross_profit_usdc(
+        execution_manager,
+        config,
+        trade_size_usdc,
+        quote.gross_profit_usdc,
+    );
+    let key = format!(
+        "simulate:pumpswap_meteora:{}:{}:{}:{:.2}",
+        pumpswap_state.pool_address, meteora.pool_address, path_label, trade_size_usdc
+    );
+    if !should_attempt_candidate_key(stats, key, net_profit_pct) {
+        return true;
+    }
+
+    stats.tx_build_required += 1;
+    let plan = match build_pumpswap_meteora_simulation_instructions(
+        config,
+        execution_manager,
+        Some(pumpswap_state),
+        pumpswap_pool,
+        meteora,
+        token_mint,
+        direction,
+        meteora_bin_arrays,
+        pumpswap_protocol_fee_recipient,
+        quote,
+        trade_size_usdc,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            stats.tx_build_blocked += 1;
+            tracing::debug!(
+                "构建 PumpSwap 到 Meteora 原子交易失败：路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                summarize_block_reason(&error.to_string())
+            );
+            return false;
+        }
+    };
+
+    let atomic_instructions = match maybe_wrap_plan_with_two_hop_executor(
+        execution_manager,
+        config,
+        path_label,
+        trade_size_usdc,
+        &plan,
+    ) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            stats.tx_build_blocked += 1;
+            tracing::debug!(
+                "构建链上两腿指令失败：路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                summarize_block_reason(&error.to_string())
+            );
+            return false;
+        }
+    };
+
+    stats.simulation_required += 1;
+    match execution_manager
+        .simulate_instructions_with_accounts(
+            atomic_instructions.clone(),
+            &[plan.net_quote_token_account.to_string()],
+        )
+        .await
+    {
+        Ok((report, accounts)) => {
+            stats.simulation_passed += 1;
+            stats.last_simulation_error = None;
+            let simulated_quote_net_change_raw = simulated_token_account_net_change(
+                &accounts,
+                &plan.net_quote_token_account,
+                plan.net_quote_start_balance,
+            );
+            let simulated_quote_net_change_usdc = simulated_quote_net_change_raw
+                .and_then(|amount| {
+                    raw_to_usdc_for_mint(
+                        &plan.net_quote_mint,
+                        amount as f64,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                        config.strategy.sol_usdc_price,
+                    )
+                })
+                .unwrap_or(f64::NEG_INFINITY);
+            let simulated_gate_profit_pct = direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                execution_manager,
+                config,
+                trade_size_usdc,
+                simulated_quote_net_change_usdc,
+            );
+            let live_send_eligible = passes_direct_execution_gate(simulated_gate_profit_pct);
+            tracing::debug!(
+                "PumpSwap/Meteora 原子模拟通过: 路径={} 币种={} CU={:?} 预估收益率={:.2}% 模拟净变化={:?} 模拟gate={:.2}% 交易数据={}",
+                path_label,
+                token_mint,
+                report.units_consumed,
+                quoted_gate_profit_pct,
+                simulated_quote_net_change_raw,
+                simulated_gate_profit_pct,
+                report.transaction_base64.as_deref().unwrap_or("<missing>")
+            );
+            let live_send_enabled = execution_manager.live_send_enabled();
+            if live_send_enabled && live_send_eligible {
+                match send_direct_plan_with_optional_setup_split_and_units(
+                    execution_manager,
+                    config,
+                    "pumpswap_meteora",
+                    path_label,
+                    token_mint,
+                    trade_size_usdc,
+                    &plan,
+                    report.units_consumed,
+                )
+                .await
+                {
+                    Ok(bundle_id) => {
+                        log_send_success(
+                            "pumpswap_meteora",
+                            path_label,
+                            token_mint,
+                            &bundle_id,
+                            simulated_gate_profit_pct,
+                        );
+                    }
+                    Err(send_error) => {
+                        maybe_bump_meteora_execution_bin_arrays(
+                            meteora,
+                            "pumpswap_meteora",
+                            path_label,
+                            token_mint,
+                            &send_error.to_string(),
+                        );
+                        tracing::debug!(
+                            "实盘发送失败：路线=PumpSwap到Meteora，路径={}，币种={}，原因={}",
+                            path_label,
+                            token_mint,
+                            send_error
+                        );
+                    }
+                }
+            } else {
+                let reason = if !live_send_enabled {
+                    "live_send_disabled"
+                } else {
+                    "negative_simulated_profit"
+                };
+                tracing::debug!(
+                    "跳过实盘: 路径={} 币种={} 原因={} 预估gate={:.2}% 模拟gate={:.2}%",
+                    path_label,
+                    token_mint,
+                    summarize_live_send_skip_reason(reason),
+                    quoted_gate_profit_pct,
+                    simulated_gate_profit_pct
+                );
+            }
+            true
+        }
+        Err(error) => {
+            stats.simulation_failed += 1;
+            stats.last_simulation_error = Some(error.to_string());
+            if is_too_many_account_locks_error(&error.to_string()) {
+                log_instruction_account_lock_summary(
+                    "pumpswap_meteora",
+                    path_label,
+                    token_mint,
+                    &atomic_instructions,
+                );
+                if let Some(retried) = retry_pumpswap_meteora_with_reduced_bin_arrays(
+                    execution_manager,
+                    config,
+                    pumpswap_state,
+                    pumpswap_pool,
+                    meteora,
+                    token_mint,
+                    direction,
+                    meteora_bin_arrays,
+                    pumpswap_protocol_fee_recipient,
+                    trade_size_usdc,
+                    quote.net_profit_pct,
+                    stats,
+                    "pumpswap_meteora",
+                    path_label,
+                    &error.to_string(),
+                )
+                .await
+                {
+                    return retried;
+                }
+            }
+            maybe_bump_meteora_execution_bin_arrays(
+                meteora,
+                "pumpswap_meteora",
+                path_label,
+                token_mint,
+                &error.to_string(),
+            );
+            tracing::debug!(
+                "PumpSwap 到 Meteora 原子模拟失败：路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                summarize_simulation_error(&error.to_string())
+            );
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_pumpswap_meteora_simulation_instructions(
+    config: &Config,
+    execution_manager: &ExecutionManager,
+    pumpswap_state: Option<&PumpSwapState>,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora_pool: &MeteoraState,
+    token_mint: &str,
+    direction: MeteoraPumpSwapDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    quote: &ExactPreflightQuote,
+    trade_size_usdc: f64,
+) -> Result<SimulationInstructionPlan> {
+    let pumpswap = pumpswap_state.ok_or_else(|| anyhow::anyhow!("missing PumpSwap pool state"))?;
+    if pumpswap.base_mint != pumpswap_pool.token_mint
+        || pumpswap.quote_mint != pumpswap_pool.quote_mint
+    {
+        anyhow::bail!(
+            "Pump AMM simulation supports base=token quote=SOL/USDC pools only; pool base={} quote={} normalized 币种={} quote={}",
+            pumpswap.base_mint,
+            pumpswap.quote_mint,
+            pumpswap_pool.token_mint,
+            pumpswap_pool.quote_mint
+        );
+    }
+
+    let meteora_quote_mint = meteora_pool
+        .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        .ok_or_else(|| anyhow::anyhow!("Meteora quote mint not found"))?;
+    if pumpswap.quote_mint != meteora_quote_mint {
+        anyhow::bail!(
+            "PumpSwap/Meteora quote mint mismatch: pumpswap={} meteora={}",
+            pumpswap.quote_mint,
+            meteora_quote_mint
+        );
+    }
+
+    let user = execution_manager
+        .wallet_pubkey()
+        .ok_or_else(|| anyhow::anyhow!("executor wallet is not configured"))?;
+    let protocol_fee_recipient = Pubkey::from_str(
+        pumpswap_protocol_fee_recipient
+            .ok_or_else(|| anyhow::anyhow!("missing Pump AMM protocol_fee_recipient"))?,
+    )?;
+    let base_token_program = token_program_for_simulation(config, &pumpswap.base_mint).await?;
+    let quote_token_program = token_program_for_simulation(config, &pumpswap.quote_mint).await?;
+    let base_mint = Pubkey::from_str(&pumpswap.base_mint)?;
+    let quote_mint = Pubkey::from_str(&pumpswap.quote_mint)?;
+    let max_sol_input_lamports = max_sol_input_lamports_for_trade_size(config, trade_size_usdc)?;
+    let pump_accounts = executor::swap::derive_pump_amm_accounts_with_token_programs(
+        pumpswap,
+        &user,
+        &protocol_fee_recipient,
+        &base_token_program,
+        &quote_token_program,
+    )?;
+    let net_quote_start_balance = token_account_balance(
+        &config.rpc.http_url,
+        &pump_accounts.user_quote_token_account,
+    )
+    .await?;
+    let mut prepared_atas = HashSet::new();
+    let mut instructions = Vec::new();
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &base_mint,
+        &base_token_program,
+        &mut prepared_atas,
+    )?;
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &quote_mint,
+        &quote_token_program,
+        &mut prepared_atas,
+    )?;
+
+    match direction {
+        MeteoraPumpSwapDirection::PumpSwapToMeteora => {
+            let arb_quote = quote.arb_quote.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("missing PumpSwap->Meteora arb quote for simulated plan")
+            })?;
+            let quote_amount_in = arb_quote.quote_in_raw.max(1);
+            if pumpswap.quote_mint == config.tokens.sol_mint {
+                ensure_simulation_sol_input_within_cap(
+                    "PumpSwap quote input",
+                    quote_amount_in,
+                    max_sol_input_lamports,
+                )?;
+                prepare_wrapped_sol_input(
+                    &config.rpc.http_url,
+                    &user,
+                    &quote_mint,
+                    &quote_token_program,
+                    &mut prepared_atas,
+                    &mut instructions,
+                    quote_amount_in,
+                )
+                .await?;
+            }
+            let use_meteora_bitmap_extension = maybe_prepare_meteora_bitmap_extension_setup(
+                config,
+                meteora_pool,
+                &user,
+                &mut instructions,
+            )
+            .await?;
+            let setup_instructions = instructions.clone();
+
+            let pump_buy_output_start_balance =
+                token_account_balance(&config.rpc.http_url, &pump_accounts.user_base_token_account)
+                    .await?;
+            let diagnostic_pump_buy_instruction = build_pumpswap_dynamic_buy_instruction(
+                config,
+                pumpswap,
+                &pump_accounts,
+                arb_quote,
+                false,
+                None,
+            )?;
+            let calibrated_token_amount = execution_manager
+                .simulate_instructions_with_accounts(
+                    {
+                        let mut first_leg_instructions = setup_instructions.clone();
+                        first_leg_instructions.push(diagnostic_pump_buy_instruction.clone());
+                        first_leg_instructions
+                    },
+                    &[pump_accounts.user_base_token_account.to_string()],
+                )
+                .await
+                .ok()
+                .and_then(|(_, accounts)| {
+                    simulated_token_account_positive_delta(
+                        &accounts,
+                        &pump_accounts.user_base_token_account,
+                        pump_buy_output_start_balance,
+                    )
+                })
+                .filter(|amount| *amount > 0)
+                .unwrap_or(arb_quote.expected_base_out_safe.max(1));
+            let exact_pump_buy_instruction = build_pumpswap_dynamic_buy_instruction(
+                config,
+                pumpswap,
+                &pump_accounts,
+                arb_quote,
+                false,
+                None,
+            )?;
+            let settled_pump_output_amount = execution_manager
+                .simulate_instructions_with_accounts(
+                    {
+                        let mut first_leg_instructions = setup_instructions.clone();
+                        first_leg_instructions.push(exact_pump_buy_instruction.clone());
+                        first_leg_instructions
+                    },
+                    &[pump_accounts.user_base_token_account.to_string()],
+                )
+                .await
+                .ok()
+                .and_then(|(_, accounts)| {
+                    simulated_token_account_positive_delta(
+                        &accounts,
+                        &pump_accounts.user_base_token_account,
+                        pump_buy_output_start_balance,
+                    )
+                })
+                .filter(|amount| *amount > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "PumpSwap exact first-leg settlement amount unavailable: 币种={} target_out={}",
+                        token_mint,
+                        arb_quote.expected_base_out_safe
+                    )
+                })?;
+            tracing::debug!(
+                "Pump->Meteora 第一腿校准: 币种={} target_out={} calibrated_out={} settled_out={}",
+                token_mint,
+                arb_quote.expected_base_out_safe,
+                calibrated_token_amount,
+                settled_pump_output_amount
+            );
+
+            let meteora_remaining_arrays =
+                meteora_swap_remaining_bin_arrays_for_exact_input_execution_async(
+                    config,
+                    meteora_pool,
+                    meteora_bin_arrays,
+                    token_mint,
+                    &pumpswap.quote_mint,
+                    settled_pump_output_amount.max(1),
+                )
+                .await?;
+            let meteora_accounts =
+                executor::swap::derive_meteora_dlmm_accounts_with_token_programs(
+                    meteora_pool,
+                    &user,
+                    token_mint,
+                    &base_token_program,
+                    &quote_token_program,
+                    use_meteora_bitmap_extension,
+                )?;
+            if meteora_accounts.user_token_in != pump_accounts.user_base_token_account {
+                anyhow::bail!(
+                    "PumpSwap->Meteora token ATA mismatch: pump token ATA={} meteora input ATA={}",
+                    pump_accounts.user_base_token_account,
+                    meteora_accounts.user_token_in
+                );
+            }
+            if meteora_accounts.user_token_out != pump_accounts.user_quote_token_account {
+                anyhow::bail!(
+                    "PumpSwap->Meteora quote ATA mismatch: pump quote ATA={} meteora output ATA={}",
+                    pump_accounts.user_quote_token_account,
+                    meteora_accounts.user_token_out
+                );
+            }
+            let meteora_input_amount = settled_pump_output_amount.max(1);
+            let (_, diagnostic_accounts) = execution_manager
+                .simulate_instructions_with_accounts(
+                    {
+                        let mut diagnostic_atomic_instructions = setup_instructions.clone();
+                        diagnostic_atomic_instructions.push(exact_pump_buy_instruction.clone());
+                        diagnostic_atomic_instructions.push(
+                            executor::swap::build_meteora_dlmm_swap_v2(
+                                &meteora_accounts.swap_v2_accounts(),
+                                &meteora_remaining_arrays
+                                    .iter()
+                                    .map(|(_, pubkey)| *pubkey)
+                                    .collect::<Vec<_>>(),
+                                meteora_input_amount,
+                                1,
+                            )?,
+                        );
+                        diagnostic_atomic_instructions
+                    },
+                    &[pump_accounts.user_quote_token_account.to_string()],
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "PumpSwap->Meteora exact second-leg diagnostic failed: {}",
+                        error
+                    )
+                })?;
+            let simulated_meteora_quote_out = simulated_second_leg_quote_output_from_atomic_delta(
+                &diagnostic_accounts,
+                &pump_accounts.user_quote_token_account,
+                net_quote_start_balance,
+                quote_amount_in,
+            )
+            .filter(|amount| *amount > 0)
+            .unwrap_or_else(|| {
+                usdc_to_raw_for_mint(
+                    &pumpswap.quote_mint,
+                    quote.final_amount_usdc,
+                    &config.tokens.usdc_mint,
+                    &config.tokens.sol_mint,
+                    config.strategy.sol_usdc_price,
+                )
+                .map(floor_u64)
+                .unwrap_or(1)
+                .max(1)
+            });
+            let min_profit_pct = pumpswap_meteora_enforced_profit_pct(execution_manager);
+            let profitable_quote_min_out =
+                quote_min_out_above_input(quote_amount_in.max(1), min_profit_pct);
+            let meteora_min_quote_out = execution_quote_min_output(
+                arb_quote.expected_quote_back_safe,
+                profitable_quote_min_out,
+            );
+            if simulated_meteora_quote_out < meteora_min_quote_out {
+                anyhow::bail!(
+                    "PumpSwap->Meteora simulated quote back {} fell below min quote out {}",
+                    simulated_meteora_quote_out,
+                    meteora_min_quote_out
+                );
+            }
+            tracing::debug!(
+                "Meteora swap2组装: 币种={} amount_in={} min_amount_out={} simulated_out={} min_profit_pct={:.2}% quoted_safe_out={}",
+                token_mint,
+                meteora_input_amount,
+                meteora_min_quote_out,
+                simulated_meteora_quote_out,
+                min_profit_pct,
+                arb_quote.expected_quote_back_safe
+            );
+
+            instructions = setup_instructions.clone();
+            instructions.push(exact_pump_buy_instruction);
+            let mut fallback_instructions = setup_instructions.clone();
+            fallback_instructions.push(diagnostic_pump_buy_instruction);
+            instructions.push(executor::swap::build_meteora_dlmm_swap_v2(
+                &meteora_accounts.swap_v2_accounts(),
+                &meteora_remaining_arrays
+                    .iter()
+                    .map(|(_, pubkey)| *pubkey)
+                    .collect::<Vec<_>>(),
+                meteora_input_amount,
+                meteora_min_quote_out,
+            )?);
+
+            Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions,
+                fallback_label: "Pump AMM buy",
+                setup_instructions,
+                net_quote_token_account: pump_accounts.user_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: pumpswap.quote_mint.clone(),
+                intermediate_token_account: pump_accounts.user_base_token_account,
+            })
+        }
+        MeteoraPumpSwapDirection::MeteoraToPumpSwap => {
+            let quote_amount_in = ceil_u64(
+                usdc_to_raw_for_mint(
+                    &pumpswap.quote_mint,
+                    trade_size_usdc,
+                    &config.tokens.usdc_mint,
+                    &config.tokens.sol_mint,
+                    config.strategy.sol_usdc_price,
+                )
+                .ok_or_else(|| anyhow::anyhow!("unsupported PumpSwap/Meteora quote mint"))?,
+            );
+            if pumpswap.quote_mint == config.tokens.sol_mint {
+                ensure_simulation_sol_input_within_cap(
+                    "Meteora quote input",
+                    quote_amount_in,
+                    max_sol_input_lamports,
+                )?;
+                prepare_wrapped_sol_input(
+                    &config.rpc.http_url,
+                    &user,
+                    &quote_mint,
+                    &quote_token_program,
+                    &mut prepared_atas,
+                    &mut instructions,
+                    quote_amount_in,
+                )
+                .await?;
+            }
+            let use_meteora_bitmap_extension = maybe_prepare_meteora_bitmap_extension_setup(
+                config,
+                meteora_pool,
+                &user,
+                &mut instructions,
+            )
+            .await?;
+            let setup_instructions = instructions.clone();
+
+            let meteora_remaining_arrays =
+                meteora_swap_remaining_bin_arrays_for_exact_input_execution_async(
+                    config,
+                    meteora_pool,
+                    meteora_bin_arrays,
+                    &pumpswap.quote_mint,
+                    token_mint,
+                    quote_amount_in,
+                )
+                .await?;
+            let meteora_accounts =
+                executor::swap::derive_meteora_dlmm_accounts_with_token_programs(
+                    meteora_pool,
+                    &user,
+                    &pumpswap.quote_mint,
+                    &quote_token_program,
+                    &base_token_program,
+                    use_meteora_bitmap_extension,
+                )?;
+            if meteora_accounts.user_token_in != pump_accounts.user_quote_token_account {
+                anyhow::bail!(
+                    "Meteora->PumpSwap quote ATA mismatch: pump quote ATA={} meteora input ATA={}",
+                    pump_accounts.user_quote_token_account,
+                    meteora_accounts.user_token_in
+                );
+            }
+            if meteora_accounts.user_token_out != pump_accounts.user_base_token_account {
+                anyhow::bail!(
+                    "Meteora->PumpSwap token ATA mismatch: pump token ATA={} meteora output ATA={}",
+                    pump_accounts.user_base_token_account,
+                    meteora_accounts.user_token_out
+                );
+            }
+            let meteora_output_start_balance =
+                token_account_balance(&config.rpc.http_url, &meteora_accounts.user_token_out)
+                    .await?;
+            let diagnostic_meteora_instruction = executor::swap::build_meteora_dlmm_swap_v2(
+                &meteora_accounts.swap_v2_accounts(),
+                &meteora_remaining_arrays
+                    .iter()
+                    .map(|(_, pubkey)| *pubkey)
+                    .collect::<Vec<_>>(),
+                quote_amount_in,
+                1,
+            )?;
+            let calibrated_token_amount = execution_manager
+                .simulate_instructions_with_accounts(
+                    {
+                        let mut first_leg_instructions = setup_instructions.clone();
+                        first_leg_instructions.push(diagnostic_meteora_instruction.clone());
+                        first_leg_instructions
+                    },
+                    &[meteora_accounts.user_token_out.to_string()],
+                )
+                .await
+                .ok()
+                .and_then(|(_, accounts)| {
+                    simulated_token_account_positive_delta(
+                        &accounts,
+                        &meteora_accounts.user_token_out,
+                        meteora_output_start_balance,
+                    )
+                })
+                .filter(|amount| *amount > 0)
+                .unwrap_or(slippage_floor_u64(quote.token_amount).max(1));
+            let meteora_min_token_out =
+                execution_min_output_for_send(execution_manager, calibrated_token_amount);
+            let exact_meteora_instruction = executor::swap::build_meteora_dlmm_swap_v2(
+                &meteora_accounts.swap_v2_accounts(),
+                &meteora_remaining_arrays
+                    .iter()
+                    .map(|(_, pubkey)| *pubkey)
+                    .collect::<Vec<_>>(),
+                quote_amount_in,
+                meteora_min_token_out,
+            )?;
+            let (_, settlement_accounts) = execution_manager
+                .simulate_instructions_with_accounts(
+                    {
+                        let mut first_leg_instructions = setup_instructions.clone();
+                        first_leg_instructions.push(exact_meteora_instruction.clone());
+                        first_leg_instructions
+                    },
+                    &[meteora_accounts.user_token_out.to_string()],
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Meteora->PumpSwap exact first-leg settlement diagnostic failed: {}",
+                        error
+                    )
+                })?;
+            let settled_meteora_output_amount = simulated_token_account_positive_delta(
+                &settlement_accounts,
+                &meteora_accounts.user_token_out,
+                meteora_output_start_balance,
+            )
+            .filter(|amount| *amount > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Meteora exact first-leg settlement amount unavailable: 币种={} min_out={}",
+                    token_mint,
+                    meteora_min_token_out
+                )
+            })?;
+
+            let (_, diagnostic_accounts) = execution_manager
+                .simulate_instructions_with_accounts(
+                    {
+                        let mut diagnostic_atomic_instructions = setup_instructions.clone();
+                        diagnostic_atomic_instructions.push(exact_meteora_instruction.clone());
+                        let mut diagnostic_pump_sell_instruction =
+                            executor::swap::build_pump_amm_sell(
+                                &pump_accounts.sell_accounts(),
+                                settled_meteora_output_amount.max(1),
+                                1,
+                            )?;
+                        diagnostic_pump_sell_instruction.accounts.extend(
+                            pump_amm_sell_remaining_accounts(config, pumpswap, &pump_accounts)?,
+                        );
+                        diagnostic_atomic_instructions.push(diagnostic_pump_sell_instruction);
+                        diagnostic_atomic_instructions
+                    },
+                    &[pump_accounts.user_quote_token_account.to_string()],
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Meteora->PumpSwap exact second-leg diagnostic failed: {}",
+                        error
+                    )
+                })?;
+            let simulated_pumpswap_quote_out = simulated_second_leg_quote_output_from_atomic_delta(
+                &diagnostic_accounts,
+                &pump_accounts.user_quote_token_account,
+                net_quote_start_balance,
+                quote_amount_in,
+            )
+            .filter(|amount| *amount > 0)
+            .unwrap_or_else(|| {
+                usdc_to_raw_for_mint(
+                    &pumpswap.quote_mint,
+                    quote.final_amount_usdc,
+                    &config.tokens.usdc_mint,
+                    &config.tokens.sol_mint,
+                    config.strategy.sol_usdc_price,
+                )
+                .map(floor_u64)
+                .unwrap_or(1)
+                .max(1)
+            });
+            let min_profit_pct = pumpswap_meteora_enforced_profit_pct(execution_manager);
+            let profitable_quote_min_out =
+                quote_min_out_above_input(quote_amount_in.max(1), min_profit_pct);
+            let pumpswap_min_quote_out = execution_quote_min_output(
+                execution_min_output(execution_manager, simulated_pumpswap_quote_out),
+                profitable_quote_min_out,
+            );
+
+            instructions = setup_instructions.clone();
+            instructions.push(exact_meteora_instruction);
+            let mut fallback_instructions = setup_instructions.clone();
+            fallback_instructions.push(diagnostic_meteora_instruction);
+            let mut pump_sell_instruction = executor::swap::build_pump_amm_sell(
+                &pump_accounts.sell_accounts(),
+                settled_meteora_output_amount.max(1),
+                pumpswap_min_quote_out,
+            )?;
+            pump_sell_instruction
+                .accounts
+                .extend(pump_amm_sell_remaining_accounts(
+                    config,
+                    pumpswap,
+                    &pump_accounts,
+                )?);
+            instructions.push(pump_sell_instruction);
+
+            Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions,
+                fallback_label: "Meteora DLMM swap",
+                setup_instructions,
+                net_quote_token_account: pump_accounts.user_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: pumpswap.quote_mint.clone(),
+                intermediate_token_account: meteora_accounts.user_token_out,
+            })
+        }
+    }
+}
+
+fn should_attempt_live_send_after_simulation(
+    net_profit_pct: f64,
+    live_send_min_profit_pct: f64,
+) -> bool {
+    net_profit_pct.is_finite()
+        && if disable_local_profit_checks() {
+            true
+        } else {
+            net_profit_pct >= live_send_min_profit_pct
+        }
+}
+
+fn executor_direct_send_ready(execution_manager: &ExecutionManager) -> bool {
+    execution_manager.live_send_enabled()
+        && execution_manager.two_hop_executor_program_id().is_some()
+}
+
+fn direct_execution_trade_size_usdc(config: &Config) -> Option<f64> {
+    configured_live_trade_sizes_usdc(config)
+        .into_iter()
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn direct_candidate_search_trade_sizes_usdc(config: &Config) -> Vec<f64> {
+    if ExecutionScope::from_env().live_send_enabled() {
+        return live_probe_trade_sizes_usdc(config);
+    }
+    let mut trade_sizes = configured_live_trade_sizes_usdc(config);
+    trade_sizes.extend(build_monitor_trade_sizes(&config.strategy.trade_sizes));
+    dedup_trade_sizes(&mut trade_sizes);
+    trade_sizes
+}
+
+fn execution_probe_trade_sizes_usdc(config: &Config, preferred_size_usdc: f64) -> Vec<f64> {
+    let mut trade_sizes = configured_live_trade_sizes_usdc(config);
+    trade_sizes.extend([
+        0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2, 0.25, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0,
+    ]);
+    trade_sizes.extend(MANUAL_DIRECT_SCAN_TRADE_SIZES_USDC);
+    if preferred_size_usdc.is_finite() && preferred_size_usdc > 0.0 {
+        trade_sizes.push(preferred_size_usdc);
+    }
+    trade_sizes.retain(|size| *size <= preferred_size_usdc.max(2.0));
+    dedup_trade_sizes(&mut trade_sizes);
+    trade_sizes
+}
+
+fn should_attempt_direct_send(
+    stats: &mut RuntimeStats,
+    _route_kind: &'static str,
+    token_mint: &str,
+    net_profit_pct_hint: f64,
+) -> bool {
+    if disable_direct_send_skip_checks() {
+        return true;
+    }
+    let key = format!("direct_send:{token_mint}");
+    let now = Instant::now();
+    let Some(last) = stats.execution_attempts.get_mut(&key) else {
+        stats.execution_attempts.insert(
+            key,
+            CandidateLogState {
+                last_seen: now,
+                last_net_profit_pct: net_profit_pct_hint,
+            },
+        );
+        return true;
+    };
+
+    if now.duration_since(last.last_seen) >= DIRECT_SEND_ATTEMPT_MIN_INTERVAL {
+        last.last_seen = now;
+        last.last_net_profit_pct = net_profit_pct_hint;
+        true
+    } else {
+        false
+    }
+}
+
+fn allow_direct_send_attempt(
+    stats: &mut RuntimeStats,
+    route_kind: &'static str,
+    token_mint: &str,
+    net_profit_pct_hint: f64,
+    bypass_rate_limit: bool,
+) -> bool {
+    bypass_rate_limit
+        || should_attempt_direct_send(stats, route_kind, token_mint, net_profit_pct_hint)
+}
+
+async fn process_program_pair_tokens(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    account_metadata: &HashMap<String, market_universe::AccountMetadata>,
+    pump_state: &HashMap<String, PumpState>,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    whirlpool_state: &HashMap<String, WhirlpoolState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    pumpswap_fee_config: Option<&pumpswap::PumpSwapGlobalFeeConfig>,
+    dirty_direct_tokens: &mut HashSet<String>,
+    stats: &mut RuntimeStats,
+) {
+    let requested_tokens = dirty_direct_tokens
+        .drain()
+        .filter(|token| should_scan_direct_token(config, token))
+        .collect::<HashSet<_>>();
+    if requested_tokens.is_empty() {
+        return;
+    }
+
+    let actual_routeable_tokens = strategy::program_pairs::routeable_tokens(
+        config,
+        account_metadata,
+        pump_state,
+        pumpswap_state,
+        raydium_state,
+        meteora_state,
+        whirlpool_state,
+    )
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let token_filter = requested_tokens
+        .into_iter()
+        .filter(|token| actual_routeable_tokens.contains(token))
+        .collect::<HashSet<_>>();
+    if token_filter.is_empty() {
+        return;
+    }
+    let token_filter_count = token_filter.len();
+    let token_filter_preview = format_token_preview(token_filter.iter(), 8);
+    let selected_tokens = apply_token_selection_engine(
+        config,
+        account_metadata,
+        pumpswap_state,
+        raydium_state,
+        meteora_state,
+        pumpswap_by_token,
+        raydium_by_token,
+        meteora_by_token,
+        whirlpool_by_token,
+        stats,
+        token_filter.into_iter().collect(),
+        "program_pair",
+    );
+    if selected_tokens.is_empty() {
+        stats.no_match_checks += 1;
+        let skip_key = format!("program_pair_scan_skip:selected_empty:{token_filter_preview}");
+        if should_log_candidate_key(stats, skip_key, -40.0) {
+            tracing::debug!(
+                "程序路径 scan skipped: token selection kept 0/{} routeable token(s) tokens=[{}]",
+                token_filter_count,
+                token_filter_preview
+            );
+        }
+        return;
+    }
+    let token_filter = selected_tokens.into_iter().collect::<HashSet<_>>();
+    let token_filter_preview = format_token_preview(token_filter.iter(), 8);
+
+    let directional_candidates = strategy::program_pairs::directional_candidates_for_tokens(
+        config,
+        account_metadata,
+        pump_state,
+        pumpswap_state,
+        raydium_state,
+        meteora_state,
+        whirlpool_state,
+        &token_filter,
+    );
+    if directional_candidates.is_empty() {
+        stats.no_match_checks += token_filter.len() as u64;
+        let skip_key = format!("program_pair_scan_skip:no_directional:{token_filter_preview}");
+        if should_log_candidate_key(stats, skip_key, -30.0) {
+            tracing::debug!(
+                "程序路径 scan found 0 directional candidates across {} routeable token(s) tokens=[{}]",
+                token_filter.len(),
+                token_filter_preview
+            );
+        }
+        return;
+    }
+
+    tracing::debug!(
+        "程序路径 scan built {} directional candidate(s) across {} dirty token(s)",
+        directional_candidates.len(),
+        token_filter.len()
+    );
+
+    let directional_candidates = directional_candidates
+        .into_iter()
+        .filter(|candidate| program_pair_direction_enabled(config, candidate))
+        .collect::<Vec<_>>();
+    if directional_candidates.is_empty() {
+        stats.no_match_checks += token_filter.len() as u64;
+        let skip_key =
+            format!("program_pair_scan_skip:no_enabled_direction:{token_filter_preview}");
+        if should_log_candidate_key(stats, skip_key, -25.0) {
+            tracing::debug!(
+                "程序路径 scan skipped: no enabled direction across {} routeable token(s) tokens=[{}]",
+                token_filter.len(),
+                token_filter_preview
+            );
+        }
+        return;
+    }
+
+    let max_program_pair_quote_sol = available_program_pair_quote_sol(execution_manager, config)
+        .await
+        .ok();
+    let directional_candidates = directional_candidates
+        .into_iter()
+        .map(|candidate| {
+            let candidate = refine_program_pair_candidate_with_exact(
+                config,
+                candidate,
+                pumpswap_state,
+                raydium_state,
+                meteora_state,
+                whirlpool_state,
+                raydium_clmm_tick_arrays,
+                meteora_bin_arrays,
+                whirlpool_tick_arrays,
+                max_program_pair_quote_sol,
+            );
+            apply_program_pair_gate_state(execution_manager, config, stats, candidate)
+        })
+        .collect::<Vec<_>>();
+
+    let directional_candidates = directional_candidates
+        .into_iter()
+        .filter(|candidate| {
+            program_pair_monitoring_candidate_allowed(config, candidate, max_program_pair_quote_sol)
+        })
+        .collect::<Vec<_>>();
+
+    let mut candidates = directional_candidates;
+    candidates.sort_by(|left, right| {
+        let left_has_exact =
+            left.pricing_mode == strategy::program_pairs::ProgramPairPricingMode::ExactQuote;
+        let right_has_exact =
+            right.pricing_mode == strategy::program_pairs::ProgramPairPricingMode::ExactQuote;
+        right_has_exact
+            .cmp(&left_has_exact)
+            .then_with(|| {
+                program_pair_gross_profit_usdc(config, right)
+                    .partial_cmp(&program_pair_gross_profit_usdc(config, left))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                right
+                    .gross_profit_pct
+                    .partial_cmp(&left.gross_profit_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.token_mint.cmp(&right.token_mint))
+    });
+
+    if config.strategy.max_direct_tokens_per_scan > 0
+        && candidates.len() > config.strategy.max_direct_tokens_per_scan
+    {
+        candidates.truncate(config.strategy.max_direct_tokens_per_scan);
+    }
+
+    let max_send_candidates_per_scan = if disable_local_profit_checks() {
+        usize::MAX
+    } else {
+        config
+            .strategy
+            .program_pair_max_send_candidates_per_scan
+            .max(1)
+    };
+    let selected_send_candidate_keys = candidates
+        .iter()
+        .filter(|candidate| program_pair_send_profit_passes(config, execution_manager, candidate))
+        .take(max_send_candidates_per_scan)
+        .map(program_pair_candidate_instance_key)
+        .collect::<HashSet<_>>();
+
+    if let Some(best) = candidates.iter().find(|candidate| {
+        candidate.pricing_mode == strategy::program_pairs::ProgramPairPricingMode::ExactQuote
+            && candidate.net_profit_pct.is_finite()
+            && candidate.net_profit_pct > 0.0
+            && program_pair_candidate_gate_profit_pct(candidate) >= 0.0
+    }) {
+        record_route_snapshot(
+            stats,
+            RouteSnapshot {
+                token_mint: best.token_mint.clone(),
+                buy_venue: config.program_label(best.buy_market.kind).to_string(),
+                sell_venue: config.program_label(best.sell_market.kind).to_string(),
+                buy_price_usdc: best.buy_market.price_usdc,
+                sell_price_usdc: best.sell_market.price_usdc,
+                gross_profit_pct: best.gross_profit_pct,
+                net_profit_pct: program_pair_candidate_gate_profit_pct(best),
+                route_kind: "program_pair_exact",
+            },
+        );
+    }
+
+    let near_profit_margin_pct = config.strategy.program_pair_near_profit_margin_pct.max(0.0);
+    let mut near_profit_pool = Vec::new();
+    let mut selected_candidates = 0usize;
+
+    for candidate in candidates {
+        record_token_exact_candidate(stats, &candidate.token_mint);
+        record_program_pair_path_evaluation(config, stats, &candidate);
+        let gate_profit_pct = program_pair_candidate_gate_profit_pct(&candidate);
+        record_direct_token_feedback(stats, &candidate.token_mint, gate_profit_pct);
+        let trade_size_usdc = program_pair_trade_size_usdc(config, &candidate).unwrap_or(0.0);
+        let gate_state = candidate.gate.as_ref();
+        let base_threshold_pct = gate_state
+            .map(|gate| gate.base_threshold_pct)
+            .unwrap_or(config.strategy.min_profit_threshold);
+        let base_profit_gap_pct = candidate.net_profit_pct - base_threshold_pct;
+        let size_search_summary = candidate
+            .exact_search
+            .as_ref()
+            .map(|search| {
+                let evals = search
+                    .evaluations
+                    .iter()
+                    .map(|evaluation| {
+                        format!(
+                            "金额=${:.2} 净利={:.2}%",
+                            evaluation.trade_size_usdc, evaluation.net_profit_pct
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "成功 {}/{}，{}",
+                    search.successful_size_count, search.requested_size_count, evals
+                )
+            })
+            .unwrap_or_else(|| "只有现货估算".to_string());
+        let log_key = program_pair_candidate_instance_key(&candidate);
+        let spot_pumpswap_raydium_test_send =
+            program_pair_spot_pumpswap_raydium_test_send_allowed(&candidate);
+        let send_supported = program_pair_candidate_send_supported(&candidate);
+        let selected_for_send = selected_send_candidate_keys.contains(&log_key);
+        if selected_for_send {
+            if candidate.pricing_mode == strategy::program_pairs::ProgramPairPricingMode::ExactQuote
+            {
+                stats.validated_checks += 1;
+            }
+            selected_candidates += 1;
+            record_program_pair_profitable_selection(stats, &candidate);
+            if should_log_candidate_key(stats, log_key, gate_profit_pct) {
+                if spot_pumpswap_raydium_test_send {
+                    tracing::info!(
+                        "准备发送现货路径：币种={}，路径={}到{}，金额=${:.2}，估算净利={:.2}%",
+                        candidate.token_mint,
+                        config.program_label(candidate.buy_market.kind),
+                        config.program_label(candidate.sell_market.kind),
+                        direct_execution_trade_size_usdc(config).unwrap_or(trade_size_usdc),
+                        gate_profit_pct,
+                    );
+                } else {
+                    tracing::info!(
+                        "发现可发送路径：币种={}，路径={}到{}，金额=${:.2}，毛利={:.2}%，净利={:.2}%，买池={}，卖池={}",
+                        candidate.token_mint,
+                        config.program_label(candidate.buy_market.kind),
+                        config.program_label(candidate.sell_market.kind),
+                        trade_size_usdc,
+                        candidate.gross_profit_pct,
+                        gate_profit_pct,
+                        candidate.buy_market.address,
+                        candidate.sell_market.address,
+                    );
+                }
+            }
+            record_token_send_attempt(stats, &candidate.token_mint);
+            maybe_send_program_pair_candidate(
+                execution_manager,
+                config,
+                &candidate,
+                pumpswap_state,
+                raydium_state,
+                meteora_state,
+                whirlpool_state,
+                raydium_clmm_tick_arrays,
+                meteora_bin_arrays,
+                whirlpool_tick_arrays,
+                pumpswap_fee_config,
+                stats,
+            )
+            .await;
+        } else {
+            stats.rejected_below_threshold += 1;
+            if base_profit_gap_pct >= -near_profit_margin_pct {
+                near_profit_pool.push(candidate.clone());
+                record_program_pair_path_near_profit(stats, &candidate);
+            }
+            if should_log_candidate_key(stats, log_key, gate_profit_pct) {
+                if candidate.pricing_mode
+                    == strategy::program_pairs::ProgramPairPricingMode::SpotHeuristic
+                {
+                    let exact_reason = candidate
+                        .exact_search
+                        .as_ref()
+                        .map(|search| {
+                            if search.requested_size_count > 0 && search.successful_size_count == 0
+                            {
+                                "缺少精确报价"
+                            } else {
+                                "只有现货估算"
+                            }
+                        })
+                        .unwrap_or("只有现货估算");
+                    tracing::debug!(
+                        "跳过现货路径：币种={}，路径={}到{}，原因={}，估算净利={:.2}%",
+                        candidate.token_mint,
+                        config.program_label(candidate.buy_market.kind),
+                        config.program_label(candidate.sell_market.kind),
+                        exact_reason,
+                        gate_profit_pct,
+                    );
+                } else {
+                    let reject_reason = if !send_supported {
+                        "不支持发送"
+                    } else if !candidate.gross_profit_pct.is_finite()
+                        || candidate.gross_profit_pct
+                            <= program_pair_send_min_gross_profit_pct(config)
+                    {
+                        "毛利不够"
+                    } else if !program_pair_gross_profit_usdc(config, &candidate).is_finite()
+                        || program_pair_gross_profit_usdc(config, &candidate) <= 0.0
+                    {
+                        "毛利为负"
+                    } else {
+                        "未选中"
+                    };
+                    tracing::debug!(
+                        "跳过路径：币种={}，路径={}到{}，原因={}，金额=${:.2}，净利={:.2}%，详情={}",
+                        candidate.token_mint,
+                        config.program_label(candidate.buy_market.kind),
+                        config.program_label(candidate.sell_market.kind),
+                        reject_reason,
+                        trade_size_usdc,
+                        gate_profit_pct,
+                        size_search_summary,
+                    );
+                }
+            }
+        }
+    }
+
+    if selected_candidates == 0 {
+        if selected_send_candidate_keys.is_empty() {
+            let skip_key = format!("program_pair_no_send_candidate:{token_filter_preview}");
+            if should_log_candidate_key(stats, skip_key, -20.0) {
+                tracing::debug!(
+                    "本轮没有可发送路径：毛利阈值>{:.2}%，tokens=[{}]",
+                    program_pair_send_min_gross_profit_pct(config),
+                    token_filter_preview
+                );
+            }
+        }
+        near_profit_pool.sort_by(|left, right| {
+            program_pair_candidate_gate_profit_pct(right)
+                .partial_cmp(&program_pair_candidate_gate_profit_pct(left))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .net_profit_pct
+                        .partial_cmp(&left.net_profit_pct)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        near_profit_pool.truncate(5);
+        if !near_profit_pool.is_empty() {
+            let summary = near_profit_pool
+                .iter()
+                .map(|candidate| {
+                    let trade_size_usdc =
+                        program_pair_trade_size_usdc(config, candidate).unwrap_or(0.0);
+                    format!(
+                        "{} {}到{} 金额=${:.2} 净利={:.2}% 门槛后={:.2}%",
+                        &candidate.token_mint[..candidate.token_mint.len().min(8)],
+                        candidate.buy_market.kind.as_str(),
+                        candidate.sell_market.kind.as_str(),
+                        trade_size_usdc,
+                        candidate.net_profit_pct,
+                        program_pair_candidate_gate_profit_pct(candidate)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if should_log_candidate_key(
+                stats,
+                "program_pair_near_profit_pool".to_string(),
+                near_profit_pool
+                    .first()
+                    .map(program_pair_candidate_gate_profit_pct)
+                    .unwrap_or(0.0),
+            ) {
+                tracing::debug!(
+                    "接近阈值的路径：数量={}，边距={:.2}%，{}",
+                    near_profit_pool.len(),
+                    near_profit_margin_pct,
+                    summary
+                );
+            }
+        }
+    }
+}
+
+fn program_pair_candidate_instance_key(
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) -> String {
+    format!(
+        "program_pair:{}:{}:{}:{}:{}",
+        candidate.token_mint,
+        candidate.buy_market.kind.as_str(),
+        candidate.sell_market.kind.as_str(),
+        candidate.buy_market.address,
+        candidate.sell_market.address
+    )
+}
+
+fn program_pair_gross_profit_usdc(
+    config: &Config,
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) -> f64 {
+    if let Some(pnl) = candidate.selected_pnl_usdc.as_ref() {
+        return pnl.gross_profit_usdc;
+    }
+
+    if candidate.quote_mint == config.tokens.sol_mint {
+        candidate.gross_profit_quote * config.strategy.sol_usdc_price
+    } else {
+        candidate.gross_profit_quote
+    }
+}
+
+fn program_pair_send_min_gross_profit_pct(config: &Config) -> f64 {
+    config
+        .strategy
+        .program_pair_send_min_gross_profit_pct
+        .max(0.0)
+}
+
+fn program_pair_send_profit_passes(
+    config: &Config,
+    execution_manager: &ExecutionManager,
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) -> bool {
+    if candidate.pricing_mode != strategy::program_pairs::ProgramPairPricingMode::ExactQuote {
+        return false;
+    }
+    if !program_pair_candidate_send_supported(candidate) {
+        return false;
+    }
+    if !candidate.net_profit_pct.is_finite() || candidate.net_profit_pct < 0.0 {
+        return false;
+    }
+    let gate_profit_pct = program_pair_candidate_gate_profit_pct(candidate);
+    if !gate_profit_pct.is_finite() || gate_profit_pct < 0.0 {
+        return false;
+    }
+    let active_threshold_pct =
+        active_offchain_profit_threshold_pct(Some(execution_manager), config);
+    if !passes_local_profit_threshold(candidate.net_profit_pct, active_threshold_pct) {
+        return false;
+    }
+    if !passes_local_profit_threshold(gate_profit_pct, active_threshold_pct) {
+        return false;
+    }
+
+    let gross_profit_usdc = program_pair_gross_profit_usdc(config, candidate);
+    if disable_local_profit_checks() {
+        gross_profit_usdc.is_finite() && candidate.gross_profit_pct.is_finite()
+    } else {
+        gross_profit_usdc.is_finite()
+            && gross_profit_usdc > 0.0
+            && candidate.gross_profit_pct.is_finite()
+            && candidate.gross_profit_pct > program_pair_send_min_gross_profit_pct(config)
+    }
+}
+
+async fn available_program_pair_quote_sol(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+) -> Result<f64> {
+    let user = execution_manager
+        .wallet_pubkey()
+        .ok_or_else(|| anyhow::anyhow!("executor wallet is not configured"))?;
+    let quote_token_program = Pubkey::from_str(executor::swap::TOKEN_PROGRAM_ID)?;
+    let quote_mint = Pubkey::from_str(&config.tokens.sol_mint)?;
+    let quote_ata =
+        executor::swap::associated_token_address(&user, &quote_mint, &quote_token_program)?;
+    let wrapped_balance_raw = token_account_balance(&config.rpc.http_url, &quote_ata).await?;
+    let wallet_balance_raw = wallet_sol_balance_lamports(&config.rpc.http_url, &user).await?;
+    let wrapped_reserve_raw = 20_000_000u64;
+    let usable_wrapped_raw = wrapped_balance_raw.saturating_sub(wrapped_reserve_raw);
+    let usable_wallet_raw = wallet_balance_raw.saturating_sub(WALLET_SOL_RESERVE_LAMPORTS);
+    let total_usable_raw = usable_wrapped_raw.saturating_add(usable_wallet_raw);
+    Ok((total_usable_raw as f64 / 1_000_000_000.0).max(0.0))
+}
+
+fn program_pair_monitoring_candidate_allowed(
+    config: &Config,
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+    max_program_pair_quote_sol: Option<f64>,
+) -> bool {
+    use config::ProgramKind;
+    if matches!(
+        (candidate.buy_market.kind, candidate.sell_market.kind),
+        (ProgramKind::RaydiumClmm, ProgramKind::Pumpswap)
+    ) {
+        return false;
+    }
+
+    if candidate.quote_mint != config.tokens.sol_mint {
+        return true;
+    }
+
+    max_program_pair_quote_sol
+        .map(|max_size| candidate.trade_size_quote <= max_size)
+        .unwrap_or(true)
+}
+
+fn program_pair_direction_enabled(
+    config: &Config,
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) -> bool {
+    use config::ProgramKind;
+    match (candidate.buy_market.kind, candidate.sell_market.kind) {
+        (ProgramKind::Pumpswap, ProgramKind::MeteoraDlmm)
+        | (ProgramKind::MeteoraDlmm, ProgramKind::Pumpswap) => {
+            direct_route_family_enabled(config, DirectRouteFamily::PumpSwapMeteora)
+        }
+        (ProgramKind::Pumpswap, kind) | (kind, ProgramKind::Pumpswap)
+            if program_pair_raydium_kind(kind) =>
+        {
+            true
+        }
+        (ProgramKind::MeteoraDlmm, kind) | (kind, ProgramKind::MeteoraDlmm)
+            if program_pair_raydium_kind(kind) =>
+        {
+            true
+        }
+        (ProgramKind::Pumpswap, ProgramKind::Whirlpool)
+        | (ProgramKind::Whirlpool, ProgramKind::Pumpswap) => {
+            direct_route_family_enabled(config, DirectRouteFamily::PumpSwapWhirlpool)
+        }
+        (ProgramKind::MeteoraDlmm, ProgramKind::Whirlpool)
+        | (ProgramKind::Whirlpool, ProgramKind::MeteoraDlmm) => {
+            direct_route_family_enabled(config, DirectRouteFamily::MeteoraWhirlpool)
+        }
+        (kind, ProgramKind::Whirlpool) | (ProgramKind::Whirlpool, kind)
+            if program_pair_raydium_kind(kind) =>
+        {
+            direct_route_family_enabled(config, DirectRouteFamily::RaydiumWhirlpool)
+        }
+        _ => false,
+    }
+}
+
+fn program_pair_raydium_kind(kind: config::ProgramKind) -> bool {
+    matches!(
+        kind,
+        config::ProgramKind::RaydiumClmm
+            | config::ProgramKind::RaydiumAmmV4
+            | config::ProgramKind::RaydiumCpmm
+    )
+}
+
+fn program_pair_spot_pumpswap_raydium_test_send_allowed(
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) -> bool {
+    use config::ProgramKind;
+    disable_local_profit_checks()
+        && candidate.pricing_mode == strategy::program_pairs::ProgramPairPricingMode::SpotHeuristic
+        && matches!(
+            (candidate.buy_market.kind, candidate.sell_market.kind),
+            (ProgramKind::Pumpswap, ProgramKind::RaydiumClmm)
+        )
+}
+
+async fn maybe_send_program_pair_candidate(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    whirlpool_state: &HashMap<String, WhirlpoolState>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    pumpswap_fee_config: Option<&pumpswap::PumpSwapGlobalFeeConfig>,
+    stats: &mut RuntimeStats,
+) {
+    use config::ProgramKind;
+
+    if !execution_manager.live_send_enabled() {
+        return;
+    }
+    let spot_pumpswap_raydium_test_send =
+        program_pair_spot_pumpswap_raydium_test_send_allowed(candidate);
+    if candidate.pricing_mode != strategy::program_pairs::ProgramPairPricingMode::ExactQuote
+        && !spot_pumpswap_raydium_test_send
+    {
+        let key = format!(
+            "program_pair_skip:{}:{}:{}:{}",
+            candidate.token_mint,
+            candidate.buy_market.address,
+            candidate.sell_market.address,
+            candidate.quote_mint
+        );
+        if should_log_candidate_key(stats, key, candidate.net_profit_pct) {
+            tracing::debug!(
+                "程序路径直发跳过: 币种={} 路径={} -> {} 原因=only spot heuristic available, exact quote missing",
+                candidate.token_mint,
+                config.program_label(candidate.buy_market.kind),
+                config.program_label(candidate.sell_market.kind),
+            );
+        }
+        return;
+    }
+    let trade_size_usdc = if spot_pumpswap_raydium_test_send {
+        direct_execution_trade_size_usdc(config).unwrap_or_else(|| {
+            if candidate.quote_mint == config.tokens.sol_mint {
+                candidate.trade_size_quote * config.strategy.sol_usdc_price
+            } else {
+                candidate.trade_size_quote
+            }
+        })
+    } else if candidate.quote_mint == config.tokens.sol_mint {
+        candidate.trade_size_quote * config.strategy.sol_usdc_price
+    } else if candidate.quote_mint == config.tokens.usdc_mint {
+        candidate.trade_size_quote
+    } else {
+        return;
+    };
+    if trade_size_usdc <= 0.0 || !trade_size_usdc.is_finite() {
+        return;
+    }
+
+    match (candidate.buy_market.kind, candidate.sell_market.kind) {
+        (ProgramKind::Pumpswap, ProgramKind::MeteoraDlmm)
+        | (ProgramKind::MeteoraDlmm, ProgramKind::Pumpswap) => {
+            let (pumpswap_address, meteora_address, direction) =
+                match (candidate.buy_market.kind, candidate.sell_market.kind) {
+                    (ProgramKind::Pumpswap, ProgramKind::MeteoraDlmm) => (
+                        candidate.buy_market.address.as_str(),
+                        candidate.sell_market.address.as_str(),
+                        MeteoraPumpSwapDirection::PumpSwapToMeteora,
+                    ),
+                    _ => (
+                        candidate.sell_market.address.as_str(),
+                        candidate.buy_market.address.as_str(),
+                        MeteoraPumpSwapDirection::MeteoraToPumpSwap,
+                    ),
+                };
+            let Some(pumpswap) = pumpswap_state.get(pumpswap_address) else {
+                return;
+            };
+            let Some(meteora) = meteora_state.get(meteora_address) else {
+                return;
+            };
+            let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                return;
+            };
+            let protocol_fee_recipient =
+                select_pumpswap_protocol_fee_recipient(Some(pumpswap), pumpswap_fee_config);
+            let _ = maybe_send_program_pair_pumpswap_meteora_rpc_direct(
+                execution_manager,
+                config,
+                pumpswap,
+                &pumpswap_pool,
+                meteora,
+                &candidate.token_mint,
+                direction,
+                meteora_bin_arrays,
+                protocol_fee_recipient,
+                trade_size_usdc,
+                candidate.net_profit_pct,
+                stats,
+            )
+            .await;
+        }
+        (ProgramKind::Pumpswap, ProgramKind::RaydiumClmm)
+        | (ProgramKind::RaydiumClmm, ProgramKind::Pumpswap) => {
+            let (pumpswap_address, raydium_address, direction) =
+                match (candidate.buy_market.kind, candidate.sell_market.kind) {
+                    (ProgramKind::Pumpswap, ProgramKind::RaydiumClmm) => (
+                        candidate.buy_market.address.as_str(),
+                        candidate.sell_market.address.as_str(),
+                        ClmmSpotDirection::PumpSwapToClmm,
+                    ),
+                    _ => (
+                        candidate.sell_market.address.as_str(),
+                        candidate.buy_market.address.as_str(),
+                        ClmmSpotDirection::ClmmToPumpSwap,
+                    ),
+                };
+            if !pumpswap_clmm_execution_direction_enabled(direction) {
+                tracing::debug!(
+                    "跳过直发: 路径={} 币种={} 原因=当前只允许 PumpSwap->Raydium CLMM 单向执行",
+                    pumpswap_clmm_direction_label(direction),
+                    candidate.token_mint
+                );
+                return;
+            }
+            let Some(pumpswap) = pumpswap_state.get(pumpswap_address) else {
+                return;
+            };
+            let Some(raydium) = raydium_state.get(raydium_address) else {
+                return;
+            };
+            let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                return;
+            };
+            let protocol_fee_recipient =
+                select_pumpswap_protocol_fee_recipient(Some(pumpswap), pumpswap_fee_config);
+            let _ = maybe_send_pumpswap_clmm_direct_with_trade_size(
+                execution_manager,
+                config,
+                pumpswap,
+                &pumpswap_pool,
+                raydium,
+                &candidate.token_mint,
+                direction,
+                raydium_clmm_tick_arrays,
+                protocol_fee_recipient,
+                trade_size_usdc,
+                candidate.net_profit_pct,
+                stats,
+            )
+            .await;
+        }
+        (ProgramKind::MeteoraDlmm, ProgramKind::RaydiumClmm)
+        | (ProgramKind::RaydiumClmm, ProgramKind::MeteoraDlmm) => {
+            if !meteora_clmm_live_send_enabled() {
+                return;
+            }
+            let (meteora_address, raydium_address, direction) =
+                match (candidate.buy_market.kind, candidate.sell_market.kind) {
+                    (ProgramKind::MeteoraDlmm, ProgramKind::RaydiumClmm) => (
+                        candidate.buy_market.address.as_str(),
+                        candidate.sell_market.address.as_str(),
+                        MeteoraClmmDirection::MeteoraToClmm,
+                    ),
+                    _ => (
+                        candidate.sell_market.address.as_str(),
+                        candidate.buy_market.address.as_str(),
+                        MeteoraClmmDirection::ClmmToMeteora,
+                    ),
+                };
+            let Some(meteora) = meteora_state.get(meteora_address) else {
+                return;
+            };
+            let Some(raydium) = raydium_state.get(raydium_address) else {
+                return;
+            };
+            let _ = maybe_send_meteora_raydium_direct_with_trade_size(
+                execution_manager,
+                config,
+                meteora,
+                raydium,
+                &candidate.token_mint,
+                direction,
+                meteora_bin_arrays,
+                raydium_clmm_tick_arrays,
+                trade_size_usdc,
+                candidate.net_profit_pct,
+                stats,
+            )
+            .await;
+        }
+        (ProgramKind::MeteoraDlmm, ProgramKind::Whirlpool)
+        | (ProgramKind::Whirlpool, ProgramKind::MeteoraDlmm) => {
+            let (meteora_address, whirlpool_address, direction) =
+                match (candidate.buy_market.kind, candidate.sell_market.kind) {
+                    (ProgramKind::MeteoraDlmm, ProgramKind::Whirlpool) => (
+                        candidate.buy_market.address.as_str(),
+                        candidate.sell_market.address.as_str(),
+                        MeteoraWhirlpoolDirection::MeteoraToWhirlpool,
+                    ),
+                    _ => (
+                        candidate.sell_market.address.as_str(),
+                        candidate.buy_market.address.as_str(),
+                        MeteoraWhirlpoolDirection::WhirlpoolToMeteora,
+                    ),
+                };
+            let Some(meteora) = meteora_state.get(meteora_address) else {
+                return;
+            };
+            let Some(whirlpool) = whirlpool_state.get(whirlpool_address) else {
+                return;
+            };
+            let _ = maybe_send_meteora_whirlpool_direct_with_trade_size(
+                execution_manager,
+                config,
+                meteora,
+                whirlpool,
+                &candidate.token_mint,
+                direction,
+                meteora_bin_arrays,
+                whirlpool_tick_arrays,
+                trade_size_usdc,
+                candidate.net_profit_pct,
+                stats,
+            )
+            .await;
+        }
+        (ProgramKind::MeteoraDlmm, ProgramKind::MeteoraDlmm) => {
+            let Some(buy_meteora) = meteora_state.get(&candidate.buy_market.address) else {
+                return;
+            };
+            let Some(sell_meteora) = meteora_state.get(&candidate.sell_market.address) else {
+                return;
+            };
+            let _ = maybe_send_meteora_meteora_direct_with_trade_size(
+                execution_manager,
+                config,
+                buy_meteora,
+                sell_meteora,
+                &candidate.token_mint,
+                meteora_bin_arrays,
+                trade_size_usdc,
+                candidate.net_profit_pct,
+                stats,
+            )
+            .await;
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_send_program_pair_pumpswap_meteora_rpc_direct(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    direction: MeteoraPumpSwapDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    trade_size_usdc: f64,
+    exact_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let (_, _, path_label) = pumpswap_meteora_direction_labels(direction);
+    if !passes_active_offchain_profit_threshold(
+        exact_net_profit_pct,
+        Some(execution_manager),
+        config,
+    ) {
+        return true;
+    }
+    if !should_attempt_direct_send(
+        stats,
+        "program_pair_pumpswap_meteora",
+        token_mint,
+        exact_net_profit_pct,
+    ) {
+        return true;
+    }
+
+    let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+        .values()
+        .filter(|array| array.lb_pair == meteora.pool_address)
+        .collect();
+    let exact = match direction {
+        MeteoraPumpSwapDirection::PumpSwapToMeteora => quote_pumpswap_buy_meteora_sell(
+            config,
+            pumpswap_pool,
+            meteora,
+            token_mint,
+            &pool_bin_arrays,
+            trade_size_usdc,
+        ),
+        MeteoraPumpSwapDirection::MeteoraToPumpSwap => quote_meteora_buy_pumpswap_sell(
+            config,
+            pumpswap_pool,
+            meteora,
+            token_mint,
+            &pool_bin_arrays,
+            trade_size_usdc,
+        ),
+    };
+    let Some(mut exact) = exact else {
+        tracing::debug!(
+            "程序路径直发跳过: 路径={} 币种={} 原因=exact quote unavailable",
+            path_label,
+            token_mint
+        );
+        return true;
+    };
+    if let Some(arb_quote) = exact.arb_quote.as_mut() {
+        arb_quote.forward_pool = pumpswap.pool_address.clone();
+        arb_quote.backward_pool = meteora.pool_address.clone();
+        let assessment = assess_pumpswap_meteora_opportunity(config, stats, arb_quote);
+        if !assessment.send_allowed {
+            log_pumpswap_meteora_quote_decision(
+                path_label,
+                token_mint,
+                trade_size_usdc,
+                arb_quote,
+                &assessment,
+                "观察",
+                "",
+            );
+            return true;
+        }
+    }
+    let rechecked_threshold_pct =
+        active_offchain_profit_threshold_pct(Some(execution_manager), config);
+    if !exact.net_profit_pct.is_finite() || exact.net_profit_pct < 0.0 {
+        stats.rejected_below_threshold += 1;
+        tracing::debug!(
+            "跳过发送：路径={}，币种={}，原因=预计收益为负，预计收益={:.2}%",
+            path_label,
+            token_mint,
+            exact.net_profit_pct
+        );
+        return true;
+    }
+    if !passes_local_profit_threshold(exact.net_profit_pct, rechecked_threshold_pct) {
+        stats.rejected_below_threshold += 1;
+        tracing::info!(
+            "跳过发送：路径={}，币种={}，原因=二次报价低于阈值，二次净利={:.2}%，阈值={:.2}%，毛利={:.2}%，净利=${:.4}",
+            path_label,
+            token_mint,
+            exact.net_profit_pct,
+            rechecked_threshold_pct,
+            exact.gross_profit_pct,
+            exact.net_profit_usdc
+        );
+        return true;
+    }
+    stats.tx_build_required += 1;
+    let plan = match build_pumpswap_meteora_direct_execution_instructions(
+        config,
+        execution_manager,
+        pumpswap,
+        pumpswap_pool,
+        meteora,
+        token_mint,
+        direction,
+        meteora_bin_arrays,
+        pumpswap_protocol_fee_recipient,
+        &exact,
+        trade_size_usdc,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            stats.tx_build_blocked += 1;
+            if let Some(retried) = retry_pumpswap_meteora_with_expanded_bin_arrays(
+                execution_manager,
+                config,
+                pumpswap,
+                pumpswap_pool,
+                meteora,
+                token_mint,
+                direction,
+                meteora_bin_arrays,
+                pumpswap_protocol_fee_recipient,
+                trade_size_usdc,
+                exact.net_profit_pct,
+                stats,
+                "pumpswap_meteora",
+                path_label,
+                &error.to_string(),
+            )
+            .await
+            {
+                return retried;
+            }
+            if let Some(retried) = retry_pumpswap_meteora_with_reduced_bin_arrays(
+                execution_manager,
+                config,
+                pumpswap,
+                pumpswap_pool,
+                meteora,
+                token_mint,
+                direction,
+                meteora_bin_arrays,
+                pumpswap_protocol_fee_recipient,
+                trade_size_usdc,
+                exact.net_profit_pct,
+                stats,
+                "pumpswap_meteora",
+                path_label,
+                &error.to_string(),
+            )
+            .await
+            {
+                return retried;
+            }
+            tracing::warn!(
+                "交易构建失败：路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                summarize_block_reason(&error.to_string())
+            );
+            return false;
+        }
+    };
+
+    let Some(send_fee_plan) =
+        send_fee_plan_for_exact_quote(config, &exact, &plan.net_quote_mint, trade_size_usdc)
+    else {
+        stats.rejected_below_threshold += 1;
+        tracing::info!(
+            "跳过发送：路径={}，币种={}，原因=无法计算动态小费和基础费",
+            path_label,
+            token_mint
+        );
+        return true;
+    };
+    tracing::debug!(
+        "发送费用计划：路径={}，币种={}，毛利raw={}，tip={} lamports，tip比例={:.1}%，基础费={} lamports，扣费后raw={}，本地不拦截，交给链上保护",
+        path_label,
+        token_mint,
+        send_fee_plan.gross_profit_raw,
+        send_fee_plan.jito_tip_lamports,
+        send_fee_plan.tip_share * 100.0,
+        send_fee_plan.base_fee_lamports,
+        send_fee_plan.net_after_tip_and_base_raw
+    );
+
+    let wrapped_instructions =
+        match wrap_program_pair_plan_with_two_hop_executor_with_min_profit_raw(
+            execution_manager,
+            &plan,
+            Some(send_fee_plan.min_profit_raw),
+        ) {
+            Ok(instructions) => instructions,
+            Err(error) => {
+                stats.tx_build_blocked += 1;
+                tracing::warn!(
+                    "两跳交易封装失败：路径={}，币种={}，原因={}",
+                    path_label,
+                    token_mint,
+                    summarize_block_reason(&error.to_string())
+                );
+                return false;
+            }
+        };
+
+    match execution_manager
+        .send_instructions_with_simulated_units_and_tip(
+            wrapped_instructions.clone(),
+            None,
+            send_fee_plan.jito_tip_lamports,
+        )
+        .await
+    {
+        Ok(signature) => {
+            record_token_send_success(stats, token_mint);
+            log_send_success(
+                "program_pair",
+                path_label,
+                token_mint,
+                &signature,
+                exact.net_profit_pct,
+            );
+            true
+        }
+        Err(error) => {
+            if error.to_string().contains("rate-limited") {
+                tracing::debug!(
+                    "程序路径直发跳过: 路径={} 币种={} 原因=发送冷却中 exact={:.2}%",
+                    path_label,
+                    token_mint,
+                    exact.net_profit_pct
+                );
+                true
+            } else {
+                let error_text = error.to_string();
+                if is_transaction_too_large_error(&error_text)
+                    && try_auto_extend_alt(
+                        execution_manager,
+                        "program_pair",
+                        path_label,
+                        token_mint,
+                        &wrapped_instructions,
+                    )
+                    .await
+                {
+                    match execution_manager
+                        .send_instructions_with_simulated_units_and_tip(
+                            wrapped_instructions.clone(),
+                            None,
+                            send_fee_plan.jito_tip_lamports,
+                        )
+                        .await
+                    {
+                        Ok(signature) => {
+                            record_token_send_success(stats, token_mint);
+                            log_send_success(
+                                "program_pair",
+                                path_label,
+                                token_mint,
+                                &signature,
+                                exact.net_profit_pct,
+                            );
+                            return true;
+                        }
+                        Err(retry_error)
+                            if !is_setup_split_send_error(&retry_error.to_string()) =>
+                        {
+                            tracing::warn!(
+                                "地址表重试失败：路径={}，币种={}，原因={}",
+                                path_label,
+                                token_mint,
+                                retry_error
+                            );
+                            return false;
+                        }
+                        Err(retry_error) => {
+                            tracing::info!(
+                                "地址表重试后仍需拆分：路径={}，币种={}，原因={}",
+                                path_label,
+                                token_mint,
+                                retry_error
+                            );
+                        }
+                    }
+                }
+
+                if is_setup_split_send_error(&error_text) && !plan.setup_instructions.is_empty() {
+                    let atomic_only = match wrap_program_pair_plan_with_two_hop_executor_atomic_only_with_min_profit_raw(
+                        execution_manager,
+                        &plan,
+                        Some(send_fee_plan.min_profit_raw),
+                    ) {
+                        Ok(instructions) => instructions,
+                        Err(split_error) => {
+                            tracing::warn!(
+                                "拆分交易组装失败：路径={}，币种={}，原因={}",
+                                path_label,
+                                token_mint,
+                                split_error
+                            );
+                            return false;
+                        }
+                    };
+                    tracing::info!(
+                        "交易过大，改用拆分发送：路径={}，币种={}，准备指令={}，交易指令={}",
+                        path_label,
+                        token_mint,
+                        plan.setup_instructions.len(),
+                        atomic_only.len()
+                    );
+                    match execution_manager
+                        .send_instruction_bundle_with_simulated_units_and_tip(
+                            vec![plan.setup_instructions.clone(), atomic_only],
+                            vec![None, None],
+                            send_fee_plan.jito_tip_lamports,
+                        )
+                        .await
+                    {
+                        Ok(signature) => {
+                            record_token_send_success(stats, token_mint);
+                            log_send_success(
+                                "program_pair",
+                                path_label,
+                                token_mint,
+                                &signature,
+                                exact.net_profit_pct,
+                            );
+                            return true;
+                        }
+                        Err(split_error) => {
+                            tracing::warn!(
+                                "拆分交易发送失败：路径={}，币种={}，原因={}",
+                                path_label,
+                                token_mint,
+                                split_error
+                            );
+                            return false;
+                        }
+                    }
+                }
+
+                tracing::warn!(
+                    "RPC 发送失败：路径={}，币种={}，原因={}",
+                    path_label,
+                    token_mint,
+                    error_text
+                );
+                false
+            }
+        }
+    }
+}
+
+fn build_program_pair_two_hop_executor_instruction(
+    execution_manager: &ExecutionManager,
+    plan: &SimulationInstructionPlan,
+    min_profit_raw_override: Option<u64>,
+) -> Result<Instruction> {
+    let Some(program_id) = execution_manager.two_hop_executor_program_id() else {
+        anyhow::bail!("missing TWO_HOP_EXECUTOR_PROGRAM_ID for program-pair direct send");
+    };
+
+    let setup_len = plan.setup_instructions.len();
+    if plan.atomic_instructions.len() < setup_len + 2 {
+        anyhow::bail!(
+            "program-pair 两跳 wrapping requires exactly two executable legs after setup; got total={} setup={}",
+            plan.atomic_instructions.len(),
+            setup_len
+        );
+    }
+
+    let first_instruction = &plan.atomic_instructions[setup_len];
+    let second_instruction = &plan.atomic_instructions[setup_len + 1];
+    let min_profit_raw = match min_profit_raw_override {
+        Some(value) => value,
+        None => program_pair_two_hop_min_profit_raw(execution_manager, &plan.net_quote_mint)?,
+    };
+    executor::onchain::build_execute_two_hop_instruction(
+        &program_id,
+        &plan.net_quote_token_account,
+        &plan.intermediate_token_account,
+        first_instruction,
+        second_instruction,
+        min_profit_raw,
+        executor::onchain::DEFAULT_SECOND_LEG_AMOUNT_IN_OFFSET,
+    )
+}
+
+fn wrap_program_pair_plan_with_two_hop_executor(
+    execution_manager: &ExecutionManager,
+    plan: &SimulationInstructionPlan,
+) -> Result<Vec<Instruction>> {
+    wrap_program_pair_plan_with_two_hop_executor_with_min_profit_raw(execution_manager, plan, None)
+}
+
+fn wrap_program_pair_plan_with_two_hop_executor_with_min_profit_raw(
+    execution_manager: &ExecutionManager,
+    plan: &SimulationInstructionPlan,
+    min_profit_raw_override: Option<u64>,
+) -> Result<Vec<Instruction>> {
+    if is_pumpswap_raydium_clmm_plan(plan) {
+        tracing::debug!("PumpSwap->Raydium CLMM 使用客户端构造 amount，跳过 两跳 executor 封装");
+        return Ok(plan.atomic_instructions.clone());
+    }
+
+    let onchain_instruction = build_program_pair_two_hop_executor_instruction(
+        execution_manager,
+        plan,
+        min_profit_raw_override,
+    )?;
+    let mut wrapped = plan.setup_instructions.clone();
+    wrapped.push(onchain_instruction);
+    Ok(wrapped)
+}
+
+fn wrap_program_pair_plan_with_two_hop_executor_atomic_only(
+    execution_manager: &ExecutionManager,
+    plan: &SimulationInstructionPlan,
+) -> Result<Vec<Instruction>> {
+    wrap_program_pair_plan_with_two_hop_executor_atomic_only_with_min_profit_raw(
+        execution_manager,
+        plan,
+        None,
+    )
+}
+
+fn wrap_program_pair_plan_with_two_hop_executor_atomic_only_with_min_profit_raw(
+    execution_manager: &ExecutionManager,
+    plan: &SimulationInstructionPlan,
+    min_profit_raw_override: Option<u64>,
+) -> Result<Vec<Instruction>> {
+    let setup_len = plan.setup_instructions.len();
+    if is_pumpswap_raydium_clmm_plan(plan) {
+        if plan.atomic_instructions.len() <= setup_len {
+            anyhow::bail!(
+                "program-pair client-constructed plan has no executable instructions after setup; total={} setup={}",
+                plan.atomic_instructions.len(),
+                setup_len
+            );
+        }
+        return Ok(plan.atomic_instructions[setup_len..].to_vec());
+    }
+
+    Ok(vec![build_program_pair_two_hop_executor_instruction(
+        execution_manager,
+        plan,
+        min_profit_raw_override,
+    )?])
+}
+
+fn program_pair_two_hop_min_profit_raw(
+    execution_manager: &ExecutionManager,
+    quote_mint: &str,
+) -> Result<u64> {
+    if quote_mint != "So11111111111111111111111111111111111111112" {
+        anyhow::bail!("program-pair direct send currently only supports WSOL quote mint");
+    }
+    let jito_tip_lamports = execution_manager.jito_tip_lamports();
+    let base_fee_lamports = jito_bundle_base_fee_lamports(jito_tip_lamports);
+    let extra_lamports = std::env::var("PROGRAM_PAIR_MIN_PROFIT_LAMPORTS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20_000);
+    Ok(jito_tip_lamports
+        .saturating_add(base_fee_lamports)
+        .saturating_add(extra_lamports)
+        .max(1))
+}
+
+fn refine_program_pair_candidate_with_exact(
+    config: &Config,
+    candidate: strategy::program_pairs::ProgramPairCandidate,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    whirlpool_state: &HashMap<String, WhirlpoolState>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    max_program_pair_quote_sol: Option<f64>,
+) -> strategy::program_pairs::ProgramPairCandidate {
+    use config::ProgramKind;
+
+    if candidate.quote_mint != config.tokens.sol_mint
+        && candidate.quote_mint != config.tokens.usdc_mint
+    {
+        return candidate;
+    }
+
+    let preferred_trade_size_quote = candidate.trade_size_quote;
+    let search_trade_sizes_quote = strategy::program_pairs::best_size_search_trade_sizes_quote(
+        config,
+        &candidate.quote_mint,
+        preferred_trade_size_quote,
+    );
+    let mut best: Option<strategy::program_pairs::ProgramPairCandidate> = None;
+    let mut evaluations = Vec::new();
+    for trade_size_quote in &search_trade_sizes_quote {
+        let trade_size_quote = *trade_size_quote;
+        if candidate.quote_mint == config.tokens.sol_mint
+            && max_program_pair_quote_sol.is_some_and(|max_size| trade_size_quote > max_size)
+        {
+            continue;
+        }
+        let trade_size_usdc = if candidate.quote_mint == config.tokens.sol_mint {
+            trade_size_quote * config.strategy.sol_usdc_price
+        } else {
+            trade_size_quote
+        };
+        let exact = match (candidate.buy_market.kind, candidate.sell_market.kind) {
+            (ProgramKind::Pumpswap, ProgramKind::MeteoraDlmm) => {
+                let Some(pumpswap) = pumpswap_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(meteora) = meteora_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                    continue;
+                };
+                let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                    .values()
+                    .filter(|array| array.lb_pair == meteora.pool_address)
+                    .collect();
+                if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+                    continue;
+                }
+                quote_pumpswap_buy_meteora_sell(
+                    config,
+                    &pumpswap_pool,
+                    meteora,
+                    &candidate.token_mint,
+                    &pool_bin_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (ProgramKind::MeteoraDlmm, ProgramKind::Pumpswap) => {
+                let Some(pumpswap) = pumpswap_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(meteora) = meteora_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                    continue;
+                };
+                let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                    .values()
+                    .filter(|array| array.lb_pair == meteora.pool_address)
+                    .collect();
+                if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+                    continue;
+                }
+                quote_meteora_buy_pumpswap_sell(
+                    config,
+                    &pumpswap_pool,
+                    meteora,
+                    &candidate.token_mint,
+                    &pool_bin_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (ProgramKind::Pumpswap, ProgramKind::RaydiumClmm) => {
+                let Some(pumpswap) = pumpswap_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(raydium) = raydium_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                    continue;
+                };
+                let tick_arrays: Vec<&raydium_clmm::ClmmTickArrayState> = raydium_clmm_tick_arrays
+                    .values()
+                    .filter(|tick_array| tick_array.pool_id == raydium.pool_address)
+                    .collect();
+                if tick_arrays.is_empty() {
+                    continue;
+                }
+                preflight_pumpswap_buy_clmm_sell(
+                    config,
+                    &pumpswap_pool,
+                    raydium,
+                    &candidate.token_mint,
+                    &tick_arrays,
+                    trade_size_usdc,
+                )
+                .ok()
+                .map(|quote| ExactPreflightQuote {
+                    token_amount: quote.token_amount as f64,
+                    final_amount_usdc: quote.final_amount_usdc,
+                    gross_profit_usdc: quote.final_amount_usdc - trade_size_usdc,
+                    slippage_buffer_usdc: quote.final_amount_usdc
+                        * (strategy::quote::SLIPPAGE_BUFFER_BPS / 10_000.0),
+                    gas_cost_usdc: atomic_execution_gas_cost_usdc(
+                        config.strategy.preflight_gas_cost_sol,
+                        config.strategy.sol_usdc_price,
+                    ),
+                    gross_profit_pct: ((quote.final_amount_usdc - trade_size_usdc)
+                        / trade_size_usdc)
+                        * 100.0,
+                    net_profit_usdc: quote.net_profit_usdc,
+                    net_profit_pct: (quote.net_profit_usdc / trade_size_usdc) * 100.0,
+                    arb_quote: None,
+                })
+            }
+            (ProgramKind::RaydiumClmm, ProgramKind::Pumpswap) => {
+                let Some(pumpswap) = pumpswap_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(raydium) = raydium_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                    continue;
+                };
+                let tick_arrays: Vec<&raydium_clmm::ClmmTickArrayState> = raydium_clmm_tick_arrays
+                    .values()
+                    .filter(|tick_array| tick_array.pool_id == raydium.pool_address)
+                    .collect();
+                if tick_arrays.is_empty() {
+                    continue;
+                }
+                preflight_clmm_buy_pumpswap_sell(
+                    config,
+                    &pumpswap_pool,
+                    raydium,
+                    &candidate.token_mint,
+                    &tick_arrays,
+                    trade_size_usdc,
+                )
+                .ok()
+                .map(|quote| ExactPreflightQuote {
+                    token_amount: quote.token_amount as f64,
+                    final_amount_usdc: quote.final_amount_usdc,
+                    gross_profit_usdc: quote.final_amount_usdc - trade_size_usdc,
+                    slippage_buffer_usdc: quote.final_amount_usdc
+                        * (strategy::quote::SLIPPAGE_BUFFER_BPS / 10_000.0),
+                    gas_cost_usdc: atomic_execution_gas_cost_usdc(
+                        config.strategy.preflight_gas_cost_sol,
+                        config.strategy.sol_usdc_price,
+                    ),
+                    gross_profit_pct: ((quote.final_amount_usdc - trade_size_usdc)
+                        / trade_size_usdc)
+                        * 100.0,
+                    net_profit_usdc: quote.net_profit_usdc,
+                    net_profit_pct: (quote.net_profit_usdc / trade_size_usdc) * 100.0,
+                    arb_quote: None,
+                })
+            }
+            (ProgramKind::Pumpswap, kind) if program_pair_raydium_kind(kind) => {
+                let Some(pumpswap) = pumpswap_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(raydium) = raydium_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                    continue;
+                };
+                quote_pumpswap_buy_raydium_sell(
+                    config,
+                    &pumpswap_pool,
+                    raydium,
+                    &candidate.token_mint,
+                    raydium_clmm_tick_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (kind, ProgramKind::Pumpswap) if program_pair_raydium_kind(kind) => {
+                let Some(pumpswap) = pumpswap_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(raydium) = raydium_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                    continue;
+                };
+                quote_raydium_buy_pumpswap_sell(
+                    config,
+                    &pumpswap_pool,
+                    raydium,
+                    &candidate.token_mint,
+                    raydium_clmm_tick_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (ProgramKind::MeteoraDlmm, kind) if program_pair_raydium_kind(kind) => {
+                let Some(meteora) = meteora_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(raydium) = raydium_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                    .values()
+                    .filter(|array| array.lb_pair == meteora.pool_address)
+                    .collect();
+                if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+                    continue;
+                }
+                quote_meteora_buy_raydium_sell(
+                    config,
+                    meteora,
+                    raydium,
+                    &candidate.token_mint,
+                    &pool_bin_arrays,
+                    raydium_clmm_tick_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (kind, ProgramKind::MeteoraDlmm) if program_pair_raydium_kind(kind) => {
+                let Some(meteora) = meteora_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(raydium) = raydium_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                    .values()
+                    .filter(|array| array.lb_pair == meteora.pool_address)
+                    .collect();
+                if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+                    continue;
+                }
+                quote_raydium_buy_meteora_sell(
+                    config,
+                    meteora,
+                    raydium,
+                    &candidate.token_mint,
+                    &pool_bin_arrays,
+                    raydium_clmm_tick_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (ProgramKind::Pumpswap, ProgramKind::Whirlpool) => {
+                let Some(pumpswap) = pumpswap_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(whirlpool) = whirlpool_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                    continue;
+                };
+                quote_pumpswap_buy_whirlpool_sell(
+                    config,
+                    &pumpswap_pool,
+                    whirlpool,
+                    &candidate.token_mint,
+                    whirlpool_tick_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (ProgramKind::Whirlpool, ProgramKind::Pumpswap) => {
+                let Some(pumpswap) = pumpswap_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(whirlpool) = whirlpool_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                    continue;
+                };
+                quote_whirlpool_buy_pumpswap_sell(
+                    config,
+                    &pumpswap_pool,
+                    whirlpool,
+                    &candidate.token_mint,
+                    whirlpool_tick_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (ProgramKind::MeteoraDlmm, ProgramKind::Whirlpool) => {
+                let Some(meteora) = meteora_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(whirlpool) = whirlpool_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                    .values()
+                    .filter(|array| array.lb_pair == meteora.pool_address)
+                    .collect();
+                if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+                    continue;
+                }
+                quote_meteora_buy_whirlpool_sell(
+                    config,
+                    meteora,
+                    whirlpool,
+                    &candidate.token_mint,
+                    &pool_bin_arrays,
+                    whirlpool_tick_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (ProgramKind::Whirlpool, ProgramKind::MeteoraDlmm) => {
+                let Some(meteora) = meteora_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(whirlpool) = whirlpool_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                    .values()
+                    .filter(|array| array.lb_pair == meteora.pool_address)
+                    .collect();
+                if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+                    continue;
+                }
+                quote_whirlpool_buy_meteora_sell(
+                    config,
+                    meteora,
+                    whirlpool,
+                    &candidate.token_mint,
+                    &pool_bin_arrays,
+                    whirlpool_tick_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (kind, ProgramKind::Whirlpool) if program_pair_raydium_kind(kind) => {
+                let Some(raydium) = raydium_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(whirlpool) = whirlpool_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                quote_raydium_buy_whirlpool_sell(
+                    config,
+                    raydium,
+                    whirlpool,
+                    &candidate.token_mint,
+                    raydium_clmm_tick_arrays,
+                    whirlpool_tick_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (ProgramKind::Whirlpool, kind) if program_pair_raydium_kind(kind) => {
+                let Some(raydium) = raydium_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let Some(whirlpool) = whirlpool_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                quote_whirlpool_buy_raydium_sell(
+                    config,
+                    raydium,
+                    whirlpool,
+                    &candidate.token_mint,
+                    raydium_clmm_tick_arrays,
+                    whirlpool_tick_arrays,
+                    trade_size_usdc,
+                )
+            }
+            (ProgramKind::MeteoraDlmm, ProgramKind::MeteoraDlmm) => {
+                let Some(buy_meteora) = meteora_state.get(&candidate.buy_market.address) else {
+                    continue;
+                };
+                let Some(sell_meteora) = meteora_state.get(&candidate.sell_market.address) else {
+                    continue;
+                };
+                let buy_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                    .values()
+                    .filter(|array| array.lb_pair == buy_meteora.pool_address)
+                    .collect();
+                let sell_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                    .values()
+                    .filter(|array| array.lb_pair == sell_meteora.pool_address)
+                    .collect();
+                if (buy_bin_arrays.is_empty() && !buy_meteora.is_damm_v2())
+                    || (sell_bin_arrays.is_empty() && !sell_meteora.is_damm_v2())
+                {
+                    continue;
+                }
+                quote_meteora_buy_meteora_sell(
+                    config,
+                    buy_meteora,
+                    sell_meteora,
+                    &candidate.token_mint,
+                    &buy_bin_arrays,
+                    &sell_bin_arrays,
+                    trade_size_usdc,
+                )
+            }
+            _ => None,
+        };
+        let Some(exact) = exact else {
+            continue;
+        };
+        let gross_profit_quote = (exact.gross_profit_pct / 100.0) * trade_size_quote;
+        let net_profit_quote = if candidate.quote_mint == config.tokens.sol_mint {
+            exact.net_profit_usdc / config.strategy.sol_usdc_price
+        } else {
+            exact.net_profit_usdc
+        };
+        let gas_cost_quote = if candidate.quote_mint == config.tokens.sol_mint {
+            config.strategy.preflight_gas_cost_sol
+        } else {
+            atomic_execution_gas_cost_usdc(
+                config.strategy.preflight_gas_cost_sol,
+                config.strategy.sol_usdc_price,
+            )
+        };
+        let pnl_usdc = strategy::program_pairs::ProgramPairPnlBreakdown {
+            gross_profit_usdc: exact.gross_profit_usdc,
+            slippage_buffer_usdc: exact.slippage_buffer_usdc,
+            gas_cost_usdc: exact.gas_cost_usdc,
+            net_profit_usdc: exact.net_profit_usdc,
+        };
+        evaluations.push(strategy::program_pairs::ProgramPairSizeEvaluation {
+            trade_size_quote,
+            trade_size_usdc,
+            gross_profit_quote,
+            gas_cost_quote,
+            net_profit_quote,
+            gross_profit_pct: exact.gross_profit_pct,
+            net_profit_pct: exact.net_profit_pct,
+            pnl_usdc: pnl_usdc.clone(),
+        });
+        let refined = strategy::program_pairs::ProgramPairCandidate {
+            token_mint: candidate.token_mint.clone(),
+            quote_mint: candidate.quote_mint.clone(),
+            pricing_mode: strategy::program_pairs::ProgramPairPricingMode::ExactQuote,
+            buy_market: candidate.buy_market.clone(),
+            sell_market: candidate.sell_market.clone(),
+            trade_size_quote,
+            gross_profit_quote,
+            gas_cost_quote,
+            net_profit_quote,
+            gross_profit_pct: exact.gross_profit_pct,
+            net_profit_pct: exact.net_profit_pct,
+            selected_pnl_usdc: Some(pnl_usdc),
+            exact_search: None,
+            gate: None,
+        };
+        let replace = best
+            .as_ref()
+            .map(|current| refined.net_profit_quote > current.net_profit_quote)
+            .unwrap_or(true);
+        if replace {
+            best = Some(refined);
+        }
+    }
+
+    let exact_search = strategy::program_pairs::ProgramPairExactSearch {
+        preferred_trade_size_quote,
+        requested_size_count: search_trade_sizes_quote.len(),
+        successful_size_count: evaluations.len(),
+        evaluations,
+    };
+
+    if let Some(mut best) = best {
+        best.exact_search = Some(exact_search);
+        best
+    } else {
+        let mut candidate = candidate;
+        candidate.exact_search = Some(exact_search);
+        candidate
+    }
+}
+
+fn program_pair_candidate_send_supported(
+    candidate: &strategy::program_pairs::ProgramPairCandidate,
+) -> bool {
+    use config::ProgramKind;
+    matches!(
+        (candidate.buy_market.kind, candidate.sell_market.kind),
+        (ProgramKind::Pumpswap, ProgramKind::MeteoraDlmm)
+            | (ProgramKind::MeteoraDlmm, ProgramKind::Pumpswap)
+            | (ProgramKind::Pumpswap, ProgramKind::RaydiumClmm)
+            | (ProgramKind::MeteoraDlmm, ProgramKind::RaydiumClmm)
+            | (ProgramKind::RaydiumClmm, ProgramKind::MeteoraDlmm)
+            | (ProgramKind::MeteoraDlmm, ProgramKind::Whirlpool)
+            | (ProgramKind::Whirlpool, ProgramKind::MeteoraDlmm)
+            | (ProgramKind::MeteoraDlmm, ProgramKind::MeteoraDlmm)
+    )
+}
+
+async fn process_direct_tokens(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    account_metadata: &HashMap<String, market_universe::AccountMetadata>,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    whirlpool_state: &HashMap<String, WhirlpoolState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    whirlpool_by_token: &HashMap<String, Vec<String>>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    pumpswap_fee_config: Option<&pumpswap::PumpSwapGlobalFeeConfig>,
+    dirty_direct_tokens: &mut HashSet<String>,
+    stats: &mut RuntimeStats,
+) {
+    let requested_tokens = dirty_direct_tokens.drain().collect::<Vec<_>>();
+    if requested_tokens.is_empty() {
+        return;
+    }
+    let requested_count = requested_tokens.len();
+    let requested_preview = format_token_preview(requested_tokens.iter(), 8);
+    let mut token_mints = apply_token_selection_engine(
+        config,
+        account_metadata,
+        pumpswap_state,
+        raydium_state,
+        meteora_state,
+        pumpswap_by_token,
+        raydium_by_token,
+        meteora_by_token,
+        whirlpool_by_token,
+        stats,
+        requested_tokens,
+        "direct",
+    );
+    if token_mints.is_empty() {
+        stats.no_match_checks += 1;
+        let skip_key = format!("direct_scan_skip:selected_empty:{requested_preview}");
+        if should_log_candidate_key(stats, skip_key, -40.0) {
+            tracing::debug!(
+                "直发扫描 skipped: token selection kept 0/{} dirty token(s) tokens=[{}]",
+                requested_count,
+                requested_preview
+            );
+        }
+        return;
+    }
+    if config.strategy.max_direct_tokens_per_scan > 0
+        && token_mints.len() > config.strategy.max_direct_tokens_per_scan
+    {
+        let kept = token_mints[..config.strategy.max_direct_tokens_per_scan]
+            .iter()
+            .map(|token| {
+                let base_score = direct_token_scan_score(
+                    config,
+                    token,
+                    pumpswap_state,
+                    raydium_state,
+                    meteora_state,
+                    pumpswap_by_token,
+                    raydium_by_token,
+                    meteora_by_token,
+                );
+                let feedback_score = direct_token_feedback_score(stats, token);
+                format!(
+                    "{}:{:.2}(base={:.2},feedback={:.2})",
+                    &token[..token.len().min(8)],
+                    base_score + feedback_score,
+                    base_score,
+                    feedback_score
+                )
+            })
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            "直发扫描 ranking kept top {} token(s): {}",
+            config.strategy.max_direct_tokens_per_scan,
+            kept.join(",")
+        );
+        token_mints.truncate(config.strategy.max_direct_tokens_per_scan);
+    }
+    let local_profit_checks_disabled = disable_local_profit_checks();
+    let fast_path_direct = fast_path_direct_send_enabled() && execution_manager.live_send_enabled();
+    let mut selected_candidates = 0usize;
+    let mut best_near_profit: Option<(String, ExactDirectRouteCandidate)> = None;
+    let live_threshold = if disable_local_profit_checks() {
+        f64::NEG_INFINITY
+    } else {
+        active_offchain_profit_threshold_pct(Some(execution_manager), config)
+    };
+
+    if fast_path_direct {
+        for token_mint in token_mints.iter().cloned() {
+            let Some(candidate) = best_direct_route_candidate(
+                config,
+                stats,
+                &token_mint,
+                pumpswap_state,
+                raydium_state,
+                meteora_state,
+                pumpswap_by_token,
+                raydium_by_token,
+                meteora_by_token,
+            ) else {
+                let skip_key = format!("direct_scan_skip:{}:no_spot_candidate", token_mint);
+                if should_log_candidate_key(stats, skip_key, -25.0) {
+                    tracing::debug!(
+                        "直发扫描 skipped 币种={} 原因=no_spot_candidate_for_enabled_paths",
+                        token_mint
+                    );
+                }
+                continue;
+            };
+
+            let trade_size_usdc = direct_execution_trade_size_usdc(config).unwrap_or(0.0);
+            if trade_size_usdc <= 0.0 {
+                continue;
+            }
+
+            match candidate {
+                DirectRouteCandidate::PumpSwapClmm {
+                    token_mint,
+                    pumpswap_address,
+                    raydium_address,
+                    direction,
+                    net_profit_pct,
+                } => {
+                    let Some(pumpswap) = pumpswap_state.get(&pumpswap_address) else {
+                        continue;
+                    };
+                    let Some(raydium) = raydium_state.get(&raydium_address) else {
+                        continue;
+                    };
+                    let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                        continue;
+                    };
+                    let protocol_fee_recipient =
+                        select_pumpswap_protocol_fee_recipient(Some(pumpswap), pumpswap_fee_config);
+                    if should_log_candidate_key(
+                        stats,
+                        format!("fast_path_spot:{}:pumpswap_clmm", token_mint),
+                        net_profit_pct,
+                    ) {
+                        let fast_path_label = pumpswap_clmm_direction_label(direction);
+                        if disable_local_profit_checks() {
+                            tracing::info!(
+                                "准备测试直发路径：币种={}，路径={}，现货收益={:.2}%，金额=${:.2}",
+                                token_mint,
+                                fast_path_label,
+                                net_profit_pct,
+                                trade_size_usdc
+                            );
+                        } else {
+                            tracing::debug!(
+                                "直发候选：币种={}，路径={}，现货收益={:.2}%，金额=${:.2}",
+                                token_mint,
+                                fast_path_label,
+                                net_profit_pct,
+                                trade_size_usdc
+                            );
+                        }
+                    }
+                    maybe_send_pumpswap_clmm_direct_with_trade_size(
+                        execution_manager,
+                        config,
+                        pumpswap,
+                        &pumpswap_pool,
+                        raydium,
+                        &token_mint,
+                        direction,
+                        raydium_clmm_tick_arrays,
+                        protocol_fee_recipient,
+                        trade_size_usdc,
+                        net_profit_pct,
+                        stats,
+                    )
+                    .await;
+                }
+                DirectRouteCandidate::PumpSwapMeteora {
+                    token_mint,
+                    pumpswap_address,
+                    meteora_address,
+                    direction,
+                    net_profit_pct,
+                } => {
+                    let Some(pumpswap) = pumpswap_state.get(&pumpswap_address) else {
+                        continue;
+                    };
+                    let Some(meteora) = meteora_state.get(&meteora_address) else {
+                        continue;
+                    };
+                    let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                        continue;
+                    };
+                    let protocol_fee_recipient =
+                        select_pumpswap_protocol_fee_recipient(Some(pumpswap), pumpswap_fee_config);
+                    if should_log_candidate_key(
+                        stats,
+                        format!("fast_path_spot:{}:pumpswap_meteora", token_mint),
+                        net_profit_pct,
+                    ) {
+                        tracing::debug!(
+                            "直发候选：币种={}，路径={}，现货收益={:.2}%，金额=${:.2}",
+                            token_mint,
+                            match direction {
+                                MeteoraPumpSwapDirection::PumpSwapToMeteora => {
+                                    "PumpSwap->Meteora"
+                                }
+                                MeteoraPumpSwapDirection::MeteoraToPumpSwap => {
+                                    "Meteora->PumpSwap"
+                                }
+                            },
+                            net_profit_pct,
+                            trade_size_usdc
+                        );
+                    }
+                    maybe_send_pumpswap_meteora_direct_with_trade_size(
+                        execution_manager,
+                        config,
+                        pumpswap,
+                        &pumpswap_pool,
+                        meteora,
+                        &token_mint,
+                        direction,
+                        meteora_bin_arrays,
+                        protocol_fee_recipient,
+                        trade_size_usdc,
+                        net_profit_pct,
+                        stats,
+                    )
+                    .await;
+                }
+                DirectRouteCandidate::MeteoraClmm {
+                    token_mint,
+                    meteora_address,
+                    raydium_address,
+                    direction,
+                    net_profit_pct,
+                } => {
+                    let Some(meteora) = meteora_state.get(&meteora_address) else {
+                        continue;
+                    };
+                    let Some(raydium) = raydium_state.get(&raydium_address) else {
+                        continue;
+                    };
+                    if should_log_candidate_key(
+                        stats,
+                        format!("fast_path_spot:{}:meteora_clmm", token_mint),
+                        net_profit_pct,
+                    ) {
+                        tracing::debug!(
+                            "直发候选：币种={}，路径={}，现货收益={:.2}%，金额=${:.2}",
+                            token_mint,
+                            match direction {
+                                MeteoraClmmDirection::MeteoraToClmm => "Meteora->Raydium CLMM",
+                                MeteoraClmmDirection::ClmmToMeteora => "Raydium CLMM->Meteora",
+                            },
+                            net_profit_pct,
+                            trade_size_usdc
+                        );
+                    }
+                    maybe_send_meteora_raydium_direct_with_trade_size(
+                        execution_manager,
+                        config,
+                        meteora,
+                        raydium,
+                        &token_mint,
+                        direction,
+                        meteora_bin_arrays,
+                        raydium_clmm_tick_arrays,
+                        trade_size_usdc,
+                        net_profit_pct,
+                        stats,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    for token_mint in token_mints {
+        let Some(candidate) = best_exact_direct_route_candidate(
+            execution_manager,
+            config,
+            &token_mint,
+            pumpswap_state,
+            raydium_state,
+            meteora_state,
+            whirlpool_state,
+            pumpswap_by_token,
+            raydium_by_token,
+            meteora_by_token,
+            whirlpool_by_token,
+            raydium_clmm_tick_arrays,
+            meteora_bin_arrays,
+            whirlpool_tick_arrays,
+            stats,
+        )
+        .await
+        else {
+            record_direct_token_feedback(stats, &token_mint, -25.0);
+            let skip_key = format!("direct_scan_skip:{}:no_exact_candidate", token_mint);
+            if should_log_candidate_key(stats, skip_key, -25.0) {
+                tracing::debug!(
+                    "直发扫描 skipped 币种={} 原因=no_exact_candidate_for_enabled_paths {}",
+                    token_mint,
+                    token_direct_pool_coverage_summary(
+                        &token_mint,
+                        pumpswap_by_token,
+                        raydium_by_token,
+                        meteora_by_token,
+                        whirlpool_by_token,
+                        meteora_state,
+                        meteora_bin_arrays
+                    )
+                );
+            }
+            continue;
+        };
+        record_token_exact_candidate(stats, &token_mint);
+
+        let path_label = exact_direct_route_candidate_path_label(&candidate);
+        let route_instance = exact_direct_route_candidate_route_instance(&candidate);
+        let trade_size_usdc = exact_direct_route_candidate_trade_size_usdc(&candidate);
+        let exact_profit_pct = exact_direct_route_candidate_exact_profit_pct(&candidate);
+        let gate_profit_pct = exact_direct_route_candidate_gate_profit_pct(&candidate);
+        record_direct_token_feedback(stats, &token_mint, gate_profit_pct);
+        if exact_profit_pct < live_threshold {
+            let gap_pct = live_threshold - exact_profit_pct;
+            let near_key = format!(
+                "near_profit_exact_direct:{}:{}:{}",
+                token_mint, path_label, route_instance
+            );
+            if should_log_candidate_key(stats, near_key, exact_profit_pct) {
+                tracing::debug!(
+                    "接近阈值的直发候选：币种={}，路径={}，池对={}，金额=${:.2}，精确收益={:.2}%，门槛后={:.2}%，差距={:.2}%",
+                    token_mint,
+                    path_label,
+                    route_instance,
+                    trade_size_usdc,
+                    exact_profit_pct,
+                    gate_profit_pct,
+                    gap_pct
+                );
+            }
+            let replace = best_near_profit
+                .as_ref()
+                .map(|(_, current)| {
+                    exact_profit_pct > exact_direct_route_candidate_exact_profit_pct(current)
+                })
+                .unwrap_or(true);
+            if replace {
+                best_near_profit = Some((token_mint.clone(), candidate.clone()));
+            }
+            stats.rejected_below_threshold += 1;
+            continue;
+        }
+
+        selected_candidates += 1;
+        record_token_send_attempt(stats, &token_mint);
+        let best_candidate_key = format!(
+            "selected_exact_direct:{}:{}:{}",
+            token_mint, path_label, route_instance
+        );
+        let cooldown_key = exact_direct_route_candidate_cooldown_key(&candidate);
+        if should_log_candidate_key(stats, best_candidate_key, exact_profit_pct) {
+            tracing::info!(
+                "{}：币种={}，路径={}，池对={}，金额=${:.2}，精确收益={:.2}%，门槛后={:.2}%",
+                if local_profit_checks_disabled {
+                    "选中直发路径"
+                } else {
+                    "发现可发送直发路径"
+                },
+                token_mint,
+                path_label,
+                route_instance,
+                trade_size_usdc,
+                exact_profit_pct,
+                gate_profit_pct
+            );
+        }
+
+        match candidate {
+            ExactDirectRouteCandidate::PumpSwapClmm {
+                token_mint,
+                pumpswap_address,
+                raydium_address,
+                direction,
+                trade_size_usdc,
+                exact_net_profit_pct,
+                gate_profit_pct: _,
+            } => {
+                let Some(pumpswap) = pumpswap_state.get(&pumpswap_address) else {
+                    continue;
+                };
+                let Some(raydium) = raydium_state.get(&raydium_address) else {
+                    continue;
+                };
+                let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                    continue;
+                };
+                let protocol_fee_recipient =
+                    select_pumpswap_protocol_fee_recipient(Some(pumpswap), pumpswap_fee_config);
+                if block_stale_unsimulated_direct_send(
+                    execution_manager,
+                    stats,
+                    "pumpswap_clmm",
+                    path_label,
+                    &token_mint,
+                    &cooldown_key,
+                    exact_net_profit_pct,
+                    &[
+                        ("PumpSwap", &pumpswap.price_history),
+                        (raydium.venue.label(), &raydium.price_history),
+                    ],
+                ) {
+                    continue;
+                }
+                maybe_send_pumpswap_clmm_direct_with_trade_size(
+                    execution_manager,
+                    config,
+                    pumpswap,
+                    &pumpswap_pool,
+                    raydium,
+                    &token_mint,
+                    direction,
+                    raydium_clmm_tick_arrays,
+                    protocol_fee_recipient,
+                    trade_size_usdc,
+                    exact_net_profit_pct,
+                    stats,
+                )
+                .await;
+            }
+            ExactDirectRouteCandidate::PumpSwapMeteora {
+                token_mint,
+                pumpswap_address,
+                meteora_address,
+                direction,
+                trade_size_usdc,
+                exact_net_profit_pct,
+                gate_profit_pct: _,
+            } => {
+                let Some(pumpswap) = pumpswap_state.get(&pumpswap_address) else {
+                    continue;
+                };
+                let Some(meteora) = meteora_state.get(&meteora_address) else {
+                    continue;
+                };
+                let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                    continue;
+                };
+                let protocol_fee_recipient =
+                    select_pumpswap_protocol_fee_recipient(Some(pumpswap), pumpswap_fee_config);
+                if block_stale_unsimulated_direct_send(
+                    execution_manager,
+                    stats,
+                    "pumpswap_meteora",
+                    path_label,
+                    &token_mint,
+                    &cooldown_key,
+                    exact_net_profit_pct,
+                    &[
+                        ("PumpSwap", &pumpswap.price_history),
+                        ("Meteora", &meteora.price_history),
+                    ],
+                ) {
+                    continue;
+                }
+                maybe_send_pumpswap_meteora_direct_with_trade_size(
+                    execution_manager,
+                    config,
+                    pumpswap,
+                    &pumpswap_pool,
+                    meteora,
+                    &token_mint,
+                    direction,
+                    meteora_bin_arrays,
+                    protocol_fee_recipient,
+                    trade_size_usdc,
+                    exact_net_profit_pct,
+                    stats,
+                )
+                .await;
+            }
+            ExactDirectRouteCandidate::MeteoraClmm {
+                token_mint,
+                meteora_address,
+                raydium_address,
+                direction,
+                trade_size_usdc,
+                exact_net_profit_pct,
+                gate_profit_pct: _,
+            } => {
+                if !meteora_clmm_live_send_enabled() {
+                    continue;
+                }
+                let Some(meteora) = meteora_state.get(&meteora_address) else {
+                    continue;
+                };
+                let Some(raydium) = raydium_state.get(&raydium_address) else {
+                    continue;
+                };
+                if block_stale_unsimulated_direct_send(
+                    execution_manager,
+                    stats,
+                    "meteora_clmm",
+                    path_label,
+                    &token_mint,
+                    &cooldown_key,
+                    exact_net_profit_pct,
+                    &[
+                        ("Meteora", &meteora.price_history),
+                        (raydium.venue.label(), &raydium.price_history),
+                    ],
+                ) {
+                    continue;
+                }
+                maybe_send_meteora_raydium_direct_with_trade_size(
+                    execution_manager,
+                    config,
+                    meteora,
+                    raydium,
+                    &token_mint,
+                    direction,
+                    meteora_bin_arrays,
+                    raydium_clmm_tick_arrays,
+                    trade_size_usdc,
+                    exact_net_profit_pct,
+                    stats,
+                )
+                .await;
+            }
+            ExactDirectRouteCandidate::MeteoraMeteora { .. } => {
+                if let ExactDirectRouteCandidate::MeteoraMeteora {
+                    token_mint,
+                    buy_meteora_address,
+                    sell_meteora_address,
+                    trade_size_usdc,
+                    exact_net_profit_pct,
+                    gate_profit_pct: _,
+                } = candidate
+                {
+                    let Some(buy_meteora) = meteora_state.get(&buy_meteora_address) else {
+                        continue;
+                    };
+                    let Some(sell_meteora) = meteora_state.get(&sell_meteora_address) else {
+                        continue;
+                    };
+                    if block_stale_unsimulated_direct_send(
+                        execution_manager,
+                        stats,
+                        "meteora_meteora",
+                        path_label,
+                        &token_mint,
+                        &cooldown_key,
+                        exact_net_profit_pct,
+                        &[
+                            ("Meteora buy", &buy_meteora.price_history),
+                            ("Meteora sell", &sell_meteora.price_history),
+                        ],
+                    ) {
+                        continue;
+                    }
+                    maybe_send_meteora_meteora_direct_with_trade_size(
+                        execution_manager,
+                        config,
+                        buy_meteora,
+                        sell_meteora,
+                        &token_mint,
+                        meteora_bin_arrays,
+                        trade_size_usdc,
+                        exact_net_profit_pct,
+                        stats,
+                    )
+                    .await;
+                }
+            }
+            ExactDirectRouteCandidate::MeteoraWhirlpool {
+                token_mint,
+                meteora_address,
+                whirlpool_address,
+                direction,
+                trade_size_usdc,
+                exact_net_profit_pct,
+                gate_profit_pct: _,
+                ..
+            } => {
+                let Some(meteora) = meteora_state.get(&meteora_address) else {
+                    continue;
+                };
+                let Some(whirlpool) = whirlpool_state.get(&whirlpool_address) else {
+                    continue;
+                };
+                if block_stale_unsimulated_direct_send(
+                    execution_manager,
+                    stats,
+                    "meteora_whirlpool",
+                    path_label,
+                    &token_mint,
+                    &cooldown_key,
+                    exact_net_profit_pct,
+                    &[
+                        ("Meteora", &meteora.price_history),
+                        ("Whirlpool", &whirlpool.price_history),
+                    ],
+                ) {
+                    continue;
+                }
+                maybe_send_meteora_whirlpool_direct_with_trade_size(
+                    execution_manager,
+                    config,
+                    meteora,
+                    whirlpool,
+                    &token_mint,
+                    direction,
+                    meteora_bin_arrays,
+                    whirlpool_tick_arrays,
+                    trade_size_usdc,
+                    exact_net_profit_pct,
+                    stats,
+                )
+                .await;
+            }
+            ExactDirectRouteCandidate::PumpSwapWhirlpool { .. }
+            | ExactDirectRouteCandidate::RaydiumWhirlpool { .. } => {
+                // Exploration-only for now.
+            }
+        }
+    }
+
+    if selected_candidates == 0 {
+        if let Some((token_mint, candidate)) = best_near_profit {
+            let path_label = exact_direct_route_candidate_path_label(&candidate);
+            let route_instance = exact_direct_route_candidate_route_instance(&candidate);
+            let trade_size_usdc = exact_direct_route_candidate_trade_size_usdc(&candidate);
+            let exact_profit_pct = exact_direct_route_candidate_exact_profit_pct(&candidate);
+            let gate_profit_pct = exact_direct_route_candidate_gate_profit_pct(&candidate);
+            let summary_key = format!(
+                "best_near_profit_exact_direct:{}:{}:{}",
+                token_mint, path_label, route_instance
+            );
+            if should_log_candidate_key(stats, summary_key, exact_profit_pct) {
+                tracing::debug!(
+                    "本轮最接近的路径：币种={}，路径={}，池对={}，金额=${:.2}，精确收益={:.2}%，门槛后={:.2}%，阈值={:.2}%",
+                    token_mint,
+                    path_label,
+                    route_instance,
+                    trade_size_usdc,
+                    exact_profit_pct,
+                    gate_profit_pct,
+                    live_threshold
+                );
+            }
+        } else {
+            let none_key = "profitable_exact_direct:none".to_string();
+            if should_log_candidate_key(stats, none_key, 0.0) {
+                tracing::debug!("本轮没有找到可发送路径");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn best_exact_direct_route_candidate(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    token_mint: &str,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    _whirlpool_state: &HashMap<String, WhirlpoolState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+    _whirlpool_by_token: &HashMap<String, Vec<String>>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    _whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    stats: &mut RuntimeStats,
+) -> Option<ExactDirectRouteCandidate> {
+    let trade_sizes = direct_candidate_search_trade_sizes_usdc(config);
+    if trade_sizes.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<ExactDirectRouteCandidate> = None;
+    let whirlpool_pool_count = _whirlpool_by_token.get(token_mint).map_or(0, Vec::len);
+    let mut whirlpool_pumpswap_attempts = 0usize;
+    let mut whirlpool_pumpswap_hits = 0usize;
+    let mut whirlpool_meteora_attempts = 0usize;
+    let mut whirlpool_meteora_hits = 0usize;
+    let mut whirlpool_raydium_attempts = 0usize;
+    let mut whirlpool_raydium_hits = 0usize;
+
+    if let Some(pumpswap_addresses) = pumpswap_by_token.get(token_mint) {
+        for pumpswap_address in pumpswap_addresses {
+            let Some(pumpswap) = pumpswap_state.get(pumpswap_address) else {
+                continue;
+            };
+            let Some(pumpswap_pool) = cp_pool_from_pumpswap(config, pumpswap) else {
+                continue;
+            };
+
+            if direct_route_family_enabled(config, DirectRouteFamily::PumpSwapRaydium) {
+                if let Some(raydium_addresses) = raydium_by_token.get(token_mint) {
+                    for raydium_address in raydium_addresses {
+                        let Some(raydium) = raydium_state.get(raydium_address) else {
+                            continue;
+                        };
+                        for direction in [ClmmSpotDirection::PumpSwapToClmm] {
+                            if !pumpswap_clmm_direction_matches_spot(
+                                config,
+                                &pumpswap_pool,
+                                raydium,
+                                token_mint,
+                                direction,
+                            )
+                            .map(|(matches_spot, _, _, _)| matches_spot)
+                            .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            for trade_size_usdc in &trade_sizes {
+                                let quote = match direction {
+                                    ClmmSpotDirection::PumpSwapToClmm => {
+                                        let tick_arrays: Vec<&raydium_clmm::ClmmTickArrayState> =
+                                            raydium_clmm_tick_arrays
+                                                .values()
+                                                .filter(|tick_array| {
+                                                    tick_array.pool_id == raydium.pool_address
+                                                })
+                                                .collect();
+                                        if tick_arrays.is_empty() {
+                                            continue;
+                                        }
+                                        preflight_pumpswap_buy_clmm_sell(
+                                            config,
+                                            &pumpswap_pool,
+                                            raydium,
+                                            token_mint,
+                                            &tick_arrays,
+                                            *trade_size_usdc,
+                                        )
+                                        .ok()
+                                        .map(|quote| {
+                                            (
+                                                quote.final_amount_usdc - *trade_size_usdc,
+                                                quote.net_profit_usdc,
+                                            )
+                                        })
+                                    }
+                                    ClmmSpotDirection::ClmmToPumpSwap => {
+                                        let tick_arrays: Vec<&raydium_clmm::ClmmTickArrayState> =
+                                            raydium_clmm_tick_arrays
+                                                .values()
+                                                .filter(|tick_array| {
+                                                    tick_array.pool_id == raydium.pool_address
+                                                })
+                                                .collect();
+                                        if tick_arrays.is_empty() {
+                                            continue;
+                                        }
+                                        preflight_clmm_buy_pumpswap_sell(
+                                            config,
+                                            &pumpswap_pool,
+                                            raydium,
+                                            token_mint,
+                                            &tick_arrays,
+                                            *trade_size_usdc,
+                                        )
+                                        .ok()
+                                        .map(|quote| {
+                                            (
+                                                quote.final_amount_usdc - *trade_size_usdc,
+                                                quote.net_profit_usdc,
+                                            )
+                                        })
+                                    }
+                                };
+                                let Some((gross_profit_usdc, exact_net_profit_usdc)) = quote else {
+                                    continue;
+                                };
+                                let gate_profit_pct =
+                                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                                        execution_manager,
+                                        config,
+                                        *trade_size_usdc,
+                                        gross_profit_usdc,
+                                    );
+                                maybe_replace_best_exact_direct_candidate(
+                                    stats,
+                                    &mut best,
+                                    ExactDirectRouteCandidate::PumpSwapClmm {
+                                        token_mint: token_mint.to_string(),
+                                        pumpswap_address: pumpswap_address.clone(),
+                                        raydium_address: raydium_address.clone(),
+                                        direction,
+                                        trade_size_usdc: *trade_size_usdc,
+                                        exact_net_profit_pct: (exact_net_profit_usdc
+                                            / *trade_size_usdc)
+                                            * 100.0,
+                                        gate_profit_pct,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if direct_route_family_enabled(config, DirectRouteFamily::PumpSwapMeteora)
+                && !fast_path_direct_send_enabled()
+            {
+                let ranked_meteora_addresses_for_exact_pumpswap_scan =
+                    ranked_meteora_pool_addresses_for_pumpswap_pair_scan(
+                        config,
+                        token_mint,
+                        pumpswap_address,
+                        &pumpswap_pool,
+                        meteora_by_token,
+                        meteora_state,
+                        meteora_bin_arrays,
+                        stats,
+                    );
+                for meteora_address in &ranked_meteora_addresses_for_exact_pumpswap_scan {
+                    let Some(meteora) = meteora_state.get(*meteora_address) else {
+                        continue;
+                    };
+                    let pair_feedback_key = pumpswap_meteora_pair_feedback_key(
+                        token_mint,
+                        pumpswap_address,
+                        meteora_address,
+                    );
+                    let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                        .values()
+                        .filter(|array| array.lb_pair == meteora.pool_address)
+                        .collect();
+                    if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+                        record_direct_pair_feedback(stats, &pair_feedback_key, -5.0);
+                        continue;
+                    }
+
+                    let Some((spot_direction, _, _, _)) =
+                        pumpswap_meteora_spot_direction_and_profit(config, &pumpswap_pool, meteora)
+                    else {
+                        record_direct_pair_feedback(stats, &pair_feedback_key, -2.0);
+                        continue;
+                    };
+                    let mut pair_best_exact_profit_pct: Option<f64> = None;
+                    for direction in [spot_direction] {
+                        if pumpswap_meteora_executable_block_reason(
+                            config,
+                            &pumpswap_pool,
+                            meteora,
+                            token_mint,
+                            direction,
+                        )
+                        .await
+                        .is_some()
+                        {
+                            continue;
+                        }
+
+                        let (meteora_input_mint, meteora_output_mint) = match direction {
+                            MeteoraPumpSwapDirection::PumpSwapToMeteora => {
+                                (token_mint, pumpswap_pool.quote_mint.as_str())
+                            }
+                            MeteoraPumpSwapDirection::MeteoraToPumpSwap => {
+                                (pumpswap_pool.quote_mint.as_str(), token_mint)
+                            }
+                        };
+                        if meteora_direct_swap_executable_block_reason(
+                            config,
+                            meteora,
+                            meteora_bin_arrays,
+                            meteora_input_mint,
+                            meteora_output_mint,
+                        )
+                        .await
+                        .is_some()
+                        {
+                            continue;
+                        }
+
+                        for trade_size_usdc in &trade_sizes {
+                            let exact = match direction {
+                                MeteoraPumpSwapDirection::PumpSwapToMeteora => {
+                                    quote_pumpswap_buy_meteora_sell(
+                                        config,
+                                        &pumpswap_pool,
+                                        meteora,
+                                        token_mint,
+                                        &pool_bin_arrays,
+                                        *trade_size_usdc,
+                                    )
+                                }
+                                MeteoraPumpSwapDirection::MeteoraToPumpSwap => {
+                                    quote_meteora_buy_pumpswap_sell(
+                                        config,
+                                        &pumpswap_pool,
+                                        meteora,
+                                        token_mint,
+                                        &pool_bin_arrays,
+                                        *trade_size_usdc,
+                                    )
+                                }
+                            };
+                            let Some(exact) = exact else {
+                                continue;
+                            };
+                            pair_best_exact_profit_pct = Some(
+                                pair_best_exact_profit_pct
+                                    .map(|current| current.max(exact.net_profit_pct))
+                                    .unwrap_or(exact.net_profit_pct),
+                            );
+                            let gate_profit_pct =
+                                direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                                    execution_manager,
+                                    config,
+                                    *trade_size_usdc,
+                                    exact.gross_profit_usdc,
+                                );
+                            maybe_replace_best_exact_direct_candidate(
+                                stats,
+                                &mut best,
+                                ExactDirectRouteCandidate::PumpSwapMeteora {
+                                    token_mint: token_mint.to_string(),
+                                    pumpswap_address: pumpswap_address.clone(),
+                                    meteora_address: (*meteora_address).clone(),
+                                    direction,
+                                    trade_size_usdc: *trade_size_usdc,
+                                    exact_net_profit_pct: exact.net_profit_pct,
+                                    gate_profit_pct,
+                                },
+                            );
+                        }
+                    }
+                    if let Some(best_exact_profit_pct) = pair_best_exact_profit_pct {
+                        record_direct_pair_feedback(
+                            stats,
+                            &pair_feedback_key,
+                            best_exact_profit_pct,
+                        );
+                    } else {
+                        record_direct_pair_feedback(stats, &pair_feedback_key, -2.0);
+                    }
+                }
+            }
+
+            if direct_route_family_enabled(config, DirectRouteFamily::PumpSwapWhirlpool) {
+                if let Some(whirlpool_addresses) = _whirlpool_by_token.get(token_mint) {
+                    for whirlpool_address in whirlpool_addresses {
+                        let Some(whirlpool) = _whirlpool_state.get(whirlpool_address) else {
+                            continue;
+                        };
+
+                        for trade_size_usdc in &trade_sizes {
+                            whirlpool_pumpswap_attempts += 1;
+                            if let Some(exact) = quote_pumpswap_buy_whirlpool_sell(
+                                config,
+                                &pumpswap_pool,
+                                whirlpool,
+                                token_mint,
+                                _whirlpool_tick_arrays,
+                                *trade_size_usdc,
+                            ) {
+                                whirlpool_pumpswap_hits += 1;
+                                let gate_profit_pct =
+                                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                                        execution_manager,
+                                        config,
+                                        *trade_size_usdc,
+                                        exact.gross_profit_usdc,
+                                    );
+                                maybe_replace_best_exact_direct_candidate(
+                                    stats,
+                                    &mut best,
+                                    ExactDirectRouteCandidate::PumpSwapWhirlpool {
+                                        token_mint: token_mint.to_string(),
+                                        pumpswap_address: pumpswap_address.clone(),
+                                        whirlpool_address: whirlpool_address.clone(),
+                                        path_label: "PumpSwap->Whirlpool",
+                                        trade_size_usdc: *trade_size_usdc,
+                                        exact_net_profit_pct: exact.net_profit_pct,
+                                        gate_profit_pct,
+                                    },
+                                );
+                            }
+
+                            whirlpool_pumpswap_attempts += 1;
+                            if let Some(exact) = quote_whirlpool_buy_pumpswap_sell(
+                                config,
+                                &pumpswap_pool,
+                                whirlpool,
+                                token_mint,
+                                _whirlpool_tick_arrays,
+                                *trade_size_usdc,
+                            ) {
+                                whirlpool_pumpswap_hits += 1;
+                                let gate_profit_pct =
+                                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                                        execution_manager,
+                                        config,
+                                        *trade_size_usdc,
+                                        exact.gross_profit_usdc,
+                                    );
+                                maybe_replace_best_exact_direct_candidate(
+                                    stats,
+                                    &mut best,
+                                    ExactDirectRouteCandidate::PumpSwapWhirlpool {
+                                        token_mint: token_mint.to_string(),
+                                        pumpswap_address: pumpswap_address.clone(),
+                                        whirlpool_address: whirlpool_address.clone(),
+                                        path_label: "Whirlpool->PumpSwap",
+                                        trade_size_usdc: *trade_size_usdc,
+                                        exact_net_profit_pct: exact.net_profit_pct,
+                                        gate_profit_pct,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(meteora_addresses) = meteora_by_token.get(token_mint) {
+        for meteora_address in meteora_addresses {
+            let Some(meteora) = meteora_state.get(meteora_address) else {
+                continue;
+            };
+            let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                .values()
+                .filter(|array| array.lb_pair == meteora.pool_address)
+                .collect();
+            if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+                continue;
+            }
+
+            if direct_route_family_enabled(config, DirectRouteFamily::MeteoraRaydium) {
+                if let Some(raydium_addresses) = raydium_by_token.get(token_mint) {
+                    for raydium_address in raydium_addresses {
+                        let Some(raydium) = raydium_state.get(raydium_address) else {
+                            continue;
+                        };
+                        if !meteora_raydium_quote_mints_match(config, meteora, raydium, token_mint)
+                        {
+                            continue;
+                        }
+
+                        for direction in [
+                            MeteoraClmmDirection::MeteoraToClmm,
+                            MeteoraClmmDirection::ClmmToMeteora,
+                        ] {
+                            if meteora_raydium_executable_block_reason(
+                                config, meteora, raydium, token_mint,
+                            )
+                            .await
+                            .is_some()
+                            {
+                                continue;
+                            }
+
+                            let Some(quote_mint) = meteora
+                                .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+                            else {
+                                continue;
+                            };
+                            let (meteora_input_mint, meteora_output_mint) = match direction {
+                                MeteoraClmmDirection::MeteoraToClmm => {
+                                    (quote_mint.as_str(), token_mint)
+                                }
+                                MeteoraClmmDirection::ClmmToMeteora => {
+                                    (token_mint, quote_mint.as_str())
+                                }
+                            };
+                            if meteora_direct_swap_executable_block_reason(
+                                config,
+                                meteora,
+                                meteora_bin_arrays,
+                                meteora_input_mint,
+                                meteora_output_mint,
+                            )
+                            .await
+                            .is_some()
+                            {
+                                continue;
+                            }
+
+                            for trade_size_usdc in &trade_sizes {
+                                let exact = match direction {
+                                    MeteoraClmmDirection::MeteoraToClmm => {
+                                        quote_meteora_buy_raydium_sell(
+                                            config,
+                                            meteora,
+                                            raydium,
+                                            token_mint,
+                                            &pool_bin_arrays,
+                                            raydium_clmm_tick_arrays,
+                                            *trade_size_usdc,
+                                        )
+                                    }
+                                    MeteoraClmmDirection::ClmmToMeteora => {
+                                        quote_raydium_buy_meteora_sell(
+                                            config,
+                                            meteora,
+                                            raydium,
+                                            token_mint,
+                                            &pool_bin_arrays,
+                                            raydium_clmm_tick_arrays,
+                                            *trade_size_usdc,
+                                        )
+                                    }
+                                };
+                                let Some(exact) = exact else {
+                                    continue;
+                                };
+                                let gate_profit_pct =
+                                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                                        execution_manager,
+                                        config,
+                                        *trade_size_usdc,
+                                        exact.gross_profit_usdc,
+                                    );
+                                maybe_replace_best_exact_direct_candidate(
+                                    stats,
+                                    &mut best,
+                                    ExactDirectRouteCandidate::MeteoraClmm {
+                                        token_mint: token_mint.to_string(),
+                                        meteora_address: meteora_address.clone(),
+                                        raydium_address: raydium_address.clone(),
+                                        direction,
+                                        trade_size_usdc: *trade_size_usdc,
+                                        exact_net_profit_pct: exact.net_profit_pct,
+                                        gate_profit_pct,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if direct_route_family_enabled(config, DirectRouteFamily::MeteoraWhirlpool) {
+                if let Some(whirlpool_addresses) = _whirlpool_by_token.get(token_mint) {
+                    for whirlpool_address in whirlpool_addresses {
+                        let Some(whirlpool) = _whirlpool_state.get(whirlpool_address) else {
+                            continue;
+                        };
+
+                        for trade_size_usdc in &trade_sizes {
+                            whirlpool_meteora_attempts += 1;
+                            if let Some(exact) = quote_meteora_buy_whirlpool_sell(
+                                config,
+                                meteora,
+                                whirlpool,
+                                token_mint,
+                                &pool_bin_arrays,
+                                _whirlpool_tick_arrays,
+                                *trade_size_usdc,
+                            ) {
+                                whirlpool_meteora_hits += 1;
+                                let gate_profit_pct =
+                                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                                        execution_manager,
+                                        config,
+                                        *trade_size_usdc,
+                                        exact.gross_profit_usdc,
+                                    );
+                                maybe_replace_best_exact_direct_candidate(
+                                    stats,
+                                    &mut best,
+                                    ExactDirectRouteCandidate::MeteoraWhirlpool {
+                                        token_mint: token_mint.to_string(),
+                                        meteora_address: meteora_address.clone(),
+                                        whirlpool_address: whirlpool_address.clone(),
+                                        direction: MeteoraWhirlpoolDirection::MeteoraToWhirlpool,
+                                        path_label: "Meteora Pool->Whirlpool",
+                                        trade_size_usdc: *trade_size_usdc,
+                                        exact_net_profit_pct: exact.net_profit_pct,
+                                        gate_profit_pct,
+                                    },
+                                );
+                            }
+
+                            whirlpool_meteora_attempts += 1;
+                            if let Some(exact) = quote_whirlpool_buy_meteora_sell(
+                                config,
+                                meteora,
+                                whirlpool,
+                                token_mint,
+                                &pool_bin_arrays,
+                                _whirlpool_tick_arrays,
+                                *trade_size_usdc,
+                            ) {
+                                whirlpool_meteora_hits += 1;
+                                let gate_profit_pct =
+                                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                                        execution_manager,
+                                        config,
+                                        *trade_size_usdc,
+                                        exact.gross_profit_usdc,
+                                    );
+                                maybe_replace_best_exact_direct_candidate(
+                                    stats,
+                                    &mut best,
+                                    ExactDirectRouteCandidate::MeteoraWhirlpool {
+                                        token_mint: token_mint.to_string(),
+                                        meteora_address: meteora_address.clone(),
+                                        whirlpool_address: whirlpool_address.clone(),
+                                        direction: MeteoraWhirlpoolDirection::WhirlpoolToMeteora,
+                                        path_label: "Whirlpool->Meteora Pool",
+                                        trade_size_usdc: *trade_size_usdc,
+                                        exact_net_profit_pct: exact.net_profit_pct,
+                                        gate_profit_pct,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if direct_route_family_enabled(config, DirectRouteFamily::RaydiumWhirlpool) {
+        if let Some(raydium_addresses) = raydium_by_token.get(token_mint) {
+            for raydium_address in raydium_addresses {
+                let Some(raydium) = raydium_state.get(raydium_address) else {
+                    continue;
+                };
+                if let Some(whirlpool_addresses) = _whirlpool_by_token.get(token_mint) {
+                    for whirlpool_address in whirlpool_addresses {
+                        let Some(whirlpool) = _whirlpool_state.get(whirlpool_address) else {
+                            continue;
+                        };
+
+                        for trade_size_usdc in &trade_sizes {
+                            whirlpool_raydium_attempts += 1;
+                            if let Some(exact) = quote_raydium_buy_whirlpool_sell(
+                                config,
+                                raydium,
+                                whirlpool,
+                                token_mint,
+                                raydium_clmm_tick_arrays,
+                                _whirlpool_tick_arrays,
+                                *trade_size_usdc,
+                            ) {
+                                whirlpool_raydium_hits += 1;
+                                let gate_profit_pct =
+                                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                                        execution_manager,
+                                        config,
+                                        *trade_size_usdc,
+                                        exact.gross_profit_usdc,
+                                    );
+                                maybe_replace_best_exact_direct_candidate(
+                                    stats,
+                                    &mut best,
+                                    ExactDirectRouteCandidate::RaydiumWhirlpool {
+                                        token_mint: token_mint.to_string(),
+                                        raydium_address: raydium_address.clone(),
+                                        whirlpool_address: whirlpool_address.clone(),
+                                        path_label: "Raydium CLMM->Whirlpool",
+                                        trade_size_usdc: *trade_size_usdc,
+                                        exact_net_profit_pct: exact.net_profit_pct,
+                                        gate_profit_pct,
+                                    },
+                                );
+                            }
+
+                            whirlpool_raydium_attempts += 1;
+                            if let Some(exact) = quote_whirlpool_buy_raydium_sell(
+                                config,
+                                raydium,
+                                whirlpool,
+                                token_mint,
+                                raydium_clmm_tick_arrays,
+                                _whirlpool_tick_arrays,
+                                *trade_size_usdc,
+                            ) {
+                                whirlpool_raydium_hits += 1;
+                                let gate_profit_pct =
+                                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                                        execution_manager,
+                                        config,
+                                        *trade_size_usdc,
+                                        exact.gross_profit_usdc,
+                                    );
+                                maybe_replace_best_exact_direct_candidate(
+                                    stats,
+                                    &mut best,
+                                    ExactDirectRouteCandidate::RaydiumWhirlpool {
+                                        token_mint: token_mint.to_string(),
+                                        raydium_address: raydium_address.clone(),
+                                        whirlpool_address: whirlpool_address.clone(),
+                                        path_label: "Whirlpool->Raydium CLMM",
+                                        trade_size_usdc: *trade_size_usdc,
+                                        exact_net_profit_pct: exact.net_profit_pct,
+                                        gate_profit_pct,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if direct_route_family_enabled(config, DirectRouteFamily::MeteoraMeteora) {
+        if let Some(meteora_addresses) = meteora_by_token.get(token_mint) {
+            for buy_meteora_address in meteora_addresses {
+                let Some(buy_meteora) = meteora_state.get(buy_meteora_address) else {
+                    continue;
+                };
+                let buy_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                    .values()
+                    .filter(|array| array.lb_pair == buy_meteora.pool_address)
+                    .collect();
+                if buy_bin_arrays.is_empty() && !buy_meteora.is_damm_v2() {
+                    continue;
+                }
+                let Some(buy_quote_mint) =
+                    buy_meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+                else {
+                    continue;
+                };
+
+                if meteora_direct_swap_executable_block_reason(
+                    config,
+                    buy_meteora,
+                    meteora_bin_arrays,
+                    buy_quote_mint.as_str(),
+                    token_mint,
+                )
+                .await
+                .is_some()
+                {
+                    continue;
+                }
+
+                for sell_meteora_address in meteora_addresses {
+                    if sell_meteora_address == buy_meteora_address {
+                        continue;
+                    }
+                    let Some(sell_meteora) = meteora_state.get(sell_meteora_address) else {
+                        continue;
+                    };
+                    let Some(sell_quote_mint) =
+                        sell_meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+                    else {
+                        continue;
+                    };
+                    if buy_quote_mint != sell_quote_mint {
+                        continue;
+                    }
+                    let sell_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+                        .values()
+                        .filter(|array| array.lb_pair == sell_meteora.pool_address)
+                        .collect();
+                    if sell_bin_arrays.is_empty() && !sell_meteora.is_damm_v2() {
+                        continue;
+                    }
+
+                    if meteora_direct_swap_executable_block_reason(
+                        config,
+                        sell_meteora,
+                        meteora_bin_arrays,
+                        token_mint,
+                        sell_quote_mint.as_str(),
+                    )
+                    .await
+                    .is_some()
+                    {
+                        continue;
+                    }
+
+                    for trade_size_usdc in &trade_sizes {
+                        let Some(exact) = quote_meteora_buy_meteora_sell(
+                            config,
+                            buy_meteora,
+                            sell_meteora,
+                            token_mint,
+                            &buy_bin_arrays,
+                            &sell_bin_arrays,
+                            *trade_size_usdc,
+                        ) else {
+                            continue;
+                        };
+                        let gate_profit_pct =
+                            direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                                execution_manager,
+                                config,
+                                *trade_size_usdc,
+                                exact.gross_profit_usdc,
+                            );
+                        maybe_replace_best_exact_direct_candidate(
+                            stats,
+                            &mut best,
+                            ExactDirectRouteCandidate::MeteoraMeteora {
+                                token_mint: token_mint.to_string(),
+                                buy_meteora_address: buy_meteora_address.clone(),
+                                sell_meteora_address: sell_meteora_address.clone(),
+                                trade_size_usdc: *trade_size_usdc,
+                                exact_net_profit_pct: exact.net_profit_pct,
+                                gate_profit_pct,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let whirlpool_attempts =
+        whirlpool_pumpswap_attempts + whirlpool_meteora_attempts + whirlpool_raydium_attempts;
+    let whirlpool_hits = whirlpool_pumpswap_hits + whirlpool_meteora_hits + whirlpool_raydium_hits;
+    if whirlpool_pool_count > 0 && whirlpool_attempts > 0 {
+        let best_path = best
+            .as_ref()
+            .map(exact_direct_route_candidate_path_label)
+            .unwrap_or("none");
+        if whirlpool_hits == 0 {
+            let key = format!("whirlpool-direct-none:{token_mint}");
+            if should_log_whirlpool_direct_diagnostic_once(&key) {
+                tracing::debug!(
+                    "Whirlpool 直发诊断：币种={}，最佳路径={}，池数=PumpSwap {}、Meteora {}、Raydium {}、Whirlpool {}，尝试=PumpSwap {}、Meteora {}、Raydium {}，命中=PumpSwap {}、Meteora {}、Raydium {}，结果=没有报价",
+                    token_mint,
+                    best_path,
+                    pumpswap_by_token.get(token_mint).map_or(0, Vec::len),
+                    meteora_by_token.get(token_mint).map_or(0, Vec::len),
+                    raydium_by_token.get(token_mint).map_or(0, Vec::len),
+                    whirlpool_pool_count,
+                    whirlpool_pumpswap_attempts,
+                    whirlpool_meteora_attempts,
+                    whirlpool_raydium_attempts,
+                    whirlpool_pumpswap_hits,
+                    whirlpool_meteora_hits,
+                    whirlpool_raydium_hits,
+                );
+            }
+        } else {
+            let best_is_whirlpool = matches!(
+                best.as_ref(),
+                Some(
+                    ExactDirectRouteCandidate::PumpSwapWhirlpool { .. }
+                        | ExactDirectRouteCandidate::MeteoraWhirlpool { .. }
+                        | ExactDirectRouteCandidate::RaydiumWhirlpool { .. }
+                )
+            );
+            if !best_is_whirlpool {
+                let key = format!("whirlpool-direct-nonbest:{token_mint}");
+                if should_log_whirlpool_direct_diagnostic_once(&key) {
+                    tracing::debug!(
+                        "Whirlpool 直发诊断：币种={}，最佳路径={}，池数=PumpSwap {}、Meteora {}、Raydium {}、Whirlpool {}，尝试=PumpSwap {}、Meteora {}、Raydium {}，命中=PumpSwap {}、Meteora {}、Raydium {}，结果=报价不是最优",
+                        token_mint,
+                        best_path,
+                        pumpswap_by_token.get(token_mint).map_or(0, Vec::len),
+                        meteora_by_token.get(token_mint).map_or(0, Vec::len),
+                        raydium_by_token.get(token_mint).map_or(0, Vec::len),
+                        whirlpool_pool_count,
+                        whirlpool_pumpswap_attempts,
+                        whirlpool_meteora_attempts,
+                        whirlpool_raydium_attempts,
+                        whirlpool_pumpswap_hits,
+                        whirlpool_meteora_hits,
+                        whirlpool_raydium_hits,
+                    );
+                }
+            }
+        }
+    }
+
+    best
+}
+
+fn should_log_whirlpool_direct_diagnostic_once(key: &str) -> bool {
+    let Ok(mut seen) = WHIRLPOOL_DIRECT_DIAGNOSTIC_KEYS.lock() else {
+        return false;
+    };
+    seen.insert(key.to_string())
+}
+
+fn maybe_replace_best_exact_direct_candidate(
+    stats: &RuntimeStats,
+    best: &mut Option<ExactDirectRouteCandidate>,
+    candidate: ExactDirectRouteCandidate,
+) {
+    if direct_path_cooldown_active(
+        stats,
+        &exact_direct_route_candidate_cooldown_key(&candidate),
+    )
+    .is_some()
+    {
+        return;
+    }
+    let candidate_profit = exact_direct_route_candidate_exact_profit_pct(&candidate)
+        + preferred_live_exact_candidate_bonus(&candidate);
+    let replace = best
+        .as_ref()
+        .map(|current| {
+            candidate_profit
+                > exact_direct_route_candidate_exact_profit_pct(current)
+                    + preferred_live_exact_candidate_bonus(current)
+        })
+        .unwrap_or(true);
+    if replace {
+        *best = Some(candidate);
+    }
+}
+
+fn exact_direct_route_candidate_gate_profit_pct(candidate: &ExactDirectRouteCandidate) -> f64 {
+    match candidate {
+        ExactDirectRouteCandidate::PumpSwapClmm {
+            gate_profit_pct, ..
+        }
+        | ExactDirectRouteCandidate::PumpSwapMeteora {
+            gate_profit_pct, ..
+        }
+        | ExactDirectRouteCandidate::MeteoraClmm {
+            gate_profit_pct, ..
+        }
+        | ExactDirectRouteCandidate::PumpSwapWhirlpool {
+            gate_profit_pct, ..
+        }
+        | ExactDirectRouteCandidate::MeteoraWhirlpool {
+            gate_profit_pct, ..
+        }
+        | ExactDirectRouteCandidate::RaydiumWhirlpool {
+            gate_profit_pct, ..
+        }
+        | ExactDirectRouteCandidate::MeteoraMeteora {
+            gate_profit_pct, ..
+        } => *gate_profit_pct,
+    }
+}
+
+fn exact_direct_route_candidate_exact_profit_pct(candidate: &ExactDirectRouteCandidate) -> f64 {
+    match candidate {
+        ExactDirectRouteCandidate::PumpSwapClmm {
+            exact_net_profit_pct,
+            ..
+        }
+        | ExactDirectRouteCandidate::PumpSwapMeteora {
+            exact_net_profit_pct,
+            ..
+        }
+        | ExactDirectRouteCandidate::MeteoraClmm {
+            exact_net_profit_pct,
+            ..
+        }
+        | ExactDirectRouteCandidate::PumpSwapWhirlpool {
+            exact_net_profit_pct,
+            ..
+        }
+        | ExactDirectRouteCandidate::MeteoraWhirlpool {
+            exact_net_profit_pct,
+            ..
+        }
+        | ExactDirectRouteCandidate::RaydiumWhirlpool {
+            exact_net_profit_pct,
+            ..
+        }
+        | ExactDirectRouteCandidate::MeteoraMeteora {
+            exact_net_profit_pct,
+            ..
+        } => *exact_net_profit_pct,
+    }
+}
+
+fn exact_direct_route_candidate_trade_size_usdc(candidate: &ExactDirectRouteCandidate) -> f64 {
+    match candidate {
+        ExactDirectRouteCandidate::PumpSwapClmm {
+            trade_size_usdc, ..
+        }
+        | ExactDirectRouteCandidate::PumpSwapMeteora {
+            trade_size_usdc, ..
+        }
+        | ExactDirectRouteCandidate::MeteoraClmm {
+            trade_size_usdc, ..
+        }
+        | ExactDirectRouteCandidate::PumpSwapWhirlpool {
+            trade_size_usdc, ..
+        }
+        | ExactDirectRouteCandidate::MeteoraWhirlpool {
+            trade_size_usdc, ..
+        }
+        | ExactDirectRouteCandidate::RaydiumWhirlpool {
+            trade_size_usdc, ..
+        }
+        | ExactDirectRouteCandidate::MeteoraMeteora {
+            trade_size_usdc, ..
+        } => *trade_size_usdc,
+    }
+}
+
+fn exact_direct_route_candidate_path_label(candidate: &ExactDirectRouteCandidate) -> &'static str {
+    match candidate {
+        ExactDirectRouteCandidate::PumpSwapClmm { direction, .. } => {
+            pumpswap_clmm_direction_label(*direction)
+        }
+        ExactDirectRouteCandidate::PumpSwapMeteora { direction, .. } => {
+            let (_, _, path_label) = pumpswap_meteora_direction_labels(*direction);
+            path_label
+        }
+        ExactDirectRouteCandidate::MeteoraClmm { direction, .. } => match direction {
+            MeteoraClmmDirection::MeteoraToClmm => "Meteora Pool->Raydium CLMM",
+            MeteoraClmmDirection::ClmmToMeteora => "Raydium CLMM->Meteora Pool",
+        },
+        ExactDirectRouteCandidate::PumpSwapWhirlpool { path_label, .. }
+        | ExactDirectRouteCandidate::MeteoraWhirlpool { path_label, .. }
+        | ExactDirectRouteCandidate::RaydiumWhirlpool { path_label, .. } => path_label,
+        ExactDirectRouteCandidate::MeteoraMeteora { .. } => "Meteora Pool->Meteora Pool",
+    }
+}
+
+fn exact_direct_route_candidate_route_instance(candidate: &ExactDirectRouteCandidate) -> String {
+    match candidate {
+        ExactDirectRouteCandidate::PumpSwapClmm {
+            pumpswap_address,
+            raydium_address,
+            ..
+        } => format!(
+            "{}/{}",
+            &pumpswap_address[..pumpswap_address.len().min(8)],
+            &raydium_address[..raydium_address.len().min(8)]
+        ),
+        ExactDirectRouteCandidate::PumpSwapMeteora {
+            pumpswap_address,
+            meteora_address,
+            ..
+        } => format!(
+            "{}/{}",
+            &pumpswap_address[..pumpswap_address.len().min(8)],
+            &meteora_address[..meteora_address.len().min(8)]
+        ),
+        ExactDirectRouteCandidate::MeteoraClmm {
+            meteora_address,
+            raydium_address,
+            ..
+        } => format!(
+            "{}/{}",
+            &meteora_address[..meteora_address.len().min(8)],
+            &raydium_address[..raydium_address.len().min(8)]
+        ),
+        ExactDirectRouteCandidate::PumpSwapWhirlpool {
+            pumpswap_address,
+            whirlpool_address,
+            ..
+        } => format!(
+            "{}/{}",
+            &pumpswap_address[..pumpswap_address.len().min(8)],
+            &whirlpool_address[..whirlpool_address.len().min(8)]
+        ),
+        ExactDirectRouteCandidate::MeteoraWhirlpool {
+            meteora_address,
+            whirlpool_address,
+            ..
+        } => format!(
+            "{}/{}",
+            &meteora_address[..meteora_address.len().min(8)],
+            &whirlpool_address[..whirlpool_address.len().min(8)]
+        ),
+        ExactDirectRouteCandidate::RaydiumWhirlpool {
+            raydium_address,
+            whirlpool_address,
+            ..
+        } => format!(
+            "{}/{}",
+            &raydium_address[..raydium_address.len().min(8)],
+            &whirlpool_address[..whirlpool_address.len().min(8)]
+        ),
+        ExactDirectRouteCandidate::MeteoraMeteora {
+            buy_meteora_address,
+            sell_meteora_address,
+            ..
+        } => format!(
+            "{}/{}",
+            &buy_meteora_address[..buy_meteora_address.len().min(8)],
+            &sell_meteora_address[..sell_meteora_address.len().min(8)]
+        ),
+    }
+}
+
+fn best_direct_route_candidate(
+    config: &Config,
+    stats: &RuntimeStats,
+    token_mint: &str,
+    pumpswap_state: &HashMap<String, PumpSwapState>,
+    raydium_state: &HashMap<String, RaydiumState>,
+    meteora_state: &HashMap<String, MeteoraState>,
+    pumpswap_by_token: &HashMap<String, Vec<String>>,
+    raydium_by_token: &HashMap<String, Vec<String>>,
+    meteora_by_token: &HashMap<String, Vec<String>>,
+) -> Option<DirectRouteCandidate> {
+    let mut best: Option<DirectRouteCandidate> = None;
+
+    if let Some(pumpswap_addresses) = pumpswap_by_token.get(token_mint) {
+        for pumpswap_address in pumpswap_addresses {
+            let Some(pumpswap) = pumpswap_state.get(pumpswap_address) else {
+                continue;
+            };
+
+            if direct_route_family_enabled(config, DirectRouteFamily::PumpSwapRaydium) {
+                if let Some(raydium_addresses) = raydium_by_token.get(token_mint) {
+                    for raydium_address in raydium_addresses {
+                        let Some(raydium) = raydium_state.get(raydium_address) else {
+                            continue;
+                        };
+                        if let Some((direction, net_profit_pct)) =
+                            pumpswap_clmm_direct_candidate_for_token(
+                                config, pumpswap, raydium, token_mint,
+                            )
+                        {
+                            maybe_replace_best_direct_candidate(
+                                stats,
+                                &mut best,
+                                DirectRouteCandidate::PumpSwapClmm {
+                                    token_mint: token_mint.to_string(),
+                                    pumpswap_address: pumpswap_address.clone(),
+                                    raydium_address: raydium_address.clone(),
+                                    direction,
+                                    net_profit_pct,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
+            if direct_route_family_enabled(config, DirectRouteFamily::PumpSwapMeteora) {
+                if let Some(meteora_addresses) = meteora_by_token.get(token_mint) {
+                    for meteora_address in meteora_addresses {
+                        let Some(meteora) = meteora_state.get(meteora_address) else {
+                            continue;
+                        };
+                        if let Some((direction, net_profit_pct)) =
+                            pumpswap_meteora_spot_candidate(config, pumpswap, meteora)
+                        {
+                            maybe_replace_best_direct_candidate(
+                                stats,
+                                &mut best,
+                                DirectRouteCandidate::PumpSwapMeteora {
+                                    token_mint: token_mint.to_string(),
+                                    pumpswap_address: pumpswap_address.clone(),
+                                    meteora_address: meteora_address.clone(),
+                                    direction,
+                                    net_profit_pct,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(meteora_addresses) = meteora_by_token.get(token_mint) {
+        for meteora_address in meteora_addresses {
+            let Some(meteora) = meteora_state.get(meteora_address) else {
+                continue;
+            };
+            if direct_route_family_enabled(config, DirectRouteFamily::MeteoraRaydium) {
+                if let Some(raydium_addresses) = raydium_by_token.get(token_mint) {
+                    for raydium_address in raydium_addresses {
+                        let Some(raydium) = raydium_state.get(raydium_address) else {
+                            continue;
+                        };
+                        if let Some((direction, net_profit_pct)) =
+                            meteora_clmm_spot_candidate(config, meteora, raydium)
+                        {
+                            maybe_replace_best_direct_candidate(
+                                stats,
+                                &mut best,
+                                DirectRouteCandidate::MeteoraClmm {
+                                    token_mint: token_mint.to_string(),
+                                    meteora_address: meteora_address.clone(),
+                                    raydium_address: raydium_address.clone(),
+                                    direction,
+                                    net_profit_pct,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    best
+}
+
+fn maybe_replace_best_direct_candidate(
+    stats: &RuntimeStats,
+    best: &mut Option<DirectRouteCandidate>,
+    candidate: DirectRouteCandidate,
+) {
+    if direct_path_cooldown_active(stats, &direct_route_candidate_cooldown_key(&candidate))
+        .is_some()
+    {
+        return;
+    }
+    let candidate_profit = direct_route_candidate_net_profit_pct(&candidate)
+        + preferred_live_direct_candidate_bonus(&candidate);
+    let replace = best
+        .as_ref()
+        .map(|current| {
+            candidate_profit
+                > direct_route_candidate_net_profit_pct(current)
+                    + preferred_live_direct_candidate_bonus(current)
+        })
+        .unwrap_or(true);
+    if replace {
+        *best = Some(candidate);
+    }
+}
+
+fn direct_route_candidate_net_profit_pct(candidate: &DirectRouteCandidate) -> f64 {
+    match candidate {
+        DirectRouteCandidate::PumpSwapClmm { net_profit_pct, .. }
+        | DirectRouteCandidate::PumpSwapMeteora { net_profit_pct, .. }
+        | DirectRouteCandidate::MeteoraClmm { net_profit_pct, .. } => *net_profit_pct,
+    }
+}
+
+fn direct_route_candidate_path_label(candidate: &DirectRouteCandidate) -> &'static str {
+    match candidate {
+        DirectRouteCandidate::PumpSwapClmm { direction, .. } => match direction {
+            ClmmSpotDirection::PumpSwapToClmm => "PumpSwap->Raydium CLMM",
+            ClmmSpotDirection::ClmmToPumpSwap => "Raydium CLMM->PumpSwap",
+        },
+        DirectRouteCandidate::PumpSwapMeteora { direction, .. } => {
+            let (_, _, path_label) = pumpswap_meteora_direction_labels(*direction);
+            path_label
+        }
+        DirectRouteCandidate::MeteoraClmm { direction, .. } => match direction {
+            MeteoraClmmDirection::MeteoraToClmm => "Meteora DLMM->Raydium CLMM",
+            MeteoraClmmDirection::ClmmToMeteora => "Raydium CLMM->Meteora DLMM",
+        },
+    }
+}
+
+fn direct_route_candidate_route_kind(candidate: &DirectRouteCandidate) -> &'static str {
+    match candidate {
+        DirectRouteCandidate::PumpSwapClmm { .. } => "pumpswap_clmm",
+        DirectRouteCandidate::PumpSwapMeteora { .. } => "pumpswap_meteora",
+        DirectRouteCandidate::MeteoraClmm { .. } => "meteora_clmm",
+    }
+}
+
+fn direct_route_candidate_route_instance(candidate: &DirectRouteCandidate) -> String {
+    match candidate {
+        DirectRouteCandidate::PumpSwapClmm {
+            pumpswap_address,
+            raydium_address,
+            ..
+        } => format!("{pumpswap_address}/{raydium_address}"),
+        DirectRouteCandidate::PumpSwapMeteora {
+            pumpswap_address,
+            meteora_address,
+            ..
+        } => format!("{pumpswap_address}/{meteora_address}"),
+        DirectRouteCandidate::MeteoraClmm {
+            meteora_address,
+            raydium_address,
+            ..
+        } => format!("{meteora_address}/{raydium_address}"),
+    }
+}
+
+fn direct_route_candidate_cooldown_key(candidate: &DirectRouteCandidate) -> String {
+    direct_route_path_key(
+        direct_route_candidate_route_kind(candidate),
+        direct_route_candidate_path_label(candidate),
+        match candidate {
+            DirectRouteCandidate::PumpSwapClmm { token_mint, .. }
+            | DirectRouteCandidate::PumpSwapMeteora { token_mint, .. }
+            | DirectRouteCandidate::MeteoraClmm { token_mint, .. } => token_mint,
+        },
+        &direct_route_candidate_route_instance(candidate),
+    )
+}
+
+fn exact_direct_route_candidate_cooldown_key(candidate: &ExactDirectRouteCandidate) -> String {
+    direct_route_path_key(
+        match candidate {
+            ExactDirectRouteCandidate::PumpSwapClmm { .. } => "pumpswap_clmm",
+            ExactDirectRouteCandidate::PumpSwapMeteora { .. } => "pumpswap_meteora",
+            ExactDirectRouteCandidate::MeteoraClmm { .. } => "meteora_clmm",
+            ExactDirectRouteCandidate::PumpSwapWhirlpool { .. } => "pumpswap_whirlpool",
+            ExactDirectRouteCandidate::MeteoraWhirlpool { .. } => "meteora_whirlpool",
+            ExactDirectRouteCandidate::RaydiumWhirlpool { .. } => "raydium_whirlpool",
+            ExactDirectRouteCandidate::MeteoraMeteora { .. } => "meteora_meteora",
+        },
+        exact_direct_route_candidate_path_label(candidate),
+        match candidate {
+            ExactDirectRouteCandidate::PumpSwapClmm { token_mint, .. }
+            | ExactDirectRouteCandidate::PumpSwapMeteora { token_mint, .. }
+            | ExactDirectRouteCandidate::MeteoraClmm { token_mint, .. }
+            | ExactDirectRouteCandidate::PumpSwapWhirlpool { token_mint, .. }
+            | ExactDirectRouteCandidate::MeteoraWhirlpool { token_mint, .. }
+            | ExactDirectRouteCandidate::RaydiumWhirlpool { token_mint, .. }
+            | ExactDirectRouteCandidate::MeteoraMeteora { token_mint, .. } => token_mint,
+        },
+        &exact_direct_route_candidate_route_instance(candidate),
+    )
+}
+
+fn direct_token_active_cooldown_count(stats: &RuntimeStats, token_mint: &str) -> usize {
+    let now = Instant::now();
+    stats
+        .direct_path_cooldowns
+        .iter()
+        .filter(|(key, state)| {
+            state.cooldown_until > now
+                && key
+                    .split(':')
+                    .nth(2)
+                    .is_some_and(|value| value == token_mint)
+        })
+        .count()
+}
+
+fn preferred_live_token_bonus(token_mint: &str) -> f64 {
+    if token_mint == PREFERRED_LIVE_METEORA_CLMM_TOKEN_MINT {
+        8.0
+    } else {
+        0.0
+    }
+}
+
+fn preferred_live_direct_candidate_bonus(candidate: &DirectRouteCandidate) -> f64 {
+    match candidate {
+        DirectRouteCandidate::MeteoraClmm { token_mint, .. }
+            if token_mint == PREFERRED_LIVE_METEORA_CLMM_TOKEN_MINT =>
+        {
+            1.0
+        }
+        _ => 0.0,
+    }
+}
+
+fn preferred_live_exact_candidate_bonus(candidate: &ExactDirectRouteCandidate) -> f64 {
+    match candidate {
+        ExactDirectRouteCandidate::MeteoraClmm { token_mint, .. }
+            if token_mint == PREFERRED_LIVE_METEORA_CLMM_TOKEN_MINT =>
+        {
+            1.0
+        }
+        _ => 0.0,
+    }
+}
+
+fn should_attempt_simulation_after_preflight(
+    net_profit_pct: f64,
+    min_profit_threshold: f64,
+) -> bool {
+    passes_local_profit_threshold(net_profit_pct, min_profit_threshold)
+}
+
+fn effective_trade_sizes_usdc(
+    execution_manager: Option<&ExecutionManager>,
+    config: &Config,
+) -> Vec<f64> {
+    if let Some(execution_manager) = execution_manager {
+        if execution_manager.live_send_enabled() {
+            return live_probe_trade_sizes_usdc(config);
+        }
+    }
+
+    build_monitor_trade_sizes(&config.strategy.trade_sizes)
+}
+
+fn build_monitor_trade_sizes(configured_trade_sizes: &[f64]) -> Vec<f64> {
+    let mut trade_sizes = configured_trade_sizes
+        .iter()
+        .copied()
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .collect::<Vec<_>>();
+    let Some(min_configured_trade_size) = trade_sizes
+        .iter()
+        .copied()
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    else {
+        return trade_sizes;
+    };
+
+    trade_sizes.extend(
+        MONITOR_TRADE_SIZE_FRACTIONS
+            .into_iter()
+            .map(|fraction| normalize_trade_size_usdc(min_configured_trade_size * fraction))
+            .filter(|size| *size >= MONITOR_MIN_TRADE_SIZE_USDC),
+    );
+    dedup_trade_sizes(&mut trade_sizes);
+    trade_sizes
+}
+
+fn configured_live_trade_sizes_usdc(config: &Config) -> Vec<f64> {
+    let mut trade_sizes = config
+        .strategy
+        .trade_sizes
+        .iter()
+        .copied()
+        .map(normalize_trade_size_usdc)
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .collect::<Vec<_>>();
+    dedup_trade_sizes(&mut trade_sizes);
+    trade_sizes
+}
+
+fn live_probe_trade_sizes_usdc(config: &Config) -> Vec<f64> {
+    let trade_sizes = configured_live_trade_sizes_usdc(config);
+    match trade_sizes.as_slice() {
+        [] => Vec::new(),
+        [single] => vec![*single],
+        [left, right] => {
+            let min = left.min(*right);
+            let max = left.max(*right);
+            if (max - min).abs() < f64::EPSILON {
+                return vec![min];
+            }
+            let step = (max - min) / (LIVE_RANGE_PROBE_POINTS.saturating_sub(1) as f64);
+            let mut probes = (0..LIVE_RANGE_PROBE_POINTS)
+                .map(|index| normalize_trade_size_usdc(min + step * index as f64))
+                .collect::<Vec<_>>();
+            dedup_trade_sizes(&mut probes);
+            probes
+        }
+        _ => trade_sizes,
+    }
+}
+
+fn sample_configured_live_trade_size_usdc(config: &Config) -> Option<f64> {
+    let trade_sizes = configured_live_trade_sizes_usdc(config);
+    match trade_sizes.as_slice() {
+        [] => None,
+        [single] => Some(*single),
+        [min, max] => Some(normalize_trade_size_usdc(
+            rand::thread_rng().gen_range(*min..=*max),
+        )),
+        _ => {
+            let index = rand::thread_rng().gen_range(0..trade_sizes.len());
+            Some(trade_sizes[index])
+        }
+    }
+}
+
+fn normalize_trade_size_usdc(value: f64) -> f64 {
+    ((value.max(0.0) * 100.0).round()) / 100.0
+}
+
+fn configured_program_pair_trade_sizes_sol(config: &Config) -> Vec<f64> {
+    let mut trade_sizes = config
+        .strategy
+        .program_pair_trade_sizes_sol
+        .iter()
+        .copied()
+        .map(|value| ((value.max(0.0) * 10_000.0).round()) / 10_000.0)
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .collect::<Vec<_>>();
+    trade_sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    trade_sizes.dedup_by(|left, right| (*left - *right).abs() < 0.0001);
+    trade_sizes
+}
+
+fn dedup_trade_sizes(trade_sizes: &mut Vec<f64>) {
+    trade_sizes.retain(|size| size.is_finite() && *size > 0.0);
+    trade_sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    trade_sizes.dedup_by(|left, right| (*left - *right).abs() < 0.01);
+}
+
+fn parse_non_negative_env_f64(var: &str, default: f64) -> f64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(default)
+}
+
+fn parse_positive_env_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_positive_env_u64(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_non_negative_env_u64(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_bool_env(var: &str, default: bool) -> bool {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" | "on" => Some(true),
+            "0" | "false" | "no" | "n" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn two_hop_profit_guard_min_usdc() -> f64 {
+    parse_non_negative_env_f64(
+        "TWO_HOP_PROFIT_GUARD_MIN_USDC",
+        DEFAULT_TWO_HOP_PROFIT_GUARD_MIN_USDC,
+    )
+}
+
+fn direct_raydium_remaining_tick_array_count() -> usize {
+    parse_positive_env_usize(
+        "DIRECT_RAYDIUM_REMAINING_TICK_ARRAYS",
+        DEFAULT_DIRECT_RAYDIUM_REMAINING_TICK_ARRAY_COUNT,
+    )
+}
+
+fn raydium_clmm_hydrate_tick_arrays_each_side() -> i32 {
+    let count = parse_positive_env_usize(
+        "RAYDIUM_CLMM_HYDRATE_TICK_ARRAYS_EACH_SIDE",
+        DEFAULT_RAYDIUM_CLMM_HYDRATE_TICK_ARRAYS_EACH_SIDE,
+    )
+    .max(3);
+    i32::try_from(count).unwrap_or(i32::MAX)
+}
+
+fn raydium_clmm_index_pool_bitmap_tick_arrays() -> bool {
+    parse_bool_env("RAYDIUM_CLMM_INDEX_POOL_BITMAP_TICK_ARRAYS", false)
+}
+
+fn raydium_clmm_hydrate_bitmap_extensions() -> bool {
+    parse_bool_env("RAYDIUM_CLMM_HYDRATE_BITMAP_EXTENSIONS", false)
+}
+
+fn max_raydium_clmm_tracked_tick_arrays_per_pool() -> usize {
+    parse_positive_env_usize(
+        "MAX_RAYDIUM_CLMM_TRACKED_TICK_ARRAYS_PER_POOL",
+        DEFAULT_MAX_RAYDIUM_CLMM_TRACKED_TICK_ARRAYS_PER_POOL,
+    )
+}
+
+fn max_meteora_tracked_bin_arrays_per_pool() -> usize {
+    parse_positive_env_usize(
+        "MAX_METEORA_TRACKED_BIN_ARRAYS_PER_POOL",
+        DEFAULT_MAX_METEORA_TRACKED_BIN_ARRAYS_PER_POOL,
+    )
+}
+
+fn raydium_execution_tick_array_count(pool_address: &str) -> usize {
+    let base = direct_raydium_remaining_tick_array_count().max(1);
+    let overrides = RAYDIUM_EXECUTION_TICK_ARRAY_COUNT_OVERRIDES.read().unwrap();
+    overrides.get(pool_address).copied().unwrap_or(base).max(1)
+}
+
+fn bump_raydium_execution_tick_array_count(pool_address: &str) -> Option<(usize, usize)> {
+    let base = direct_raydium_remaining_tick_array_count().max(1);
+    let mut overrides = RAYDIUM_EXECUTION_TICK_ARRAY_COUNT_OVERRIDES
+        .write()
+        .unwrap();
+    let current = overrides.get(pool_address).copied().unwrap_or(base).max(1);
+    let next = (current + 2).min(12);
+    if next <= current {
+        return None;
+    }
+    overrides.insert(pool_address.to_string(), next);
+    Some((current, next))
+}
+
+fn reduce_raydium_execution_tick_array_count(pool_address: &str) -> Option<(usize, usize)> {
+    const RAYDIUM_EXECUTION_TICK_ARRAY_REDUCE_MIN: usize = 2;
+    let base = direct_raydium_remaining_tick_array_count().max(1);
+    let mut overrides = RAYDIUM_EXECUTION_TICK_ARRAY_COUNT_OVERRIDES
+        .write()
+        .unwrap();
+    let current = overrides.get(pool_address).copied().unwrap_or(base).max(1);
+    if current <= RAYDIUM_EXECUTION_TICK_ARRAY_REDUCE_MIN {
+        return None;
+    }
+    let next = if current > 4 {
+        current / 2
+    } else {
+        current.saturating_sub(1)
+    }
+    .max(RAYDIUM_EXECUTION_TICK_ARRAY_REDUCE_MIN);
+    if next >= current {
+        return None;
+    }
+    overrides.insert(pool_address.to_string(), next);
+    Some((current, next))
+}
+
+fn direct_meteora_remaining_bin_array_count() -> usize {
+    parse_positive_env_usize(
+        "DIRECT_METEORA_REMAINING_BIN_ARRAYS",
+        DEFAULT_DIRECT_METEORA_REMAINING_BIN_ARRAY_COUNT,
+    )
+}
+
+fn direct_meteora_pad_exact_bin_arrays() -> bool {
+    parse_bool_env("DIRECT_METEORA_PAD_EXACT_BIN_ARRAYS", false)
+}
+
+fn meteora_pad_exact_bin_arrays(pool_address: &str) -> bool {
+    if direct_meteora_pad_exact_bin_arrays() {
+        return true;
+    }
+    METEORA_EXECUTION_BIN_ARRAY_SEARCH_STATE
+        .read()
+        .unwrap()
+        .get(pool_address)
+        .and_then(|state| state.min_required)
+        .is_some()
+}
+
+fn meteora_execution_bin_array_count(pool_address: &str) -> usize {
+    let base = direct_meteora_remaining_bin_array_count();
+    let overrides = METEORA_EXECUTION_BIN_ARRAY_COUNT_OVERRIDES.read().unwrap();
+    overrides.get(pool_address).copied().unwrap_or(base).max(1)
+}
+
+fn set_meteora_execution_bin_array_count_override(pool_address: &str, next: usize) {
+    let mut overrides = METEORA_EXECUTION_BIN_ARRAY_COUNT_OVERRIDES.write().unwrap();
+    overrides.insert(pool_address.to_string(), next.max(1));
+}
+
+fn bump_meteora_execution_bin_array_count(pool_address: &str) -> usize {
+    const METEORA_EXECUTION_BIN_ARRAY_BUMP_STEP: usize = 8;
+    const METEORA_EXECUTION_BIN_ARRAY_MAX: usize = 64;
+    let current = meteora_execution_bin_array_count(pool_address);
+    let next = current
+        .saturating_add(METEORA_EXECUTION_BIN_ARRAY_BUMP_STEP)
+        .min(METEORA_EXECUTION_BIN_ARRAY_MAX);
+    set_meteora_execution_bin_array_count_override(pool_address, next);
+    next
+}
+
+fn reduce_meteora_execution_bin_array_count(pool_address: &str) -> Option<(usize, usize)> {
+    const METEORA_EXECUTION_BIN_ARRAY_REDUCE_STEP: usize = 4;
+    const METEORA_EXECUTION_BIN_ARRAY_REDUCE_MIN: usize = 2;
+    let current = meteora_execution_bin_array_count(pool_address).max(1);
+    if current <= METEORA_EXECUTION_BIN_ARRAY_REDUCE_MIN {
+        return None;
+    }
+    let mut search_state = METEORA_EXECUTION_BIN_ARRAY_SEARCH_STATE.write().unwrap();
+    let state = search_state.entry(pool_address.to_string()).or_default();
+    state.max_allowed = Some(
+        state
+            .max_allowed
+            .map_or(current.saturating_sub(1), |value| {
+                value.min(current.saturating_sub(1))
+            }),
+    );
+    let min_required = state
+        .min_required
+        .unwrap_or(METEORA_EXECUTION_BIN_ARRAY_REDUCE_MIN)
+        .max(METEORA_EXECUTION_BIN_ARRAY_REDUCE_MIN);
+    let max_allowed = state
+        .max_allowed
+        .unwrap()
+        .max(METEORA_EXECUTION_BIN_ARRAY_REDUCE_MIN);
+    if min_required > max_allowed {
+        return None;
+    }
+    let midpoint = min_required + (max_allowed - min_required) / 2;
+    let next = if state.min_required.is_some() {
+        midpoint
+    } else {
+        current
+            .saturating_sub(METEORA_EXECUTION_BIN_ARRAY_REDUCE_STEP)
+            .max(min_required)
+            .max(METEORA_EXECUTION_BIN_ARRAY_REDUCE_MIN)
+    };
+    if next >= current {
+        return None;
+    }
+    drop(search_state);
+    set_meteora_execution_bin_array_count_override(pool_address, next);
+    Some((current, next))
+}
+
+fn bump_meteora_execution_bin_array_count_for_error(pool_address: &str, error: &str) -> usize {
+    const METEORA_EXECUTION_BIN_ARRAY_MAX: usize = 64;
+    const METEORA_EXECUTION_BIN_ARRAY_BUMP_STEP: usize = 8;
+
+    let current = meteora_execution_bin_array_count(pool_address).max(1);
+    if is_meteora_non_zero_liquidity_bin_array_error(error) {
+        let mut search_state = METEORA_EXECUTION_BIN_ARRAY_SEARCH_STATE.write().unwrap();
+        let state = search_state.entry(pool_address.to_string()).or_default();
+        state.min_required = Some(
+            state
+                .min_required
+                .map_or(current.saturating_add(1), |value| {
+                    value.max(current.saturating_add(1))
+                }),
+        );
+        let min_required = state
+            .min_required
+            .unwrap()
+            .min(METEORA_EXECUTION_BIN_ARRAY_MAX);
+        let max_allowed = state
+            .max_allowed
+            .unwrap_or(METEORA_EXECUTION_BIN_ARRAY_MAX)
+            .min(METEORA_EXECUTION_BIN_ARRAY_MAX);
+        if min_required > max_allowed {
+            return current;
+        }
+        let midpoint = min_required + (max_allowed - min_required) / 2;
+        let next = if state.max_allowed.is_some() {
+            midpoint
+        } else {
+            current
+                .saturating_add(METEORA_EXECUTION_BIN_ARRAY_BUMP_STEP)
+                .min(max_allowed)
+                .max(min_required)
+        };
+        if next <= current {
+            return current;
+        }
+        drop(search_state);
+        set_meteora_execution_bin_array_count_override(pool_address, next);
+        return next;
+    }
+
+    if is_meteora_bitmap_extension_missing_error(error) {
+        let next = current
+            .saturating_add(METEORA_EXECUTION_BIN_ARRAY_BUMP_STEP)
+            .min(METEORA_EXECUTION_BIN_ARRAY_MAX);
+        if next > current {
+            set_meteora_execution_bin_array_count_override(pool_address, next);
+            return next;
+        }
+    }
+
+    bump_meteora_execution_bin_array_count(pool_address)
+}
+
+fn maybe_bump_meteora_execution_bin_arrays(
+    meteora_pool: &MeteoraState,
+    route_kind: &str,
+    path_label: &str,
+    token_mint: &str,
+    error: &str,
+) {
+    if should_reduce_meteora_execution_bin_arrays(error) {
+        if let Some((current, next)) =
+            reduce_meteora_execution_bin_array_count(&meteora_pool.pool_address)
+        {
+            tracing::debug!(
+                "收缩 Meteora 执行窗口：路线={}，路径={}，币种={}，池={}，原因=锁账户过多，{}到{}",
+                route_kind,
+                path_label,
+                token_mint,
+                meteora_pool.pool_address,
+                current,
+                next
+            );
+        }
+        return;
+    }
+
+    if should_expand_meteora_execution_bin_arrays(error) {
+        let next =
+            bump_meteora_execution_bin_array_count_for_error(&meteora_pool.pool_address, error);
+        tracing::debug!(
+            "扩大 Meteora 执行窗口：路线={}，路径={}，币种={}，池={}，数组数={}",
+            route_kind,
+            path_label,
+            token_mint,
+            meteora_pool.pool_address,
+            next
+        );
+    }
+}
+
+async fn retry_pumpswap_meteora_with_expanded_bin_arrays(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    direction: MeteoraPumpSwapDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    trade_size_usdc: f64,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+    route_kind: &'static str,
+    path_label: &str,
+    error: &str,
+) -> Option<bool> {
+    if !should_expand_meteora_execution_bin_arrays(error) {
+        return None;
+    }
+    let current = meteora_execution_bin_array_count(&meteora.pool_address);
+    let next = bump_meteora_execution_bin_array_count_for_error(&meteora.pool_address, error);
+    if next <= current {
+        return None;
+    }
+    tracing::debug!(
+        "立即重试：路线={}，路径={}，币种={}，原因=扩大 Meteora 数组，{}到{}",
+        route_kind,
+        path_label,
+        token_mint,
+        current,
+        next
+    );
+    Some(
+        Box::pin(maybe_send_pumpswap_meteora_direct_with_trade_size_inner(
+            execution_manager,
+            config,
+            pumpswap,
+            pumpswap_pool,
+            meteora,
+            token_mint,
+            direction,
+            meteora_bin_arrays,
+            pumpswap_protocol_fee_recipient,
+            trade_size_usdc,
+            estimated_net_profit_pct,
+            stats,
+            true,
+        ))
+        .await,
+    )
+}
+
+async fn retry_pumpswap_meteora_with_reduced_bin_arrays(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    direction: MeteoraPumpSwapDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    trade_size_usdc: f64,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+    route_kind: &'static str,
+    path_label: &str,
+    error: &str,
+) -> Option<bool> {
+    if !should_reduce_meteora_execution_bin_arrays(error) {
+        return None;
+    }
+    let Some((current, next)) = reduce_meteora_execution_bin_array_count(&meteora.pool_address)
+    else {
+        return None;
+    };
+    tracing::debug!(
+        "立即重试：路线={}，路径={}，币种={}，原因=收缩 Meteora 数组，{}到{}",
+        route_kind,
+        path_label,
+        token_mint,
+        current,
+        next
+    );
+    Some(
+        Box::pin(maybe_send_pumpswap_meteora_direct_with_trade_size_inner(
+            execution_manager,
+            config,
+            pumpswap,
+            pumpswap_pool,
+            meteora,
+            token_mint,
+            direction,
+            meteora_bin_arrays,
+            pumpswap_protocol_fee_recipient,
+            trade_size_usdc,
+            estimated_net_profit_pct,
+            stats,
+            true,
+        ))
+        .await,
+    )
+}
+
+fn max_sol_input_lamports_for_trade_size(config: &Config, trade_size_usdc: f64) -> Result<u64> {
+    Ok(ceil_u64(
+        usdc_to_raw_for_mint(
+            &config.tokens.sol_mint,
+            trade_size_usdc,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+        )
+        .ok_or_else(|| anyhow::anyhow!("unsupported SOL input cap for live trade size"))?,
+    ))
+}
+
+async fn evaluate_meteora_raydium_spot(
+    execution_manager: &ExecutionManager,
+    _skip_monitor_only_routes_when_live: bool,
+    config: &Config,
+    meteora: &MeteoraState,
+    raydium: &RaydiumState,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    stats: &mut RuntimeStats,
+) {
+    let Some(meteora_token) =
+        meteora.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    else {
+        stats.no_match_checks += 1;
+        return;
+    };
+    let Some(raydium_token) = strategy::quote::raydium_traded_token(
+        raydium,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+    ) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+    if meteora_token != raydium_token {
+        stats.no_match_checks += 1;
+        return;
+    }
+    if !meteora_raydium_quote_mints_match(config, meteora, raydium, &meteora_token) {
+        stats.no_match_checks += 1;
+        return;
+    }
+
+    let Some(meteora_price_usdc) = meteora_token_price_usdc(
+        meteora,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    ) else {
+        stats.no_match_checks += 1;
+        return;
+    };
+
+    let Some(raydium_price_usdc) =
+        raydium_token_price_usdc_for_spot(config, raydium, &meteora_token)
+    else {
+        stats.no_match_checks += 1;
+        return;
+    };
+
+    if !meteora_price_usdc.is_finite()
+        || !raydium_price_usdc.is_finite()
+        || meteora_price_usdc <= 0.0
+        || raydium_price_usdc <= 0.0
+    {
+        stats.no_match_checks += 1;
+        return;
+    }
+
+    stats.validated_checks += 1;
+    let high = meteora_price_usdc.max(raydium_price_usdc);
+    let low = meteora_price_usdc.min(raydium_price_usdc);
+    let gross_profit_pct = ((high - low) / low) * 100.0;
+    let estimated_cost_pct =
+        (meteora.fee_bps + raydium.fee_bps + strategy::quote::SLIPPAGE_BUFFER_BPS) / 100.0;
+    let net_profit_pct = gross_profit_pct - estimated_cost_pct;
+    let (buy_venue, sell_venue) = if meteora_price_usdc < raydium_price_usdc {
+        ("Meteora", raydium.venue.label())
+    } else {
+        (raydium.venue.label(), "Meteora")
+    };
+
+    record_route_snapshot(
+        stats,
+        RouteSnapshot {
+            token_mint: meteora_token.clone(),
+            buy_venue: buy_venue.to_string(),
+            sell_venue: sell_venue.to_string(),
+            buy_price_usdc: low,
+            sell_price_usdc: high,
+            gross_profit_pct,
+            net_profit_pct,
+            route_kind: "meteora_spot",
+        },
+    );
+
+    if executor_direct_send_ready(execution_manager) && meteora_clmm_live_send_enabled() {
+        let direction = if meteora_price_usdc < raydium_price_usdc {
+            MeteoraClmmDirection::MeteoraToClmm
+        } else {
+            MeteoraClmmDirection::ClmmToMeteora
+        };
+        maybe_send_meteora_raydium_direct(
+            execution_manager,
+            config,
+            meteora,
+            raydium,
+            &meteora_token,
+            direction,
+            meteora_bin_arrays,
+            raydium_clmm_tick_arrays,
+            net_profit_pct,
+            stats,
+        )
+        .await;
+        return;
+    }
+
+    if !passes_local_profit_threshold(net_profit_pct, config.strategy.min_profit_threshold) {
+        stats.rejected_below_threshold += 1;
+        return;
+    }
+
+    stats.non_executable_opportunities += 1;
+    stats.exact_quote_required += 1;
+    let route_instance = format!(
+        "{}/{}",
+        &meteora.pool_address[..meteora.pool_address.len().min(8)],
+        &raydium.pool_address[..raydium.pool_address.len().min(8)]
+    );
+    log_monitor_candidate(
+        stats,
+        "meteora_spot",
+        &meteora_token,
+        buy_venue,
+        sell_venue,
+        None,
+        gross_profit_pct,
+        net_profit_pct,
+        Some(route_instance.as_str()),
+    );
+
+    preflight_meteora_raydium(
+        Some(execution_manager),
+        config,
+        meteora,
+        raydium,
+        &meteora_token,
+        buy_venue,
+        sell_venue,
+        meteora_bin_arrays,
+        raydium_clmm_tick_arrays,
+        stats,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_send_meteora_raydium_direct(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    meteora: &MeteoraState,
+    raydium: &RaydiumState,
+    token_mint: &str,
+    direction: MeteoraClmmDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let Some(trade_size_usdc) = direct_execution_trade_size_usdc(config) else {
+        return false;
+    };
+    maybe_send_meteora_raydium_direct_with_trade_size(
+        execution_manager,
+        config,
+        meteora,
+        raydium,
+        token_mint,
+        direction,
+        meteora_bin_arrays,
+        raydium_clmm_tick_arrays,
+        trade_size_usdc,
+        estimated_net_profit_pct,
+        stats,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_send_meteora_raydium_direct_with_trade_size(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    meteora: &MeteoraState,
+    raydium: &RaydiumState,
+    token_mint: &str,
+    direction: MeteoraClmmDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    trade_size_usdc: f64,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let path_label = match direction {
+        MeteoraClmmDirection::MeteoraToClmm => "Meteora DLMM->Raydium CLMM",
+        MeteoraClmmDirection::ClmmToMeteora => "Raydium CLMM->Meteora DLMM",
+    };
+    let route_instance = format!("{}/{}", meteora.pool_address, raydium.pool_address);
+    let cooldown_key =
+        direct_route_path_key("meteora_clmm", path_label, token_mint, &route_instance);
+    let token_path_cooldown_key =
+        direct_route_token_path_key("meteora_clmm", path_label, token_mint);
+    if let Some(cooldown) = direct_path_cooldown_active(stats, &cooldown_key)
+        .or_else(|| direct_path_cooldown_active(stats, &token_path_cooldown_key))
+    {
+        let reason_key = cooldown.reason_key;
+        let last_gate_profit_pct = cooldown.last_gate_profit_pct;
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            reason_key,
+            last_gate_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=路径冷却中 原因={} gate={:.2}%",
+                path_label,
+                token_mint,
+                reason_key,
+                last_gate_profit_pct
+            );
+        }
+        return true;
+    }
+    if block_stale_unsimulated_direct_send(
+        execution_manager,
+        stats,
+        "meteora_clmm",
+        path_label,
+        token_mint,
+        &cooldown_key,
+        estimated_net_profit_pct,
+        &[
+            ("Meteora", &meteora.price_history),
+            (raydium.venue.label(), &raydium.price_history),
+        ],
+    ) {
+        return true;
+    }
+    if let Some(block) =
+        meteora_raydium_executable_block_reason(config, meteora, raydium, token_mint).await
+    {
+        log_preflight_blocked(
+            stats,
+            "meteora_direct",
+            token_mint,
+            match direction {
+                MeteoraClmmDirection::MeteoraToClmm => "Meteora",
+                MeteoraClmmDirection::ClmmToMeteora => raydium.venue.label(),
+            },
+            match direction {
+                MeteoraClmmDirection::MeteoraToClmm => raydium.venue.label(),
+                MeteoraClmmDirection::ClmmToMeteora => "Meteora",
+            },
+            block.reason_key,
+            &block.reason,
+        );
+        true
+    } else {
+        let offchain_threshold_pct =
+            active_offchain_profit_threshold_pct(Some(execution_manager), config);
+        if fast_path_direct_send_enabled()
+            && !disable_fast_path_spot_profit_filter()
+            && !(send_on_positive_spot_enabled() && estimated_net_profit_pct > 0.0)
+            && estimated_net_profit_pct <= offchain_threshold_pct
+        {
+            if should_log_direct_skip(
+                stats,
+                path_label,
+                token_mint,
+                "fast_path_spot_below_threshold",
+                estimated_net_profit_pct,
+            ) {
+                tracing::debug!(
+                    "跳过直发: 路径={} 币种={} 原因=快速路径 spot 未过阈值 spot={:.2}% threshold={:.2}% size=${:.2}",
+                    path_label,
+                    token_mint,
+                    estimated_net_profit_pct,
+                    offchain_threshold_pct,
+                    trade_size_usdc
+                );
+            }
+            return true;
+        }
+        let Some(quote_mint) =
+            meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        else {
+            return true;
+        };
+        let (meteora_input_mint, meteora_output_mint) = match direction {
+            MeteoraClmmDirection::MeteoraToClmm => (quote_mint.as_str(), token_mint),
+            MeteoraClmmDirection::ClmmToMeteora => (token_mint, quote_mint.as_str()),
+        };
+        if let Some(block) = meteora_direct_swap_executable_block_reason(
+            config,
+            meteora,
+            meteora_bin_arrays,
+            meteora_input_mint,
+            meteora_output_mint,
+        )
+        .await
+        {
+            log_preflight_blocked(
+                stats,
+                "meteora_direct",
+                token_mint,
+                match direction {
+                    MeteoraClmmDirection::MeteoraToClmm => "Meteora",
+                    MeteoraClmmDirection::ClmmToMeteora => raydium.venue.label(),
+                },
+                match direction {
+                    MeteoraClmmDirection::MeteoraToClmm => raydium.venue.label(),
+                    MeteoraClmmDirection::ClmmToMeteora => "Meteora",
+                },
+                block.reason_key,
+                &block.reason,
+            );
+            return true;
+        }
+        let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+            .values()
+            .filter(|array| array.lb_pair == meteora.pool_address)
+            .collect();
+        if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+            if should_log_direct_skip(stats, path_label, token_mint, "missing_bin_arrays", 0.0) {
+                tracing::debug!(
+                    "跳过直发: 路径={} 币种={} 原因=缺少 Meteora bin arrays",
+                    path_label,
+                    token_mint
+                );
+            }
+            return true;
+        }
+        if fast_path_direct_send_enabled()
+            && execution_pre_send_simulation_enabled(execution_manager)
+        {
+            return probe_meteora_raydium_fast_path_with_simulation(
+                execution_manager,
+                config,
+                meteora,
+                raydium,
+                token_mint,
+                direction,
+                meteora_bin_arrays,
+                raydium_clmm_tick_arrays,
+                trade_size_usdc,
+                estimated_net_profit_pct,
+                stats,
+            )
+            .await;
+        }
+
+        let exact = match direction {
+            MeteoraClmmDirection::MeteoraToClmm => quote_meteora_buy_raydium_sell(
+                config,
+                meteora,
+                raydium,
+                token_mint,
+                &pool_bin_arrays,
+                raydium_clmm_tick_arrays,
+                trade_size_usdc,
+            ),
+            MeteoraClmmDirection::ClmmToMeteora => quote_raydium_buy_meteora_sell(
+                config,
+                meteora,
+                raydium,
+                token_mint,
+                &pool_bin_arrays,
+                raydium_clmm_tick_arrays,
+                trade_size_usdc,
+            ),
+        };
+        let Some(exact) = exact else {
+            set_direct_path_cooldown(
+                stats,
+                cooldown_key.clone(),
+                Duration::from_secs(300),
+                "exact_quote_unavailable",
+                estimated_net_profit_pct,
+            );
+            if should_log_direct_skip(
+                stats,
+                path_label,
+                token_mint,
+                "exact_quote_unavailable",
+                0.0,
+            ) {
+                tracing::debug!(
+                    "跳过直发: 路径={} 币种={} 原因=exact quote 不可得 size=${:.2}",
+                    path_label,
+                    token_mint,
+                    trade_size_usdc
+                );
+            }
+            return true;
+        };
+        let gate_profit_pct = direct_execution_gate_profit_pct_from_gross_profit_usdc(
+            execution_manager,
+            config,
+            trade_size_usdc,
+            exact.gross_profit_usdc,
+        );
+        let positive_exact_override = !execution_manager.require_pre_send_simulation()
+            && passes_unsimulated_exact_profit_pct(exact.net_profit_pct);
+        if !positive_exact_override
+            && !disable_direct_send_skip_checks()
+            && !passes_direct_execution_gate(gate_profit_pct)
+        {
+            if gate_profit_pct <= -2.0 {
+                set_direct_path_cooldown(
+                    stats,
+                    cooldown_key.clone(),
+                    Duration::from_secs(300),
+                    "exact_quote_below_threshold",
+                    gate_profit_pct,
+                );
+            }
+            if should_log_direct_skip(
+                stats,
+                path_label,
+                token_mint,
+                "exact_quote_below_threshold",
+                exact.net_profit_pct,
+            ) {
+                tracing::debug!(
+                    "跳过直发: 路径={} 币种={} 原因=exact quote 未过阈值 spot={:.2}% gate={:.2}% exact={:.2}% size=${:.2}",
+                    path_label,
+                    token_mint,
+                    estimated_net_profit_pct,
+                    gate_profit_pct,
+                    exact.net_profit_pct,
+                    trade_size_usdc
+                );
+            }
+            stats.rejected_below_threshold += 1;
+            return true;
+        }
+        if !should_attempt_direct_send(stats, "meteora_clmm", token_mint, exact.net_profit_pct) {
+            return true;
+        }
+
+        stats.tx_build_required += 1;
+        let plan = match build_meteora_raydium_direct_execution_instructions(
+            config,
+            execution_manager,
+            meteora,
+            raydium,
+            token_mint,
+            direction,
+            meteora_bin_arrays,
+            raydium_clmm_tick_arrays,
+            trade_size_usdc,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                stats.tx_build_blocked += 1;
+                tracing::debug!(
+                    "构建 Meteora 到 Raydium 交易失败：路径={}，币种={}，原因={}",
+                    path_label,
+                    token_mint,
+                    summarize_block_reason(&error.to_string())
+                );
+                return false;
+            }
+        };
+
+        if block_unsimulated_direct_send(
+            execution_manager,
+            stats,
+            "meteora_clmm",
+            path_label,
+            token_mint,
+            estimated_net_profit_pct,
+        ) {
+            return true;
+        }
+
+        match send_direct_plan_with_optional_setup_split(
+            execution_manager,
+            config,
+            "meteora_clmm",
+            path_label,
+            token_mint,
+            trade_size_usdc,
+            &plan,
+        )
+        .await
+        {
+            Ok(signature) => {
+                record_token_send_success(stats, token_mint);
+                log_send_success(
+                    "meteora_clmm",
+                    path_label,
+                    token_mint,
+                    &signature,
+                    exact.net_profit_pct,
+                );
+                true
+            }
+            Err(error) => {
+                let error_text = error.to_string();
+                if error_text.contains("rate-limited") {
+                    tracing::debug!(
+                        "跳过直发: 路径={} 币种={} 原因=发送冷却中 收益提示={:.2}%",
+                        path_label,
+                        token_mint,
+                        gate_profit_pct
+                    );
+                    return true;
+                } else {
+                    if let Some((reason_key, _, _)) = classify_unsimulated_send_failure(&error_text)
+                    {
+                        set_direct_path_cooldown(
+                            stats,
+                            token_path_cooldown_key.clone(),
+                            Duration::from_secs(60),
+                            reason_key,
+                            gate_profit_pct,
+                        );
+                    }
+                    let reduced_raydium = maybe_reduce_raydium_execution_tick_arrays(
+                        raydium,
+                        "meteora_clmm",
+                        path_label,
+                        token_mint,
+                        &error_text,
+                    );
+                    let reduced_meteora = if should_reduce_meteora_execution_bin_arrays(&error_text)
+                    {
+                        reduce_meteora_execution_bin_array_count(&meteora.pool_address).map(
+                            |(current, next)| {
+                                tracing::debug!(
+                                    "收缩 Meteora 执行窗口：路线=Meteora到Raydium，路径={}，币种={}，池={}，原因=交易过大，{}到{}",
+                                    path_label,
+                                    token_mint,
+                                    meteora.pool_address,
+                                    current,
+                                    next
+                                );
+                            },
+                        ).is_some()
+                    } else {
+                        false
+                    };
+                    let reduced_account_window = reduced_raydium || reduced_meteora;
+                    if is_transaction_too_large_error(&error_text) && !reduced_account_window {
+                        set_direct_path_cooldown(
+                            stats,
+                            cooldown_key.clone(),
+                            Duration::from_secs(1800),
+                            "serialized_transaction_too_large",
+                            gate_profit_pct,
+                        );
+                        set_direct_path_cooldown(
+                            stats,
+                            token_path_cooldown_key.clone(),
+                            Duration::from_secs(60),
+                            "serialized_transaction_too_large",
+                            gate_profit_pct,
+                        );
+                    }
+                    maybe_bump_raydium_execution_tick_arrays(
+                        raydium,
+                        "meteora_clmm",
+                        path_label,
+                        token_mint,
+                        &error_text,
+                    );
+                    if !reduced_account_window {
+                        apply_unsimulated_send_failure_backoff(
+                            execution_manager,
+                            stats,
+                            token_mint,
+                            &cooldown_key,
+                            gate_profit_pct,
+                            &error_text,
+                        );
+                        maybe_bump_meteora_execution_bin_arrays(
+                            meteora,
+                            "meteora_clmm",
+                            path_label,
+                            token_mint,
+                            &error_text,
+                        );
+                    }
+                    tracing::debug!(
+                        "发送构建失败：路线=Meteora到Raydium，路径={}，币种={}，原因={}",
+                        path_label,
+                        token_mint,
+                        summarize_block_reason(&error_text)
+                    );
+                }
+                false
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn probe_meteora_raydium_fast_path_with_simulation(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    meteora: &MeteoraState,
+    raydium: &RaydiumState,
+    token_mint: &str,
+    direction: MeteoraClmmDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    preferred_trade_size_usdc: f64,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let path_label = match direction {
+        MeteoraClmmDirection::MeteoraToClmm => "Meteora DLMM->Raydium CLMM",
+        MeteoraClmmDirection::ClmmToMeteora => "Raydium CLMM->Meteora DLMM",
+    };
+    if !should_attempt_direct_send(
+        stats,
+        "meteora_clmm_fast",
+        token_mint,
+        estimated_net_profit_pct,
+    ) {
+        return true;
+    }
+
+    let live_send_min_profit_pct = execution_manager.live_send_min_profit_pct();
+    let mut best_simulated: Option<(f64, f64)> = None;
+
+    for trade_size_usdc in execution_probe_trade_sizes_usdc(config, preferred_trade_size_usdc) {
+        stats.tx_build_required += 1;
+        let plan = match build_meteora_raydium_direct_execution_instructions(
+            config,
+            execution_manager,
+            meteora,
+            raydium,
+            token_mint,
+            direction,
+            meteora_bin_arrays,
+            raydium_clmm_tick_arrays,
+            trade_size_usdc,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                stats.tx_build_blocked += 1;
+                tracing::debug!(
+                    "构建 Meteora 到 Raydium 快速交易失败：路径={}，币种={}，金额=${:.2}，原因={}",
+                    path_label,
+                    token_mint,
+                    trade_size_usdc,
+                    summarize_block_reason(&error.to_string())
+                );
+                continue;
+            }
+        };
+
+        let atomic_instructions = match maybe_wrap_plan_with_two_hop_executor(
+            execution_manager,
+            config,
+            path_label,
+            trade_size_usdc,
+            &plan,
+        ) {
+            Ok(instructions) => instructions,
+            Err(error) => {
+                stats.tx_build_blocked += 1;
+                tracing::debug!(
+                    "构建链上两腿指令失败：路径={}，币种={}，金额=${:.2}，原因={}",
+                    path_label,
+                    token_mint,
+                    trade_size_usdc,
+                    summarize_block_reason(&error.to_string())
+                );
+                continue;
+            }
+        };
+
+        stats.simulation_required += 1;
+        match execution_manager
+            .simulate_instructions_with_accounts(
+                atomic_instructions.clone(),
+                &[plan.net_quote_token_account.to_string()],
+            )
+            .await
+        {
+            Ok((report, accounts)) => {
+                stats.simulation_passed += 1;
+                stats.last_simulation_error = None;
+                let simulated_quote_net_change_raw = simulated_token_account_net_change(
+                    &accounts,
+                    &plan.net_quote_token_account,
+                    plan.net_quote_start_balance,
+                );
+                let simulated_quote_net_change_usdc = simulated_quote_net_change_raw
+                    .and_then(|amount| {
+                        raw_to_usdc_for_mint(
+                            &plan.net_quote_mint,
+                            amount as f64,
+                            &config.tokens.usdc_mint,
+                            &config.tokens.sol_mint,
+                            config.strategy.sol_usdc_price,
+                        )
+                    })
+                    .unwrap_or(f64::NEG_INFINITY);
+                let simulated_effective_net_profit_pct =
+                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                        execution_manager,
+                        config,
+                        trade_size_usdc,
+                        simulated_quote_net_change_usdc,
+                    );
+                let replace = best_simulated
+                    .as_ref()
+                    .map(|(_, current_profit_pct)| {
+                        simulated_effective_net_profit_pct > *current_profit_pct
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    best_simulated = Some((trade_size_usdc, simulated_effective_net_profit_pct));
+                }
+                if passes_direct_execution_gate(simulated_effective_net_profit_pct) {
+                    tracing::debug!(
+                        "Meteora/Raydium 快速路径 原子模拟通过: 路径={} 币种={} size=${:.2} CU={:?} 模拟收益率={:.2}%",
+                        path_label,
+                        token_mint,
+                        trade_size_usdc,
+                        report.units_consumed,
+                        simulated_effective_net_profit_pct
+                    );
+                    match send_direct_plan_with_optional_setup_split_and_units(
+                        execution_manager,
+                        config,
+                        "meteora_clmm",
+                        path_label,
+                        token_mint,
+                        trade_size_usdc,
+                        &plan,
+                        report.units_consumed,
+                    )
+                    .await
+                    {
+                        Ok(signature) => {
+                            log_send_success(
+                                "meteora_clmm",
+                                path_label,
+                                token_mint,
+                                &signature,
+                                simulated_effective_net_profit_pct,
+                            );
+                            return true;
+                        }
+                        Err(error) => {
+                            let error_text = error.to_string();
+                            let reduced_raydium = maybe_reduce_raydium_execution_tick_arrays(
+                                raydium,
+                                "meteora_clmm",
+                                path_label,
+                                token_mint,
+                                &error_text,
+                            );
+                            let reduced_meteora = if should_reduce_meteora_execution_bin_arrays(
+                                &error_text,
+                            ) {
+                                reduce_meteora_execution_bin_array_count(&meteora.pool_address)
+                                    .map(|(current, next)| {
+                                        tracing::debug!(
+                                            "收缩 Meteora 执行窗口：路线=Meteora到Raydium，路径={}，币种={}，池={}，原因=交易过大，{}到{}",
+                                            path_label,
+                                            token_mint,
+                                            meteora.pool_address,
+                                            current,
+                                            next
+                                        );
+                                    })
+                                    .is_some()
+                            } else {
+                                false
+                            };
+                            if is_transaction_too_large_error(&error_text)
+                                && !reduced_raydium
+                                && !reduced_meteora
+                            {
+                                let route_instance =
+                                    format!("{}/{}", meteora.pool_address, raydium.pool_address);
+                                set_direct_path_cooldown(
+                                    stats,
+                                    direct_route_path_key(
+                                        "meteora_clmm",
+                                        path_label,
+                                        token_mint,
+                                        &route_instance,
+                                    ),
+                                    Duration::from_secs(1800),
+                                    "serialized_transaction_too_large",
+                                    simulated_effective_net_profit_pct,
+                                );
+                                set_direct_path_cooldown(
+                                    stats,
+                                    direct_route_token_path_key(
+                                        "meteora_clmm",
+                                        path_label,
+                                        token_mint,
+                                    ),
+                                    Duration::from_secs(60),
+                                    "serialized_transaction_too_large",
+                                    simulated_effective_net_profit_pct,
+                                );
+                            }
+                            if let Some((reason_key, cooldown, _)) =
+                                classify_unsimulated_send_failure(&error_text)
+                            {
+                                let route_instance =
+                                    format!("{}/{}", meteora.pool_address, raydium.pool_address);
+                                set_direct_path_cooldown(
+                                    stats,
+                                    direct_route_path_key(
+                                        "meteora_clmm",
+                                        path_label,
+                                        token_mint,
+                                        &route_instance,
+                                    ),
+                                    cooldown,
+                                    reason_key,
+                                    simulated_effective_net_profit_pct,
+                                );
+                                set_direct_path_cooldown(
+                                    stats,
+                                    direct_route_token_path_key(
+                                        "meteora_clmm",
+                                        path_label,
+                                        token_mint,
+                                    ),
+                                    Duration::from_secs(60),
+                                    reason_key,
+                                    simulated_effective_net_profit_pct,
+                                );
+                            }
+                            if !reduced_raydium && !reduced_meteora {
+                                maybe_bump_meteora_execution_bin_arrays(
+                                    meteora,
+                                    "meteora_clmm",
+                                    path_label,
+                                    token_mint,
+                                    &error_text,
+                                );
+                            }
+                            tracing::debug!(
+                                "发送构建失败：路线=Meteora到Raydium，路径={}，币种={}，原因={}",
+                                path_label,
+                                token_mint,
+                                error
+                            );
+                            return false;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                stats.simulation_failed += 1;
+                stats.last_simulation_error = Some(error.to_string());
+                let error_text = error.to_string();
+                if is_setup_split_send_error(&error_text) {
+                    maybe_reduce_raydium_execution_tick_arrays(
+                        raydium,
+                        "meteora_clmm",
+                        path_label,
+                        token_mint,
+                        &error_text,
+                    );
+                    if should_reduce_meteora_execution_bin_arrays(&error_text) {
+                        if let Some((current, next)) =
+                            reduce_meteora_execution_bin_array_count(&meteora.pool_address)
+                        {
+                            tracing::debug!(
+                                "收缩 Meteora 执行窗口：路线=Meteora到Raydium，路径={}，币种={}，池={}，原因=模拟交易过大，{}到{}",
+                                path_label,
+                                token_mint,
+                                meteora.pool_address,
+                                current,
+                                next
+                            );
+                        }
+                    }
+                }
+                let summarized_error = summarize_simulation_error(&error_text);
+                tracing::debug!(
+                    "Meteora 到 Raydium 快速模拟失败：路径={}，币种={}，金额=${:.2}，原因={}",
+                    path_label,
+                    token_mint,
+                    trade_size_usdc,
+                    summarized_error
+                );
+                if is_transaction_too_large_error(&error_text)
+                    || is_invalid_first_tick_array_error(&error_text)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some((best_size, best_profit_pct)) = best_simulated {
+        tracing::debug!(
+            "Meteora/Raydium 快速路径 best simulated result: 路径={} 币种={} best_size=${:.2} simulated_profit={:.2}% live_min={:.2}%",
+            path_label,
+            token_mint,
+            best_size,
+            best_profit_pct,
+            live_send_min_profit_pct
+        );
+    }
+    true
+}
+
+struct MeteoraSwapInstructionPlan {
+    instruction: Instruction,
+    fallback_label: &'static str,
+    user_token_in: Pubkey,
+    user_token_out: Pubkey,
+}
+
+struct WhirlpoolSwapInstructionPlan {
+    instruction: Instruction,
+    fallback_label: &'static str,
+    user_token_in: Pubkey,
+    user_token_out: Pubkey,
+}
+
+async fn build_meteora_direct_swap_instruction(
+    config: &Config,
+    meteora_pool: &MeteoraState,
+    user: &Pubkey,
+    input_mint: &str,
+    output_mint: &str,
+    amount_in: u64,
+    min_amount_out: u64,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+) -> Result<MeteoraSwapInstructionPlan> {
+    let token_x_program = token_program_for_simulation(config, &meteora_pool.token_x_mint).await?;
+    let token_y_program = token_program_for_simulation(config, &meteora_pool.token_y_mint).await?;
+
+    if meteora_pool.is_damm_v2() {
+        let accounts = executor::swap::derive_meteora_damm_v2_accounts_with_token_programs(
+            meteora_pool,
+            user,
+            &token_x_program,
+            &token_y_program,
+            input_mint,
+        )?;
+        let instruction = executor::swap::build_meteora_damm_v2_swap_v2(
+            &accounts.swap_v2_accounts(),
+            amount_in,
+            min_amount_out,
+        )?;
+        return Ok(MeteoraSwapInstructionPlan {
+            instruction,
+            fallback_label: "Meteora DAMM v2 swap",
+            user_token_in: accounts.input_token_account,
+            user_token_out: accounts.output_token_account,
+        });
+    }
+
+    let remaining_arrays = meteora_swap_remaining_bin_arrays_for_exact_input_execution_async(
+        config,
+        meteora_pool,
+        meteora_bin_arrays,
+        input_mint,
+        output_mint,
+        amount_in,
+    )
+    .await?;
+    let input_token_program = if input_mint == meteora_pool.token_x_mint {
+        token_x_program
+    } else if input_mint == meteora_pool.token_y_mint {
+        token_y_program
+    } else {
+        anyhow::bail!(
+            "Meteora input mint {} does not match pool mints {} / {}",
+            input_mint,
+            meteora_pool.token_x_mint,
+            meteora_pool.token_y_mint
+        );
+    };
+    let output_token_program = if output_mint == meteora_pool.token_x_mint {
+        token_x_program
+    } else if output_mint == meteora_pool.token_y_mint {
+        token_y_program
+    } else {
+        anyhow::bail!(
+            "Meteora output mint {} does not match pool mints {} / {}",
+            output_mint,
+            meteora_pool.token_x_mint,
+            meteora_pool.token_y_mint
+        );
+    };
+    let accounts = executor::swap::derive_meteora_dlmm_accounts_with_token_programs(
+        meteora_pool,
+        user,
+        input_mint,
+        &input_token_program,
+        &output_token_program,
+        meteora_use_bitmap_extension(config, meteora_pool, &remaining_arrays).await?,
+    )?;
+    let instruction = executor::swap::build_meteora_dlmm_swap_v2(
+        &accounts.swap_v2_accounts(),
+        &remaining_arrays
+            .iter()
+            .map(|(_, pubkey)| *pubkey)
+            .collect::<Vec<_>>(),
+        amount_in,
+        min_amount_out,
+    )?;
+    Ok(MeteoraSwapInstructionPlan {
+        instruction,
+        fallback_label: "Meteora DLMM swap",
+        user_token_in: accounts.user_token_in,
+        user_token_out: accounts.user_token_out,
+    })
+}
+
+fn meteora_swap_remaining_bin_array_pubkeys(
+    meteora_pool: &MeteoraState,
+    input_mint: &str,
+    output_mint: &str,
+    max_count: i64,
+) -> Result<Vec<(i64, Pubkey)>> {
+    let x_to_y =
+        input_mint == meteora_pool.token_x_mint && output_mint == meteora_pool.token_y_mint;
+    let y_to_x =
+        input_mint == meteora_pool.token_y_mint && output_mint == meteora_pool.token_x_mint;
+    if !x_to_y && !y_to_x {
+        anyhow::bail!(
+            "Meteora swap mint mismatch: input={} output={} x={} y={}",
+            input_mint,
+            output_mint,
+            meteora_pool.token_x_mint,
+            meteora_pool.token_y_mint
+        );
+    }
+
+    let current_index = meteora::bin_array_index(meteora_pool.active_id);
+    let max_count = max_count.max(1);
+    let mut arrays = Vec::with_capacity(max_count as usize);
+    for offset in 0..max_count {
+        let index = if x_to_y {
+            current_index - offset
+        } else {
+            current_index + offset
+        };
+        let address = meteora::derive_bin_array_address(&meteora_pool.pool_address, index)?;
+        arrays.push((index, Pubkey::from_str(&address)?));
+    }
+    arrays.dedup_by(|left, right| left.0 == right.0);
+    Ok(arrays)
+}
+
+fn whirlpool_tick_array_addresses_for_swap(
+    whirlpool: &WhirlpoolState,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    a_to_b: bool,
+) -> Result<[Pubkey; 3]> {
+    let current_start_tick_index = orca_whirlpools_core::get_tick_array_start_tick_index(
+        whirlpool.tick_current_index,
+        whirlpool.tick_spacing,
+    );
+    let offset = whirlpool.tick_spacing as i32 * orca_whirlpools_core::TICK_ARRAY_SIZE as i32;
+    let ordered_start_indexes = if a_to_b {
+        [
+            current_start_tick_index,
+            current_start_tick_index - offset,
+            current_start_tick_index - offset * 2,
+        ]
+    } else {
+        [
+            current_start_tick_index,
+            current_start_tick_index + offset,
+            current_start_tick_index + offset * 2,
+        ]
+    };
+    let by_start_index = whirlpool_tick_arrays
+        .iter()
+        .filter(|(_, array)| array.whirlpool == whirlpool.pool_address)
+        .map(|(address, array)| (array.start_tick_index, address.as_str()))
+        .collect::<HashMap<_, _>>();
+    let whirlpool_pubkey = Pubkey::from_str(&whirlpool.pool_address)?;
+
+    let addresses = ordered_start_indexes.map(|start_tick_index| -> Result<Pubkey> {
+        let address = if let Some(address) = by_start_index.get(&start_tick_index) {
+            Pubkey::from_str(address)?
+        } else {
+            orca_whirlpools_client::get_tick_array_address(&whirlpool_pubkey, start_tick_index)
+                .map(|(pubkey, _)| pubkey)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "derive Whirlpool tick array PDA failed: 池={} start_tick={} error={}",
+                        whirlpool.pool_address,
+                        start_tick_index,
+                        error
+                    )
+                })?
+        };
+        Ok(address)
+    });
+    let [a0, a1, a2] = addresses;
+    Ok([a0?, a1?, a2?])
+}
+
+async fn build_whirlpool_direct_swap_instruction(
+    config: &Config,
+    whirlpool: &WhirlpoolState,
+    user: &Pubkey,
+    input_mint: &str,
+    output_mint: &str,
+    amount_in: u64,
+    other_amount_threshold: u64,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+) -> Result<WhirlpoolSwapInstructionPlan> {
+    let expected_output_mint = whirlpool_counter_mint(whirlpool, input_mint).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Whirlpool input mint {} does not match pool mints {} / {}",
+            input_mint,
+            whirlpool.token_mint_a,
+            whirlpool.token_mint_b
+        )
+    })?;
+    if expected_output_mint != output_mint {
+        anyhow::bail!(
+            "Whirlpool output mint mismatch: expected={} actual={}",
+            expected_output_mint,
+            output_mint
+        );
+    }
+
+    let token_program_a = token_program_for_simulation(config, &whirlpool.token_mint_a).await?;
+    let token_program_b = token_program_for_simulation(config, &whirlpool.token_mint_b).await?;
+    let a_to_b = input_mint == whirlpool.token_mint_a;
+    let tick_arrays =
+        whirlpool_tick_array_addresses_for_swap(whirlpool, whirlpool_tick_arrays, a_to_b)?;
+    let accounts = executor::swap::derive_whirlpool_accounts_with_token_programs(
+        whirlpool,
+        user,
+        input_mint,
+        &token_program_a,
+        &token_program_b,
+        tick_arrays,
+    )?;
+    let instruction = executor::swap::build_whirlpool_swap_v2(
+        &accounts,
+        amount_in,
+        other_amount_threshold,
+        0,
+        true,
+    )?;
+    let (user_token_in, user_token_out) = if accounts.a_to_b {
+        (
+            accounts.token_owner_account_a,
+            accounts.token_owner_account_b,
+        )
+    } else {
+        (
+            accounts.token_owner_account_b,
+            accounts.token_owner_account_a,
+        )
+    };
+
+    Ok(WhirlpoolSwapInstructionPlan {
+        instruction,
+        fallback_label: "Whirlpool swap",
+        user_token_in,
+        user_token_out,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_send_meteora_whirlpool_direct_with_trade_size(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    meteora: &MeteoraState,
+    whirlpool: &WhirlpoolState,
+    token_mint: &str,
+    direction: MeteoraWhirlpoolDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    trade_size_usdc: f64,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let path_label = match direction {
+        MeteoraWhirlpoolDirection::MeteoraToWhirlpool => "Meteora Pool->Whirlpool",
+        MeteoraWhirlpoolDirection::WhirlpoolToMeteora => "Whirlpool->Meteora Pool",
+    };
+    let route_instance = format!("{}/{}", meteora.pool_address, whirlpool.pool_address);
+    let cooldown_key =
+        direct_route_path_key("meteora_whirlpool", path_label, token_mint, &route_instance);
+    if let Some(cooldown) = direct_path_cooldown_active(stats, &cooldown_key) {
+        let reason_key = cooldown.reason_key;
+        let last_gate_profit_pct = cooldown.last_gate_profit_pct;
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            reason_key,
+            last_gate_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=路径冷却中 原因={} gate={:.2}%",
+                path_label,
+                token_mint,
+                reason_key,
+                last_gate_profit_pct
+            );
+        }
+        return true;
+    }
+    if block_stale_unsimulated_direct_send(
+        execution_manager,
+        stats,
+        "meteora_whirlpool",
+        path_label,
+        token_mint,
+        &cooldown_key,
+        estimated_net_profit_pct,
+        &[
+            ("Meteora", &meteora.price_history),
+            ("Whirlpool", &whirlpool.price_history),
+        ],
+    ) {
+        return true;
+    }
+    let Some(quote_mint) = meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    else {
+        return true;
+    };
+    let Some(whirlpool_quote_mint) =
+        whirlpool.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    else {
+        return true;
+    };
+    if quote_mint != whirlpool_quote_mint {
+        return true;
+    }
+
+    let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+        .values()
+        .filter(|array| array.lb_pair == meteora.pool_address)
+        .collect();
+    if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+        if should_log_direct_skip(stats, path_label, token_mint, "missing_bin_arrays", 0.0) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=Meteora bin arrays unavailable",
+                path_label,
+                token_mint
+            );
+        }
+        return true;
+    }
+
+    if !disable_direct_send_skip_checks() && estimated_net_profit_pct <= 0.0 {
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            "exact_quote_below_threshold",
+            estimated_net_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=估算收益未过阈值 exact={:.2}% size=${:.2}",
+                path_label,
+                token_mint,
+                estimated_net_profit_pct,
+                trade_size_usdc
+            );
+        }
+        stats.rejected_below_threshold += 1;
+        return true;
+    }
+    let estimated_net_profit_usdc = trade_size_usdc * estimated_net_profit_pct / 100.0;
+    let gate_profit_pct = direct_execution_gate_profit_pct_from_estimated_net_profit_usdc(
+        execution_manager,
+        config,
+        trade_size_usdc,
+        estimated_net_profit_usdc,
+    );
+    let positive_spot_override = send_on_positive_spot_enabled()
+        && estimated_net_profit_pct.is_finite()
+        && estimated_net_profit_pct > 0.0;
+    if !positive_spot_override
+        && !disable_direct_send_skip_checks()
+        && !passes_direct_execution_gate(gate_profit_pct)
+    {
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            "exact_quote_below_threshold",
+            estimated_net_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=估算收益未过阈值 exact={:.2}% gate={:.2}% size=${:.2}",
+                path_label,
+                token_mint,
+                estimated_net_profit_pct,
+                gate_profit_pct,
+                trade_size_usdc
+            );
+        }
+        stats.rejected_below_threshold += 1;
+        return true;
+    }
+    if !should_attempt_direct_send(
+        stats,
+        "meteora_whirlpool",
+        token_mint,
+        estimated_net_profit_pct,
+    ) {
+        return true;
+    }
+
+    stats.tx_build_required += 1;
+    let plan = match build_meteora_whirlpool_direct_execution_instructions(
+        config,
+        execution_manager,
+        meteora,
+        whirlpool,
+        token_mint,
+        direction,
+        meteora_bin_arrays,
+        whirlpool_tick_arrays,
+        trade_size_usdc,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            stats.tx_build_blocked += 1;
+            tracing::debug!(
+                "构建 Meteora 到 Whirlpool 交易失败：路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                summarize_block_reason(&error.to_string())
+            );
+            return false;
+        }
+    };
+
+    let atomic_instructions = match maybe_wrap_plan_with_two_hop_executor(
+        execution_manager,
+        config,
+        path_label,
+        trade_size_usdc,
+        &plan,
+    ) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            stats.tx_build_blocked += 1;
+            tracing::debug!(
+                "构建链上两腿指令失败：路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                summarize_block_reason(&error.to_string())
+            );
+            return false;
+        }
+    };
+
+    if !execution_pre_send_simulation_enabled(execution_manager) {
+        match send_direct_plan_with_optional_setup_split_and_units(
+            execution_manager,
+            config,
+            "meteora_whirlpool",
+            path_label,
+            token_mint,
+            trade_size_usdc,
+            &plan,
+            None,
+        )
+        .await
+        {
+            Ok(signature) => {
+                record_token_send_success(stats, token_mint);
+                log_send_success(
+                    "meteora_whirlpool",
+                    path_label,
+                    token_mint,
+                    &signature,
+                    estimated_net_profit_pct,
+                );
+            }
+            Err(send_error) => {
+                apply_unsimulated_send_failure_backoff(
+                    execution_manager,
+                    stats,
+                    token_mint,
+                    &cooldown_key,
+                    gate_profit_pct,
+                    &send_error.to_string(),
+                );
+                tracing::debug!(
+                    "实盘发送失败：路线=Meteora到Whirlpool，路径={}，币种={}，原因={}",
+                    path_label,
+                    token_mint,
+                    send_error
+                );
+            }
+        }
+        return true;
+    }
+
+    let live_send_min_profit_pct = execution_manager.live_send_min_profit_pct();
+    let jito_tip_usdc = (execution_manager.jito_tip_lamports() as f64 / 1_000_000_000.0)
+        * config.strategy.sol_usdc_price;
+    let quoted_effective_net_profit_pct =
+        ((estimated_net_profit_usdc - jito_tip_usdc) / trade_size_usdc) * 100.0;
+
+    stats.simulation_required += 1;
+    match execution_manager
+        .simulate_instructions_with_accounts(
+            atomic_instructions.clone(),
+            &[plan.net_quote_token_account.to_string()],
+        )
+        .await
+    {
+        Ok((report, accounts)) => {
+            stats.simulation_passed += 1;
+            stats.last_simulation_error = None;
+            let simulated_quote_net_change_raw = simulated_token_account_net_change(
+                &accounts,
+                &plan.net_quote_token_account,
+                plan.net_quote_start_balance,
+            );
+            let simulated_quote_net_change_usdc = simulated_quote_net_change_raw
+                .and_then(|amount| {
+                    raw_to_usdc_for_mint(
+                        &plan.net_quote_mint,
+                        amount as f64,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                        config.strategy.sol_usdc_price,
+                    )
+                })
+                .unwrap_or(f64::NEG_INFINITY);
+            let simulated_effective_net_profit_pct =
+                direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                    execution_manager,
+                    config,
+                    trade_size_usdc,
+                    simulated_quote_net_change_usdc,
+                );
+            let live_send_eligible =
+                passes_direct_execution_gate(simulated_effective_net_profit_pct);
+            tracing::debug!(
+                "Meteora/Whirlpool 原子模拟通过: 路径={} 币种={} CU={:?} 预估收益率={:.2}% 模拟净变化={:?} 模拟收益率={:.2}% 交易数据={}",
+                path_label,
+                token_mint,
+                report.units_consumed,
+                quoted_effective_net_profit_pct,
+                simulated_quote_net_change_raw,
+                simulated_effective_net_profit_pct,
+                report.transaction_base64.as_deref().unwrap_or("<missing>")
+            );
+            let live_send_enabled = execution_manager.live_send_enabled();
+            if live_send_enabled && live_send_eligible {
+                match send_direct_plan_with_optional_setup_split_and_units(
+                    execution_manager,
+                    config,
+                    "meteora_whirlpool",
+                    path_label,
+                    token_mint,
+                    trade_size_usdc,
+                    &plan,
+                    report.units_consumed,
+                )
+                .await
+                {
+                    Ok(signature) => {
+                        log_send_success(
+                            "meteora_whirlpool",
+                            path_label,
+                            token_mint,
+                            &signature,
+                            simulated_effective_net_profit_pct,
+                        );
+                    }
+                    Err(send_error) => {
+                        tracing::debug!(
+                            "实盘发送失败：路线=Meteora到Whirlpool，路径={}，币种={}，原因={}",
+                            path_label,
+                            token_mint,
+                            send_error
+                        );
+                    }
+                }
+            } else {
+                let reason = if !live_send_enabled {
+                    "live_send_disabled"
+                } else {
+                    "negative_simulated_profit"
+                };
+                tracing::debug!(
+                    "跳过实盘: 路径={} 币种={} 原因={} 预估收益率={:.2}% 模拟收益率={:.2}% 实盘阈值={:.2}%",
+                    path_label,
+                    token_mint,
+                    summarize_live_send_skip_reason(reason),
+                    quoted_effective_net_profit_pct,
+                    simulated_effective_net_profit_pct,
+                    live_send_min_profit_pct
+                );
+            }
+            true
+        }
+        Err(error) => {
+            stats.simulation_failed += 1;
+            stats.last_simulation_error = Some(error.to_string());
+            tracing::debug!(
+                "Meteora 到 Whirlpool 原子模拟失败：路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                summarize_simulation_error(&error.to_string())
+            );
+            let diagnostic_key = format!(
+                "meteora_whirlpool_diag:{}:{}:{}:{}",
+                token_mint, meteora.pool_address, whirlpool.pool_address, path_label
+            );
+            if should_log_candidate_key(stats, diagnostic_key, 0.0) {
+                diagnose_meteora_whirlpool_failure(
+                    execution_manager,
+                    config,
+                    meteora,
+                    whirlpool,
+                    token_mint,
+                    direction,
+                    meteora_bin_arrays,
+                    whirlpool_tick_arrays,
+                    &plan,
+                )
+                .await;
+            }
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_meteora_whirlpool_direct_execution_instructions(
+    config: &Config,
+    execution_manager: &ExecutionManager,
+    meteora_pool: &MeteoraState,
+    whirlpool: &WhirlpoolState,
+    token_mint: &str,
+    direction: MeteoraWhirlpoolDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    trade_size_usdc: f64,
+) -> Result<SimulationInstructionPlan> {
+    let user = execution_manager
+        .wallet_pubkey()
+        .ok_or_else(|| anyhow::anyhow!("executor wallet is not configured"))?;
+    let max_sol_input_lamports = max_sol_input_lamports_for_trade_size(config, trade_size_usdc)?;
+    let quote_mint = meteora_pool
+        .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        .ok_or_else(|| anyhow::anyhow!("Meteora quote mint not found"))?;
+    let whirlpool_quote_mint = whirlpool
+        .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        .ok_or_else(|| anyhow::anyhow!("Whirlpool quote mint not found"))?;
+    if quote_mint != whirlpool_quote_mint {
+        anyhow::bail!(
+            "Meteora/Whirlpool quote mint mismatch: meteora={} whirl池={}",
+            quote_mint,
+            whirlpool_quote_mint
+        );
+    }
+
+    let quote_mint_pubkey = Pubkey::from_str(&quote_mint)?;
+    let token_mint_pubkey = Pubkey::from_str(token_mint)?;
+    let quote_token_program = token_program_for_simulation(config, &quote_mint).await?;
+    let token_token_program = token_program_for_simulation(config, token_mint).await?;
+    let ata_specs = vec![
+        (quote_mint_pubkey, quote_token_program),
+        (token_mint_pubkey, token_token_program),
+    ];
+    let mut prepared_atas =
+        existing_associated_token_accounts(&config.rpc.http_url, &user, &ata_specs).await?;
+    let mut instructions = Vec::new();
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &quote_mint_pubkey,
+        &quote_token_program,
+        &mut prepared_atas,
+    )?;
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &token_mint_pubkey,
+        &token_token_program,
+        &mut prepared_atas,
+    )?;
+    let setup_instructions = instructions.clone();
+    let net_quote_token_account =
+        executor::swap::associated_token_address(&user, &quote_mint_pubkey, &quote_token_program)?;
+    let net_quote_start_balance =
+        token_account_balance(&config.rpc.http_url, &net_quote_token_account).await?;
+    let quote_amount_in = ceil_u64(
+        usdc_to_raw_for_mint(
+            &quote_mint,
+            trade_size_usdc,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+        )
+        .ok_or_else(|| anyhow::anyhow!("unsupported route quote mint {}", quote_mint))?,
+    );
+    if quote_mint == config.tokens.sol_mint {
+        ensure_simulation_sol_input_within_cap(
+            "direct Meteora/Whirlpool SOL input",
+            quote_amount_in,
+            max_sol_input_lamports,
+        )?;
+        ensure_existing_associated_token_account_balance(
+            &config.rpc.http_url,
+            &user,
+            &quote_mint_pubkey,
+            &quote_token_program,
+            &mut prepared_atas,
+            quote_amount_in,
+            "pre-wrapped SOL ATA",
+        )
+        .await?;
+    }
+
+    match direction {
+        MeteoraWhirlpoolDirection::MeteoraToWhirlpool => {
+            let buy_swap = build_meteora_direct_swap_instruction(
+                config,
+                meteora_pool,
+                &user,
+                &quote_mint,
+                token_mint,
+                quote_amount_in,
+                1,
+                meteora_bin_arrays,
+            )
+            .await?;
+            if buy_swap.user_token_in != net_quote_token_account {
+                anyhow::bail!(
+                    "Meteora->Whirlpool quote ATA mismatch: expected={} actual={}",
+                    net_quote_token_account,
+                    buy_swap.user_token_in
+                );
+            }
+            let sell_swap = build_whirlpool_direct_swap_instruction(
+                config,
+                whirlpool,
+                &user,
+                token_mint,
+                &quote_mint,
+                1,
+                1,
+                whirlpool_tick_arrays,
+            )
+            .await?;
+            if sell_swap.user_token_out != net_quote_token_account {
+                anyhow::bail!(
+                    "Meteora->Whirlpool second-leg quote ATA mismatch: expected={} actual={}",
+                    net_quote_token_account,
+                    sell_swap.user_token_out
+                );
+            }
+
+            instructions = setup_instructions.clone();
+            instructions.push(buy_swap.instruction);
+            instructions.push(sell_swap.instruction);
+            let observed_intermediate_token_account = second_leg_input_observed_account(
+                "Meteora Pool->Whirlpool",
+                token_mint,
+                buy_swap.user_token_out,
+                sell_swap.user_token_in,
+            );
+
+            Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions: setup_instructions.clone(),
+                fallback_label: buy_swap.fallback_label,
+                setup_instructions,
+                net_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: quote_mint,
+                intermediate_token_account: observed_intermediate_token_account,
+            })
+        }
+        MeteoraWhirlpoolDirection::WhirlpoolToMeteora => {
+            let buy_swap = build_whirlpool_direct_swap_instruction(
+                config,
+                whirlpool,
+                &user,
+                &quote_mint,
+                token_mint,
+                quote_amount_in,
+                1,
+                whirlpool_tick_arrays,
+            )
+            .await?;
+            if buy_swap.user_token_in != net_quote_token_account {
+                anyhow::bail!(
+                    "Whirlpool->Meteora quote ATA mismatch: expected={} actual={}",
+                    net_quote_token_account,
+                    buy_swap.user_token_in
+                );
+            }
+            let sell_swap = build_meteora_direct_swap_instruction(
+                config,
+                meteora_pool,
+                &user,
+                token_mint,
+                &quote_mint,
+                1,
+                1,
+                meteora_bin_arrays,
+            )
+            .await?;
+            if sell_swap.user_token_out != net_quote_token_account {
+                anyhow::bail!(
+                    "Whirlpool->Meteora second-leg quote ATA mismatch: expected={} actual={}",
+                    net_quote_token_account,
+                    sell_swap.user_token_out
+                );
+            }
+
+            instructions = setup_instructions.clone();
+            instructions.push(buy_swap.instruction);
+            instructions.push(sell_swap.instruction);
+            let observed_intermediate_token_account = second_leg_input_observed_account(
+                "Whirlpool->Meteora Pool",
+                token_mint,
+                buy_swap.user_token_out,
+                sell_swap.user_token_in,
+            );
+
+            Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions: setup_instructions.clone(),
+                fallback_label: buy_swap.fallback_label,
+                setup_instructions,
+                net_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: quote_mint,
+                intermediate_token_account: observed_intermediate_token_account,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn diagnose_meteora_whirlpool_failure(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    meteora_pool: &MeteoraState,
+    whirlpool: &WhirlpoolState,
+    token_mint: &str,
+    direction: MeteoraWhirlpoolDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    plan: &SimulationInstructionPlan,
+) {
+    let setup_len = plan.setup_instructions.len();
+    let Some(first_instruction) = plan.atomic_instructions.get(setup_len).cloned() else {
+        return;
+    };
+    let intermediate_start_balance =
+        token_account_balance(&config.rpc.http_url, &plan.intermediate_token_account)
+            .await
+            .unwrap_or(0);
+    let mut first_leg_instructions = plan.setup_instructions.clone();
+    first_leg_instructions.push(first_instruction.clone());
+    match execution_manager
+        .simulate_instructions_with_accounts(
+            first_leg_instructions,
+            &[plan.intermediate_token_account.to_string()],
+        )
+        .await
+    {
+        Ok((_report, accounts)) => {
+            let Some(first_leg_out_raw) = simulated_token_account_positive_delta(
+                &accounts,
+                &plan.intermediate_token_account,
+                intermediate_start_balance,
+            ) else {
+                tracing::debug!(
+                    "Meteora 到 Whirlpool 诊断失败：币种={}，无法读取第一腿产出",
+                    token_mint
+                );
+                return;
+            };
+            tracing::debug!(
+                "Meteora/Whirlpool 诊断: 币种={} first_leg_out_raw={} intermediate_ata={}",
+                token_mint,
+                first_leg_out_raw,
+                plan.intermediate_token_account
+            );
+
+            let user = match execution_manager.wallet_pubkey() {
+                Some(user) => user,
+                None => return,
+            };
+            let quote_mint =
+                match meteora_pool.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint) {
+                    Some(mint) => mint,
+                    None => return,
+                };
+            let second_leg = match direction {
+                MeteoraWhirlpoolDirection::MeteoraToWhirlpool => {
+                    build_whirlpool_direct_swap_instruction(
+                        config,
+                        whirlpool,
+                        &user,
+                        token_mint,
+                        &quote_mint,
+                        first_leg_out_raw,
+                        1,
+                        whirlpool_tick_arrays,
+                    )
+                    .await
+                    .map(|plan| plan.instruction)
+                }
+                MeteoraWhirlpoolDirection::WhirlpoolToMeteora => {
+                    build_meteora_direct_swap_instruction(
+                        config,
+                        meteora_pool,
+                        &user,
+                        token_mint,
+                        &quote_mint,
+                        first_leg_out_raw,
+                        1,
+                        meteora_bin_arrays,
+                    )
+                    .await
+                    .map(|plan| plan.instruction)
+                }
+            };
+            let Ok(second_leg) = second_leg else {
+                tracing::debug!(
+                    "Meteora 到 Whirlpool 诊断失败：币种={}，无法构建第二腿指令",
+                    token_mint
+                );
+                return;
+            };
+
+            let mut direct_two_leg = plan.setup_instructions.clone();
+            direct_two_leg.push(first_instruction);
+            direct_two_leg.push(second_leg);
+            match execution_manager
+                .simulate_instructions_with_accounts(
+                    direct_two_leg,
+                    &[plan.net_quote_token_account.to_string()],
+                )
+                .await
+            {
+                Ok((_report, accounts)) => {
+                    let net_quote_change_raw = simulated_token_account_net_change(
+                        &accounts,
+                        &plan.net_quote_token_account,
+                        plan.net_quote_start_balance,
+                    );
+                    let net_quote_change_usdc = net_quote_change_raw.and_then(|amount| {
+                        raw_to_usdc_for_mint(
+                            &plan.net_quote_mint,
+                            amount as f64,
+                            &config.tokens.usdc_mint,
+                            &config.tokens.sol_mint,
+                            config.strategy.sol_usdc_price,
+                        )
+                    });
+                    tracing::debug!(
+                        "Meteora/Whirlpool 诊断: 币种={} direct_two_leg_net_quote_change_raw={:?} direct_two_leg_net_quote_change_usdc={:?}",
+                        token_mint,
+                        net_quote_change_raw,
+                        net_quote_change_usdc
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "Meteora 到 Whirlpool 诊断失败：币种={}，组合模拟失败，原因={}",
+                        token_mint,
+                        summarize_simulation_error(&error.to_string())
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                "Meteora 到 Whirlpool 诊断失败：币种={}，第一腿模拟失败，原因={}",
+                token_mint,
+                summarize_simulation_error(&error.to_string())
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_send_meteora_meteora_direct_with_trade_size(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    buy_meteora: &MeteoraState,
+    sell_meteora: &MeteoraState,
+    token_mint: &str,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    trade_size_usdc: f64,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let path_label = "Meteora Pool->Meteora Pool";
+    let route_instance = format!("{}/{}", buy_meteora.pool_address, sell_meteora.pool_address);
+    let cooldown_key =
+        direct_route_path_key("meteora_meteora", path_label, token_mint, &route_instance);
+    if let Some(cooldown) = direct_path_cooldown_active(stats, &cooldown_key) {
+        let reason_key = cooldown.reason_key;
+        let last_gate_profit_pct = cooldown.last_gate_profit_pct;
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            reason_key,
+            last_gate_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=路径冷却中 原因={} gate={:.2}%",
+                path_label,
+                token_mint,
+                reason_key,
+                last_gate_profit_pct
+            );
+        }
+        return true;
+    }
+    if !meteora_meteora_live_send_enabled() {
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            "live_send_disabled_by_route_flag",
+            estimated_net_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过实盘: 路径={} 币种={} 原因=Meteora/Meteora route live send disabled",
+                path_label,
+                token_mint
+            );
+        }
+        return true;
+    }
+    if block_stale_unsimulated_direct_send(
+        execution_manager,
+        stats,
+        "meteora_meteora",
+        path_label,
+        token_mint,
+        &cooldown_key,
+        estimated_net_profit_pct,
+        &[
+            ("Meteora buy", &buy_meteora.price_history),
+            ("Meteora sell", &sell_meteora.price_history),
+        ],
+    ) {
+        return true;
+    }
+    let Some(buy_quote_mint) =
+        buy_meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    else {
+        return true;
+    };
+    let Some(sell_quote_mint) =
+        sell_meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    else {
+        return true;
+    };
+    if buy_quote_mint != sell_quote_mint {
+        return true;
+    }
+
+    if let Some(block) = meteora_direct_swap_executable_block_reason(
+        config,
+        buy_meteora,
+        meteora_bin_arrays,
+        &buy_quote_mint,
+        token_mint,
+    )
+    .await
+    {
+        log_preflight_blocked(
+            stats,
+            "meteora_meteora_direct",
+            token_mint,
+            "Meteora",
+            "Meteora",
+            block.reason_key,
+            &block.reason,
+        );
+        return true;
+    }
+    if let Some(block) = meteora_direct_swap_executable_block_reason(
+        config,
+        sell_meteora,
+        meteora_bin_arrays,
+        token_mint,
+        &sell_quote_mint,
+    )
+    .await
+    {
+        log_preflight_blocked(
+            stats,
+            "meteora_meteora_direct",
+            token_mint,
+            "Meteora",
+            "Meteora",
+            block.reason_key,
+            &block.reason,
+        );
+        return true;
+    }
+
+    let buy_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+        .values()
+        .filter(|array| array.lb_pair == buy_meteora.pool_address)
+        .collect();
+    let sell_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+        .values()
+        .filter(|array| array.lb_pair == sell_meteora.pool_address)
+        .collect();
+
+    if estimated_net_profit_pct > 0.0 && execution_pre_send_simulation_enabled(execution_manager) {
+        return probe_meteora_meteora_fast_path_with_simulation(
+            execution_manager,
+            config,
+            buy_meteora,
+            sell_meteora,
+            token_mint,
+            meteora_bin_arrays,
+            trade_size_usdc,
+            estimated_net_profit_pct,
+            stats,
+        )
+        .await;
+    }
+
+    let mut best_exact: Option<(f64, ExactPreflightQuote, f64)> = None;
+    for candidate_trade_size_usdc in execution_probe_trade_sizes_usdc(config, trade_size_usdc) {
+        let Some(exact) = quote_meteora_buy_meteora_sell(
+            config,
+            buy_meteora,
+            sell_meteora,
+            token_mint,
+            &buy_bin_arrays,
+            &sell_bin_arrays,
+            candidate_trade_size_usdc,
+        ) else {
+            continue;
+        };
+        let gate_profit_pct = direct_execution_gate_profit_pct_from_gross_profit_usdc(
+            execution_manager,
+            config,
+            candidate_trade_size_usdc,
+            exact.gross_profit_usdc,
+        );
+        let replace = best_exact
+            .as_ref()
+            .map(|(_, current_exact, current_gate)| {
+                gate_profit_pct > *current_gate
+                    || (gate_profit_pct == *current_gate
+                        && exact.net_profit_pct > current_exact.net_profit_pct)
+            })
+            .unwrap_or(true);
+        if replace {
+            best_exact = Some((candidate_trade_size_usdc, exact, gate_profit_pct));
+        }
+    }
+
+    let Some((selected_trade_size_usdc, exact, gate_profit_pct)) = best_exact else {
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            "exact_quote_unavailable",
+            0.0,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=exact quote 不可得 size=${:.2}",
+                path_label,
+                token_mint,
+                trade_size_usdc
+            );
+        }
+        return true;
+    };
+    let positive_spot_override = send_on_positive_spot_enabled()
+        && estimated_net_profit_pct.is_finite()
+        && estimated_net_profit_pct > 0.0;
+    if !positive_spot_override
+        && !disable_direct_send_skip_checks()
+        && !passes_direct_execution_gate(gate_profit_pct)
+    {
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            "exact_quote_below_threshold",
+            exact.net_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=exact quote 未过阈值 exact={:.2}% gate={:.2}% size=${:.2}",
+                path_label,
+                token_mint,
+                exact.net_profit_pct,
+                gate_profit_pct,
+                selected_trade_size_usdc
+            );
+        }
+        stats.rejected_below_threshold += 1;
+        return true;
+    }
+    if !should_attempt_direct_send(stats, "meteora_meteora", token_mint, exact.net_profit_pct) {
+        return true;
+    }
+
+    stats.tx_build_required += 1;
+    let plan = match build_meteora_meteora_direct_execution_instructions(
+        config,
+        execution_manager,
+        buy_meteora,
+        sell_meteora,
+        token_mint,
+        meteora_bin_arrays,
+        selected_trade_size_usdc,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            stats.tx_build_blocked += 1;
+            tracing::debug!(
+                "构建 Meteora 到 Meteora 交易失败：路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                summarize_block_reason(&error.to_string())
+            );
+            return false;
+        }
+    };
+
+    if block_unsimulated_direct_send(
+        execution_manager,
+        stats,
+        "meteora_meteora",
+        path_label,
+        token_mint,
+        estimated_net_profit_pct,
+    ) {
+        return true;
+    }
+
+    match send_direct_plan_with_optional_setup_split_and_units(
+        execution_manager,
+        config,
+        "meteora_meteora",
+        path_label,
+        token_mint,
+        selected_trade_size_usdc,
+        &plan,
+        None,
+    )
+    .await
+    {
+        Ok(signature) => {
+            record_token_send_success(stats, token_mint);
+            log_send_success(
+                "meteora_meteora",
+                path_label,
+                token_mint,
+                &signature,
+                exact.net_profit_pct,
+            );
+            true
+        }
+        Err(error) => {
+            if error.to_string().contains("rate-limited") {
+                tracing::debug!(
+                    "跳过直发: 路径={} 币种={} 原因=发送冷却中 收益提示={:.2}%",
+                    path_label,
+                    token_mint,
+                    exact.net_profit_pct
+                );
+                return true;
+            }
+            apply_unsimulated_send_failure_backoff(
+                execution_manager,
+                stats,
+                token_mint,
+                &cooldown_key,
+                gate_profit_pct,
+                &error.to_string(),
+            );
+            tracing::debug!(
+                "发送构建失败：路线=Meteora到Meteora，路径={}，币种={}，原因={}",
+                path_label,
+                token_mint,
+                error
+            );
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn probe_meteora_meteora_fast_path_with_simulation(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    buy_meteora: &MeteoraState,
+    sell_meteora: &MeteoraState,
+    token_mint: &str,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    preferred_trade_size_usdc: f64,
+    estimated_net_profit_pct: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    let path_label = "Meteora Pool->Meteora Pool";
+    if !should_attempt_direct_send(
+        stats,
+        "meteora_meteora_fast",
+        token_mint,
+        estimated_net_profit_pct,
+    ) {
+        if should_log_direct_skip(
+            stats,
+            path_label,
+            token_mint,
+            "direct_send_cooldown",
+            estimated_net_profit_pct,
+        ) {
+            tracing::debug!(
+                "跳过直发: 路径={} 币种={} 原因=direct send 冷却中",
+                path_label,
+                token_mint
+            );
+        }
+        return true;
+    }
+
+    let live_send_min_profit_pct = execution_manager.live_send_min_profit_pct();
+    let mut best_simulated: Option<(f64, f64)> = None;
+
+    for trade_size_usdc in execution_probe_trade_sizes_usdc(config, preferred_trade_size_usdc) {
+        stats.tx_build_required += 1;
+        let plan = match build_meteora_meteora_direct_execution_instructions(
+            config,
+            execution_manager,
+            buy_meteora,
+            sell_meteora,
+            token_mint,
+            meteora_bin_arrays,
+            trade_size_usdc,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                stats.tx_build_blocked += 1;
+                tracing::debug!(
+                    "构建 Meteora 到 Meteora 快速交易失败：币种={}，金额=${:.2}，原因={}",
+                    token_mint,
+                    trade_size_usdc,
+                    summarize_block_reason(&error.to_string())
+                );
+                continue;
+            }
+        };
+
+        let atomic_instructions = match maybe_wrap_plan_with_two_hop_executor(
+            execution_manager,
+            config,
+            path_label,
+            trade_size_usdc,
+            &plan,
+        ) {
+            Ok(instructions) => instructions,
+            Err(error) => {
+                stats.tx_build_blocked += 1;
+                tracing::debug!(
+                    "构建链上两腿指令失败：币种={}，金额=${:.2}，原因={}",
+                    token_mint,
+                    trade_size_usdc,
+                    summarize_block_reason(&error.to_string())
+                );
+                continue;
+            }
+        };
+
+        stats.simulation_required += 1;
+        match execution_manager
+            .simulate_instructions_with_accounts(
+                atomic_instructions.clone(),
+                &[plan.net_quote_token_account.to_string()],
+            )
+            .await
+        {
+            Ok((report, accounts)) => {
+                stats.simulation_passed += 1;
+                stats.last_simulation_error = None;
+                let simulated_quote_net_change_raw = simulated_token_account_net_change(
+                    &accounts,
+                    &plan.net_quote_token_account,
+                    plan.net_quote_start_balance,
+                );
+                let simulated_quote_net_change_usdc = simulated_quote_net_change_raw
+                    .and_then(|amount| {
+                        raw_to_usdc_for_mint(
+                            &plan.net_quote_mint,
+                            amount as f64,
+                            &config.tokens.usdc_mint,
+                            &config.tokens.sol_mint,
+                            config.strategy.sol_usdc_price,
+                        )
+                    })
+                    .unwrap_or(f64::NEG_INFINITY);
+                let simulated_effective_net_profit_pct =
+                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                        execution_manager,
+                        config,
+                        trade_size_usdc,
+                        simulated_quote_net_change_usdc,
+                    );
+                let replace = best_simulated
+                    .as_ref()
+                    .map(|(_, current_profit_pct)| {
+                        simulated_effective_net_profit_pct > *current_profit_pct
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    best_simulated = Some((trade_size_usdc, simulated_effective_net_profit_pct));
+                }
+                if passes_direct_execution_gate(simulated_effective_net_profit_pct) {
+                    tracing::debug!(
+                        "Meteora/Meteora 快速路径 原子模拟通过: 币种={} size=${:.2} CU={:?} 模拟收益率={:.2}%",
+                        token_mint,
+                        trade_size_usdc,
+                        report.units_consumed,
+                        simulated_effective_net_profit_pct
+                    );
+                    match send_direct_plan_with_optional_setup_split_and_units(
+                        execution_manager,
+                        config,
+                        "meteora_meteora",
+                        path_label,
+                        token_mint,
+                        trade_size_usdc,
+                        &plan,
+                        report.units_consumed,
+                    )
+                    .await
+                    {
+                        Ok(signature) => {
+                            log_send_success(
+                                "meteora_meteora",
+                                path_label,
+                                token_mint,
+                                &signature,
+                                simulated_effective_net_profit_pct,
+                            );
+                            return true;
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "发送构建失败：路线=Meteora到Meteora，路径={}，币种={}，原因={}",
+                                path_label,
+                                token_mint,
+                                error
+                            );
+                            return false;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                stats.simulation_failed += 1;
+                stats.last_simulation_error = Some(error.to_string());
+                let summarized_error = summarize_simulation_error(&error.to_string());
+                tracing::debug!(
+                    "Meteora 到 Meteora 快速模拟失败：币种={}，金额=${:.2}，原因={}",
+                    token_mint,
+                    trade_size_usdc,
+                    summarized_error
+                );
+                if is_transaction_too_large_error(&error.to_string()) {
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some((best_size, best_profit_pct)) = best_simulated {
+        tracing::debug!(
+            "Meteora/Meteora 快速路径 best simulated result: 币种={} best_size=${:.2} simulated_profit={:.2}% live_min={:.2}%",
+            token_mint,
+            best_size,
+            best_profit_pct,
+            live_send_min_profit_pct
+        );
+        tracing::debug!(
+            "跳过实盘: 路径={} 币种={} 原因={} best_size=${:.2} 模拟收益率={:.2}% 实盘阈值={:.2}%",
+            path_label,
+            token_mint,
+            summarize_live_send_skip_reason("negative_simulated_profit"),
+            best_size,
+            best_profit_pct,
+            live_send_min_profit_pct
+        );
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_meteora_meteora_direct_execution_instructions(
+    config: &Config,
+    execution_manager: &ExecutionManager,
+    buy_meteora: &MeteoraState,
+    sell_meteora: &MeteoraState,
+    token_mint: &str,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    trade_size_usdc: f64,
+) -> Result<SimulationInstructionPlan> {
+    let user = execution_manager
+        .wallet_pubkey()
+        .ok_or_else(|| anyhow::anyhow!("executor wallet is not configured"))?;
+    let quote_mint = buy_meteora
+        .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        .ok_or_else(|| anyhow::anyhow!("buy Meteora quote mint not found"))?;
+    let sell_quote_mint = sell_meteora
+        .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        .ok_or_else(|| anyhow::anyhow!("sell Meteora quote mint not found"))?;
+    if quote_mint != sell_quote_mint {
+        anyhow::bail!(
+            "Meteora/Meteora quote mint mismatch: buy={} sell={}",
+            quote_mint,
+            sell_quote_mint
+        );
+    }
+
+    let max_sol_input_lamports = max_sol_input_lamports_for_trade_size(config, trade_size_usdc)?;
+    let quote_mint_pubkey = Pubkey::from_str(&quote_mint)?;
+    let token_mint_pubkey = Pubkey::from_str(token_mint)?;
+    let quote_token_program = token_program_for_simulation(config, &quote_mint).await?;
+    let token_token_program = token_program_for_simulation(config, token_mint).await?;
+    let ata_specs = vec![
+        (quote_mint_pubkey, quote_token_program),
+        (token_mint_pubkey, token_token_program),
+    ];
+    let mut prepared_atas =
+        existing_associated_token_accounts(&config.rpc.http_url, &user, &ata_specs).await?;
+    let mut instructions = Vec::new();
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &quote_mint_pubkey,
+        &quote_token_program,
+        &mut prepared_atas,
+    )?;
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &token_mint_pubkey,
+        &token_token_program,
+        &mut prepared_atas,
+    )?;
+    let setup_instructions = instructions.clone();
+    let net_quote_token_account =
+        executor::swap::associated_token_address(&user, &quote_mint_pubkey, &quote_token_program)?;
+    let net_quote_start_balance =
+        token_account_balance(&config.rpc.http_url, &net_quote_token_account).await?;
+    let quote_amount_in = ceil_u64(
+        usdc_to_raw_for_mint(
+            &quote_mint,
+            trade_size_usdc,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+        )
+        .ok_or_else(|| anyhow::anyhow!("unsupported Meteora/Meteora quote mint {}", quote_mint))?,
+    );
+    if quote_mint == config.tokens.sol_mint {
+        ensure_simulation_sol_input_within_cap(
+            "direct Meteora/Meteora SOL input",
+            quote_amount_in,
+            max_sol_input_lamports,
+        )?;
+        ensure_existing_associated_token_account_balance(
+            &config.rpc.http_url,
+            &user,
+            &quote_mint_pubkey,
+            &quote_token_program,
+            &mut prepared_atas,
+            quote_amount_in,
+            "pre-wrapped SOL ATA",
+        )
+        .await?;
+    }
+
+    let buy_swap = build_meteora_direct_swap_instruction(
+        config,
+        buy_meteora,
+        &user,
+        &quote_mint,
+        token_mint,
+        quote_amount_in,
+        1,
+        meteora_bin_arrays,
+    )
+    .await?;
+    if buy_swap.user_token_in != net_quote_token_account {
+        anyhow::bail!(
+            "Meteora/Meteora first-leg quote ATA mismatch: expected={} actual={}",
+            net_quote_token_account,
+            buy_swap.user_token_in
+        );
+    }
+
+    let sell_swap = build_meteora_direct_swap_instruction(
+        config,
+        sell_meteora,
+        &user,
+        token_mint,
+        &quote_mint,
+        1,
+        1,
+        meteora_bin_arrays,
+    )
+    .await?;
+    if sell_swap.user_token_out != net_quote_token_account {
+        anyhow::bail!(
+            "Meteora/Meteora second-leg quote ATA mismatch: expected={} actual={}",
+            net_quote_token_account,
+            sell_swap.user_token_out
+        );
+    }
+
+    instructions = setup_instructions.clone();
+    instructions.push(buy_swap.instruction);
+    instructions.push(sell_swap.instruction);
+    let observed_intermediate_token_account = second_leg_input_observed_account(
+        "Meteora Pool->Meteora Pool",
+        token_mint,
+        buy_swap.user_token_out,
+        sell_swap.user_token_in,
+    );
+
+    Ok(SimulationInstructionPlan {
+        atomic_instructions: instructions,
+        fallback_instructions: setup_instructions.clone(),
+        fallback_label: buy_swap.fallback_label,
+        setup_instructions,
+        net_quote_token_account,
+        net_quote_start_balance,
+        net_quote_mint: quote_mint,
+        intermediate_token_account: observed_intermediate_token_account,
+    })
+}
+
+fn meteora_clmm_spot_candidate(
+    config: &Config,
+    meteora: &MeteoraState,
+    raydium: &RaydiumState,
+) -> Option<(MeteoraClmmDirection, f64)> {
+    if raydium.venue != RaydiumVenue::Clmm {
+        return None;
+    }
+    let meteora_token = meteora.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    let raydium_token = strategy::quote::raydium_traded_token(
+        raydium,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+    )?;
+    if meteora_token != raydium_token {
+        return None;
+    }
+    if !meteora_raydium_quote_mints_match(config, meteora, raydium, &meteora_token) {
+        return None;
+    }
+    let meteora_price_usdc = meteora_token_price_usdc(
+        meteora,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let raydium_pool = cp_pool_from_raydium(config, raydium)?;
+    let raydium_spot_in_quote =
+        raydium_pool.quote_reserve as f64 / raydium_pool.token_reserve as f64;
+    let raydium_price_usdc = if raydium_pool.quote_mint == config.tokens.sol_mint {
+        raydium_spot_in_quote * config.strategy.sol_usdc_price
+    } else {
+        raydium_spot_in_quote
+    };
+    if !meteora_price_usdc.is_finite()
+        || !raydium_price_usdc.is_finite()
+        || meteora_price_usdc <= 0.0
+        || raydium_price_usdc <= 0.0
+    {
+        return None;
+    }
+    let high = meteora_price_usdc.max(raydium_price_usdc);
+    let low = meteora_price_usdc.min(raydium_price_usdc);
+    let gross_profit_pct = ((high - low) / low) * 100.0;
+    let estimated_cost_pct =
+        (meteora.fee_bps + raydium.fee_bps + strategy::quote::SLIPPAGE_BUFFER_BPS) / 100.0;
+    let net_profit_pct = gross_profit_pct - estimated_cost_pct;
+    let direction = if meteora_price_usdc < raydium_price_usdc {
+        MeteoraClmmDirection::MeteoraToClmm
+    } else {
+        MeteoraClmmDirection::ClmmToMeteora
+    };
+    Some((direction, net_profit_pct))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_meteora_raydium_direct_execution_instructions(
+    config: &Config,
+    execution_manager: &ExecutionManager,
+    meteora_pool: &MeteoraState,
+    raydium: &RaydiumState,
+    token_mint: &str,
+    direction: MeteoraClmmDirection,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    trade_size_usdc: f64,
+) -> Result<SimulationInstructionPlan> {
+    if raydium.venue != RaydiumVenue::Clmm {
+        anyhow::bail!(
+            "Meteora executable route currently supports Raydium CLMM only; got {}",
+            raydium.venue.label()
+        );
+    }
+
+    let user = execution_manager
+        .wallet_pubkey()
+        .ok_or_else(|| anyhow::anyhow!("executor wallet is not configured"))?;
+    let max_sol_input_lamports = max_sol_input_lamports_for_trade_size(config, trade_size_usdc)?;
+    let quote_mint = meteora_pool
+        .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        .ok_or_else(|| anyhow::anyhow!("Meteora quote mint not found"))?;
+    let raydium_quote_mint = raydium_counter_mint(raydium, token_mint)
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM counter mint not found"))?;
+    if quote_mint != raydium_quote_mint {
+        anyhow::bail!(
+            "Meteora/Raydium quote mint mismatch: meteora={} raydium={}",
+            quote_mint,
+            raydium_quote_mint
+        );
+    }
+
+    let quote_mint_pubkey = Pubkey::from_str(&quote_mint)?;
+    let token_mint_pubkey = Pubkey::from_str(token_mint)?;
+    let quote_token_program = token_program_for_simulation(config, &quote_mint).await?;
+    let token_token_program = token_program_for_simulation(config, token_mint).await?;
+    let ata_specs = vec![
+        (quote_mint_pubkey, quote_token_program),
+        (token_mint_pubkey, token_token_program),
+    ];
+    let mut prepared_atas =
+        existing_associated_token_accounts(&config.rpc.http_url, &user, &ata_specs).await?;
+    let mut instructions = Vec::new();
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &quote_mint_pubkey,
+        &quote_token_program,
+        &mut prepared_atas,
+    )?;
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &token_mint_pubkey,
+        &token_token_program,
+        &mut prepared_atas,
+    )?;
+    let net_quote_token_account =
+        executor::swap::associated_token_address(&user, &quote_mint_pubkey, &quote_token_program)?;
+    let net_quote_start_balance =
+        token_account_balance(&config.rpc.http_url, &net_quote_token_account).await?;
+    let quote_amount_in = ceil_u64(
+        usdc_to_raw_for_mint(
+            &quote_mint,
+            trade_size_usdc,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+        )
+        .ok_or_else(|| anyhow::anyhow!("unsupported route quote mint {}", quote_mint))?,
+    );
+    if quote_mint == config.tokens.sol_mint {
+        ensure_simulation_sol_input_within_cap(
+            "direct Meteora/Raydium SOL input",
+            quote_amount_in,
+            max_sol_input_lamports,
+        )?;
+        prepare_wrapped_sol_input(
+            &config.rpc.http_url,
+            &user,
+            &quote_mint_pubkey,
+            &quote_token_program,
+            &mut prepared_atas,
+            &mut instructions,
+            quote_amount_in,
+        )
+        .await?;
+    }
+    let use_meteora_bitmap_extension = maybe_prepare_meteora_bitmap_extension_setup(
+        config,
+        meteora_pool,
+        &user,
+        &mut instructions,
+    )
+    .await?;
+    let setup_instructions = instructions.clone();
+
+    match direction {
+        MeteoraClmmDirection::MeteoraToClmm => {
+            let meteora_remaining_arrays =
+                meteora_swap_remaining_bin_arrays_for_exact_input_execution_async(
+                    config,
+                    meteora_pool,
+                    meteora_bin_arrays,
+                    &quote_mint,
+                    token_mint,
+                    quote_amount_in,
+                )
+                .await?;
+            let meteora_accounts =
+                executor::swap::derive_meteora_dlmm_accounts_with_token_programs(
+                    meteora_pool,
+                    &user,
+                    &quote_mint,
+                    &quote_token_program,
+                    &token_token_program,
+                    use_meteora_bitmap_extension,
+                )?;
+            let estimated_raydium_input_amount = estimated_meteora_exact_input_output_amount(
+                meteora_pool,
+                meteora_bin_arrays,
+                &quote_mint,
+                token_mint,
+                quote_amount_in,
+            )
+            .unwrap_or(1);
+            let raydium_route = match raydium_clmm_quote_swap_v2_route_for_mints(
+                raydium,
+                raydium_clmm_tick_arrays,
+                token_mint,
+                &quote_mint,
+                estimated_raydium_input_amount,
+            ) {
+                Ok(route) => RaydiumClmmSwapV2Route {
+                    zero_for_one: route.zero_for_one,
+                    sqrt_price_limit_x64: route.sqrt_price_limit_x64,
+                    first_tick_array: route.first_tick_array,
+                    remaining_tick_arrays: route.remaining_tick_arrays,
+                },
+                Err(error) => {
+                    tracing::debug!(
+                        "Raydium CLMM touched-array route unavailable; using derived window: 池={} 币种={} amount={} 原因={}",
+                        raydium.pool_address,
+                        token_mint,
+                        estimated_raydium_input_amount,
+                        error
+                    );
+                    raydium_clmm_swap_v2_route_for_mints(
+                        raydium,
+                        token_mint,
+                        &quote_mint,
+                        raydium_execution_tick_array_count(&raydium.pool_address),
+                    )?
+                }
+            };
+            let raydium_accounts =
+                executor::swap::derive_raydium_clmm_exact_input_accounts_with_token_programs(
+                    raydium,
+                    &user,
+                    token_mint,
+                    &quote_mint,
+                    &token_token_program,
+                    &quote_token_program,
+                    &raydium_route.first_tick_array.to_string(),
+                )?;
+            if raydium_accounts.output_token_account != net_quote_token_account {
+                anyhow::bail!(
+                    "Meteora->CLMM quote ATA mismatch: meteora quote ATA={} raydium output ATA={}",
+                    net_quote_token_account,
+                    raydium_accounts.output_token_account
+                );
+            }
+            let remaining_tick_arrays = raydium_route.remaining_tick_arrays.clone();
+            let bitmap_extension = Pubkey::from_str(
+                &raydium_clmm::derive_tickarray_bitmap_extension_address(&raydium.pool_address)?,
+            )?;
+
+            instructions = setup_instructions.clone();
+            instructions.push(executor::swap::build_meteora_dlmm_swap_v2(
+                &meteora_accounts.swap_v2_accounts(),
+                &meteora_remaining_arrays
+                    .iter()
+                    .map(|(_, pubkey)| *pubkey)
+                    .collect::<Vec<_>>(),
+                quote_amount_in,
+                1,
+            )?);
+            instructions.push(
+                executor::swap::build_raydium_clmm_swap_v2_with_bitmap_extension_and_remaining_tick_arrays(
+                    &raydium_accounts.swap_v2_accounts(),
+                    &bitmap_extension,
+                    &remaining_tick_arrays,
+                    1,
+                    1,
+                    raydium_route.sqrt_price_limit_x64,
+                    RAYDIUM_CLMM_EXACT_INPUT,
+                )?,
+            );
+            let observed_intermediate_token_account = second_leg_input_observed_account(
+                "Meteora DLMM->Raydium CLMM",
+                token_mint,
+                meteora_accounts.user_token_out,
+                raydium_accounts.input_token_account,
+            );
+
+            Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions: setup_instructions.clone(),
+                fallback_label: "Meteora DLMM swap",
+                setup_instructions,
+                net_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: quote_mint.to_string(),
+                intermediate_token_account: observed_intermediate_token_account,
+            })
+        }
+        MeteoraClmmDirection::ClmmToMeteora => {
+            let raydium_route = raydium_clmm_quote_swap_v2_route_for_mints(
+                raydium,
+                raydium_clmm_tick_arrays,
+                &quote_mint,
+                token_mint,
+                quote_amount_in,
+            )?;
+            let raydium_accounts =
+                executor::swap::derive_raydium_clmm_exact_input_accounts_with_token_programs(
+                    raydium,
+                    &user,
+                    &quote_mint,
+                    token_mint,
+                    &quote_token_program,
+                    &token_token_program,
+                    &raydium_route.first_tick_array.to_string(),
+                )?;
+            let remaining_tick_arrays = raydium_route.remaining_tick_arrays.clone();
+            let bitmap_extension = Pubkey::from_str(
+                &raydium_clmm::derive_tickarray_bitmap_extension_address(&raydium.pool_address)?,
+            )?;
+            let meteora_remaining_arrays = meteora_swap_remaining_bin_arrays_for_execution_async(
+                config,
+                meteora_pool,
+                meteora_bin_arrays,
+                token_mint,
+                &quote_mint,
+            )
+            .await?;
+            let meteora_accounts =
+                executor::swap::derive_meteora_dlmm_accounts_with_token_programs(
+                    meteora_pool,
+                    &user,
+                    token_mint,
+                    &token_token_program,
+                    &quote_token_program,
+                    use_meteora_bitmap_extension,
+                )?;
+            if meteora_accounts.user_token_out != net_quote_token_account {
+                anyhow::bail!(
+                    "CLMM->Meteora quote ATA mismatch: meteora output ATA={} expected quote ATA={}",
+                    meteora_accounts.user_token_out,
+                    net_quote_token_account
+                );
+            }
+
+            instructions = setup_instructions.clone();
+            instructions.push(
+                executor::swap::build_raydium_clmm_swap_v2_with_bitmap_extension_and_remaining_tick_arrays(
+                    &raydium_accounts.swap_v2_accounts(),
+                    &bitmap_extension,
+                    &remaining_tick_arrays,
+                    quote_amount_in,
+                    1,
+                    raydium_route.sqrt_price_limit_x64,
+                    RAYDIUM_CLMM_EXACT_INPUT,
+                )?,
+            );
+            instructions.push(executor::swap::build_meteora_dlmm_swap_v2(
+                &meteora_accounts.swap_v2_accounts(),
+                &meteora_remaining_arrays
+                    .iter()
+                    .map(|(_, pubkey)| *pubkey)
+                    .collect::<Vec<_>>(),
+                1,
+                1,
+            )?);
+            let observed_intermediate_token_account = second_leg_input_observed_account(
+                "Raydium CLMM->Meteora DLMM",
+                token_mint,
+                raydium_accounts.output_token_account,
+                meteora_accounts.user_token_in,
+            );
+
+            Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions: setup_instructions.clone(),
+                fallback_label: "Raydium CLMM swap",
+                setup_instructions,
+                net_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: quote_mint.to_string(),
+                intermediate_token_account: observed_intermediate_token_account,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_pumpswap_clmm_direct_execution_instructions(
+    config: &Config,
+    execution_manager: &ExecutionManager,
+    pumpswap: &PumpSwapState,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+    direction: ClmmSpotDirection,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    trade_size_usdc: f64,
+) -> Result<SimulationInstructionPlan> {
+    if !pumpswap_clmm_execution_direction_enabled(direction) {
+        anyhow::bail!(
+            "PumpSwap/Raydium CLMM reverse direction disabled: {}",
+            pumpswap_clmm_direction_label(direction)
+        );
+    }
+    if pumpswap.base_mint != pumpswap_pool.token_mint
+        || pumpswap.quote_mint != pumpswap_pool.quote_mint
+    {
+        anyhow::bail!(
+            "Pump AMM direct execution supports base=token quote=SOL/USDC pools only; pool base={} quote={} normalized 币种={} quote={}",
+            pumpswap.base_mint,
+            pumpswap.quote_mint,
+            pumpswap_pool.token_mint,
+            pumpswap_pool.quote_mint
+        );
+    }
+
+    let user = execution_manager
+        .wallet_pubkey()
+        .ok_or_else(|| anyhow::anyhow!("executor wallet is not configured"))?;
+    let protocol_fee_recipient = Pubkey::from_str(
+        pumpswap_protocol_fee_recipient
+            .ok_or_else(|| anyhow::anyhow!("missing Pump AMM protocol_fee_recipient"))?,
+    )?;
+    let base_token_program = token_program_for_simulation(config, &pumpswap.base_mint).await?;
+    let quote_token_program = token_program_for_simulation(config, &pumpswap.quote_mint).await?;
+    let base_mint = Pubkey::from_str(&pumpswap.base_mint)?;
+    let quote_mint = Pubkey::from_str(&pumpswap.quote_mint)?;
+    let max_sol_input_lamports = max_sol_input_lamports_for_trade_size(config, trade_size_usdc)?;
+    let pump_accounts = executor::swap::derive_pump_amm_accounts_with_token_programs(
+        pumpswap,
+        &user,
+        &protocol_fee_recipient,
+        &base_token_program,
+        &quote_token_program,
+    )?;
+    let net_quote_start_balance = token_account_balance(
+        &config.rpc.http_url,
+        &pump_accounts.user_quote_token_account,
+    )
+    .await?;
+    let mut ata_specs = vec![
+        (base_mint, base_token_program),
+        (quote_mint, quote_token_program),
+    ];
+    if let Some(clmm_input_mint) = raydium_counter_mint(raydium, raydium_token) {
+        ata_specs.push((
+            Pubkey::from_str(clmm_input_mint)?,
+            token_program_for_simulation(config, clmm_input_mint).await?,
+        ));
+    }
+    let mut prepared_atas =
+        existing_associated_token_accounts(&config.rpc.http_url, &user, &ata_specs).await?;
+    let mut instructions = Vec::new();
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &base_mint,
+        &base_token_program,
+        &mut prepared_atas,
+    )?;
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &quote_mint,
+        &quote_token_program,
+        &mut prepared_atas,
+    )?;
+    let setup_instructions = instructions.clone();
+    let remaining_tick_arrays;
+    let bitmap_extension = Pubkey::from_str(
+        &raydium_clmm::derive_tickarray_bitmap_extension_address(&raydium.pool_address)?,
+    )?;
+
+    match direction {
+        ClmmSpotDirection::PumpSwapToClmm => {
+            let raydium_input_token_program =
+                token_program_for_simulation(config, raydium_token).await?;
+            let raydium_output_mint = raydium_counter_mint(raydium, raydium_token)
+                .ok_or_else(|| anyhow::anyhow!("Raydium CLMM counter mint not found"))?;
+            if raydium_output_mint != pumpswap.quote_mint {
+                anyhow::bail!(
+                    "PumpSwap->CLMM round-trip quote mint mismatch: pump quote={} raydium output={}",
+                    pumpswap.quote_mint,
+                    raydium_output_mint
+                );
+            }
+            if raydium_output_mint != config.tokens.sol_mint {
+                anyhow::bail!(
+                    "PumpSwap->Raydium CLMM currently only supports token->WSOL second leg; output={}",
+                    raydium_output_mint
+                );
+            }
+            let raydium_output_token_program =
+                token_program_for_simulation(config, raydium_output_mint).await?;
+            let pool_tick_arrays =
+                raydium_clmm_tick_array_refs_for_pool(raydium, raydium_clmm_tick_arrays);
+            let best_input = calculate_best_pump_to_raydium_input(
+                config,
+                pumpswap_pool,
+                raydium,
+                raydium_token,
+                &pool_tick_arrays,
+                max_sol_input_lamports,
+            )?;
+            let pump_max_quote_amount_in =
+                pump_buy_max_quote_amount_in(best_input.pump_quote_in_lamports);
+            let mut branch_setup_instructions = setup_instructions.clone();
+            if pumpswap.quote_mint == config.tokens.sol_mint {
+                ensure_simulation_sol_input_within_cap(
+                    "direct PumpSwap->CLMM SOL input",
+                    pump_max_quote_amount_in,
+                    max_sol_input_lamports,
+                )?;
+                prepare_wrapped_sol_input(
+                    &config.rpc.http_url,
+                    &user,
+                    &quote_mint,
+                    &quote_token_program,
+                    &mut prepared_atas,
+                    &mut branch_setup_instructions,
+                    pump_max_quote_amount_in,
+                )
+                .await?;
+            }
+            let mut pump_buy_instruction = executor::swap::build_pump_amm_buy(
+                &pump_accounts.buy_exact_quote_in_accounts(),
+                best_input.expected_pump_token_out,
+                pump_max_quote_amount_in,
+                false,
+            )?;
+            pump_buy_instruction
+                .accounts
+                .extend(pump_amm_buy_remaining_accounts(
+                    config,
+                    pumpswap,
+                    &pump_accounts,
+                )?);
+
+            instructions = branch_setup_instructions.clone();
+            instructions.push(pump_buy_instruction);
+            let raydium_route = raydium_clmm_quote_swap_v2_route_for_mints(
+                raydium,
+                raydium_clmm_tick_arrays,
+                raydium_token,
+                raydium_output_mint,
+                best_input.raydium_token_in,
+            )?;
+            remaining_tick_arrays = raydium_route.remaining_tick_arrays.clone();
+            let raydium_accounts =
+                executor::swap::derive_raydium_clmm_exact_input_accounts_with_token_programs(
+                    raydium,
+                    &user,
+                    raydium_token,
+                    raydium_output_mint,
+                    &raydium_input_token_program,
+                    &raydium_output_token_program,
+                    &raydium_route.first_tick_array.to_string(),
+                )?;
+            if raydium_accounts.output_token_account != pump_accounts.user_quote_token_account {
+                anyhow::bail!(
+                    "PumpSwap->CLMM round-trip quote ATA mismatch: pump quote ATA={} raydium output ATA={}",
+                    pump_accounts.user_quote_token_account,
+                    raydium_accounts.output_token_account
+                );
+            }
+            log_raydium_clmm_swap_v2_wiring(
+                "PumpSwap->Raydium CLMM",
+                raydium_token,
+                raydium,
+                &raydium_accounts,
+                raydium_route.zero_for_one,
+                raydium_route.sqrt_price_limit_x64,
+                &remaining_tick_arrays,
+                best_input.raydium_token_in,
+                best_input.min_raydium_wsol_out,
+            );
+            tracing::debug!(
+                "Pump 到 Raydium 执行数量：币种={}，Pump付款={}，Pump最大付款={}，Pump产出={}，Raydium输入={}，Raydium最小回款={}，Raydium预计回款={}",
+                raydium_token,
+                best_input.pump_quote_in_lamports,
+                pump_max_quote_amount_in,
+                best_input.expected_pump_token_out,
+                best_input.raydium_token_in,
+                best_input.min_raydium_wsol_out,
+                raydium_route.expected_output
+            );
+            instructions.push(
+                executor::swap::build_raydium_clmm_swap_v2_with_remaining_tick_arrays(
+                    &raydium_accounts.swap_v2_accounts(),
+                    &remaining_tick_arrays,
+                    best_input.raydium_token_in,
+                    best_input.min_raydium_wsol_out,
+                    raydium_route.sqrt_price_limit_x64,
+                    RAYDIUM_CLMM_EXACT_INPUT,
+                )?,
+            );
+
+            Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions: branch_setup_instructions.clone(),
+                fallback_label: "Pump AMM buy",
+                setup_instructions: branch_setup_instructions,
+                net_quote_token_account: pump_accounts.user_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: pumpswap.quote_mint.clone(),
+                intermediate_token_account: pump_accounts.user_base_token_account,
+            })
+        }
+        ClmmSpotDirection::ClmmToPumpSwap => {
+            let clmm_input_mint = raydium_counter_mint(raydium, raydium_token)
+                .ok_or_else(|| anyhow::anyhow!("Raydium CLMM counter mint not found"))?;
+            if clmm_input_mint != pumpswap.quote_mint {
+                anyhow::bail!(
+                    "CLMM->PumpSwap round-trip quote mint mismatch: CLMM input={} PumpSwap quote={}",
+                    clmm_input_mint,
+                    pumpswap.quote_mint
+                );
+            }
+            let clmm_input_pubkey = Pubkey::from_str(clmm_input_mint)?;
+            let clmm_input_program = token_program_for_simulation(config, clmm_input_mint).await?;
+            push_ata_setup(
+                &mut instructions,
+                &user,
+                &clmm_input_pubkey,
+                &clmm_input_program,
+                &mut prepared_atas,
+            )?;
+            let pool_tick_arrays =
+                raydium_clmm_tick_array_refs_for_pool(raydium, raydium_clmm_tick_arrays);
+            let reverse_quote = preflight_clmm_buy_pumpswap_sell(
+                config,
+                pumpswap_pool,
+                raydium,
+                raydium_token,
+                &pool_tick_arrays,
+                trade_size_usdc,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Raydium->Pump preflight quote failed for direct execution: {:?}",
+                    error
+                )
+            })?;
+            let quote_amount_in = reverse_quote.clmm_amount_in;
+            if clmm_input_mint == config.tokens.sol_mint {
+                ensure_simulation_sol_input_within_cap(
+                    "direct CLMM->PumpSwap SOL input",
+                    quote_amount_in,
+                    max_sol_input_lamports,
+                )?;
+                prepare_wrapped_sol_input(
+                    &config.rpc.http_url,
+                    &user,
+                    &clmm_input_pubkey,
+                    &clmm_input_program,
+                    &mut prepared_atas,
+                    &mut instructions,
+                    quote_amount_in,
+                )
+                .await?;
+            }
+            let raydium_output_token_program =
+                token_program_for_simulation(config, raydium_token).await?;
+            let raydium_route = raydium_clmm_quote_swap_v2_route_for_mints(
+                raydium,
+                raydium_clmm_tick_arrays,
+                clmm_input_mint,
+                raydium_token,
+                quote_amount_in,
+            )?;
+            let raydium_accounts =
+                executor::swap::derive_raydium_clmm_exact_input_accounts_with_token_programs(
+                    raydium,
+                    &user,
+                    clmm_input_mint,
+                    raydium_token,
+                    &clmm_input_program,
+                    &raydium_output_token_program,
+                    &raydium_route.first_tick_array.to_string(),
+                )?;
+            if raydium_accounts.input_token_account != pump_accounts.user_quote_token_account {
+                anyhow::bail!(
+                    "CLMM->PumpSwap round-trip quote ATA mismatch: CLMM input ATA={} PumpSwap quote ATA={}",
+                    raydium_accounts.input_token_account,
+                    pump_accounts.user_quote_token_account
+                );
+            }
+            remaining_tick_arrays = raydium_route.remaining_tick_arrays.clone();
+            let token_amount_to_sell = reverse_quote.min_clmm_amount_out.max(1);
+            let min_pumpswap_quote_out = ensure_raydium_pumpswap_profit_guard(
+                config,
+                raydium_token,
+                clmm_input_mint,
+                quote_amount_in,
+                reverse_quote.min_pumpswap_quote_out,
+            )?;
+            let mut pump_sell_instruction = executor::swap::build_pump_amm_sell(
+                &pump_accounts.sell_accounts(),
+                token_amount_to_sell,
+                min_pumpswap_quote_out,
+            )?;
+            pump_sell_instruction
+                .accounts
+                .extend(pump_amm_sell_remaining_accounts(
+                    config,
+                    pumpswap,
+                    &pump_accounts,
+                )?);
+
+            let setup_instructions = instructions.clone();
+            log_raydium_clmm_swap_v2_wiring(
+                "Raydium CLMM->PumpSwap",
+                raydium_token,
+                raydium,
+                &raydium_accounts,
+                raydium_route.zero_for_one,
+                raydium_route.sqrt_price_limit_x64,
+                &remaining_tick_arrays,
+                quote_amount_in,
+                token_amount_to_sell,
+            );
+            tracing::debug!(
+                "Raydium 到 Pump 执行数量：币种={}，Raydium付款={}，Raydium预计产出={}，Raydium最小产出={}，Pump卖出数量={}，Pump最小回款={}，Pump预计回款={}",
+                raydium_token,
+                quote_amount_in,
+                raydium_route.expected_output,
+                reverse_quote.min_clmm_amount_out,
+                token_amount_to_sell,
+                min_pumpswap_quote_out,
+                reverse_quote.min_pumpswap_quote_out
+            );
+            instructions.push(
+                executor::swap::build_raydium_clmm_swap_v2_with_bitmap_extension_and_remaining_tick_arrays(
+                    &raydium_accounts.swap_v2_accounts(),
+                    &bitmap_extension,
+                    &remaining_tick_arrays,
+                    quote_amount_in,
+                    token_amount_to_sell,
+                    raydium_route.sqrt_price_limit_x64,
+                    RAYDIUM_CLMM_EXACT_INPUT,
+                )?,
+            );
+            instructions.push(pump_sell_instruction);
+
+            Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions: setup_instructions.clone(),
+                fallback_label: "Raydium CLMM swap",
+                setup_instructions,
+                net_quote_token_account: pump_accounts.user_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: pumpswap.quote_mint.clone(),
+                intermediate_token_account: raydium_accounts.output_token_account,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn preflight_meteora_raydium(
+    execution_manager: Option<&ExecutionManager>,
+    config: &Config,
+    meteora: &MeteoraState,
+    raydium: &RaydiumState,
+    token_mint: &str,
+    buy_venue: &str,
+    sell_venue: &str,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    stats: &mut RuntimeStats,
+) {
+    let pool_bin_arrays: Vec<&meteora::MeteoraBinArrayState> = meteora_bin_arrays
+        .values()
+        .filter(|array| array.lb_pair == meteora.pool_address)
+        .collect();
+
+    if let Some(block) =
+        meteora_raydium_executable_block_reason(config, meteora, raydium, token_mint).await
+    {
+        log_preflight_blocked(
+            stats,
+            "meteora_exact",
+            token_mint,
+            buy_venue,
+            sell_venue,
+            block.reason_key,
+            &block.reason,
+        );
+        return;
+    }
+
+    if pool_bin_arrays.is_empty() && !meteora.is_damm_v2() {
+        log_preflight_blocked(
+            stats,
+            "meteora_exact",
+            token_mint,
+            buy_venue,
+            sell_venue,
+            "missing_bin_arrays",
+            "missing Meteora bin arrays for the selected pool",
+        );
+        return;
+    }
+
+    let mut exact_quote_found = false;
+    let mut threshold_passed = false;
+    for trade_size_usdc in effective_trade_sizes_usdc(execution_manager, config) {
+        let exact = if buy_venue == "Meteora" && sell_venue == raydium.venue.label() {
+            quote_meteora_buy_raydium_sell(
+                config,
+                meteora,
+                raydium,
+                token_mint,
+                &pool_bin_arrays,
+                raydium_clmm_tick_arrays,
+                trade_size_usdc,
+            )
+        } else if buy_venue == raydium.venue.label() && sell_venue == "Meteora" {
+            quote_raydium_buy_meteora_sell(
+                config,
+                meteora,
+                raydium,
+                token_mint,
+                &pool_bin_arrays,
+                raydium_clmm_tick_arrays,
+                trade_size_usdc,
+            )
+        } else {
+            None
+        };
+
+        let Some(exact) = exact else {
+            continue;
+        };
+        exact_quote_found = true;
+
+        let gate_profit_pct = execution_manager
+            .map(|manager| {
+                direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                    manager,
+                    config,
+                    trade_size_usdc,
+                    exact.gross_profit_usdc,
+                )
+            })
+            .unwrap_or(exact.net_profit_pct);
+        let threshold_pass = execution_manager
+            .map(|_| passes_direct_execution_gate(gate_profit_pct))
+            .unwrap_or_else(|| {
+                passes_active_offchain_profit_threshold(
+                    exact.net_profit_pct,
+                    execution_manager,
+                    config,
+                )
+            });
+        if !threshold_pass {
+            stats.rejected_below_threshold += 1;
+            continue;
+        }
+
+        threshold_passed = true;
+        stats.exact_quote_passed += 1;
+        record_route_snapshot(
+            stats,
+            RouteSnapshot {
+                token_mint: token_mint.to_string(),
+                buy_venue: buy_venue.to_string(),
+                sell_venue: sell_venue.to_string(),
+                buy_price_usdc: trade_size_usdc / exact.token_amount,
+                sell_price_usdc: exact.final_amount_usdc / exact.token_amount,
+                gross_profit_pct: exact.gross_profit_pct,
+                net_profit_pct: exact.net_profit_pct,
+                route_kind: "meteora_exact",
+            },
+        );
+
+        let candidate_key = format!(
+            "meteora_exact:{}:{}:{}",
+            token_mint, meteora.pool_address, raydium.pool_address
+        );
+        if should_log_candidate_key(stats, candidate_key, exact.net_profit_pct) {
+            tracing::debug!(
+                "Meteora/Raydium exact preflight passed: {} -> {} 币种={} size=${:.2} final=${:.4} net=${:.4} ({:.2}%) gate={:.2}%",
+                buy_venue,
+                sell_venue,
+                token_mint,
+                trade_size_usdc,
+                exact.final_amount_usdc,
+                exact.net_profit_usdc,
+                exact.net_profit_pct,
+                gate_profit_pct
+            );
+        }
+        let simulated = if let Some(execution_manager) = execution_manager {
+            maybe_simulate_meteora_raydium(
+                execution_manager,
+                config,
+                meteora,
+                raydium,
+                token_mint,
+                meteora_bin_arrays,
+                raydium_clmm_tick_arrays,
+                &exact,
+                trade_size_usdc,
+                if buy_venue == "Meteora" {
+                    MeteoraClmmDirection::MeteoraToClmm
+                } else {
+                    MeteoraClmmDirection::ClmmToMeteora
+                },
+                stats,
+            )
+            .await
+        } else {
+            false
+        };
+        if !simulated {
+            record_tx_build_blocked(
+                stats,
+                "meteora_exact",
+                token_mint,
+                buy_venue,
+                sell_venue,
+                "Meteora/Raydium executable path failed to build or simulate",
+            );
+        }
+    }
+
+    if !exact_quote_found {
+        log_preflight_blocked(
+            stats,
+            "meteora_exact",
+            token_mint,
+            buy_venue,
+            sell_venue,
+            "quote_unavailable",
+            "exact quote unavailable with current Meteora bins / Raydium pool state",
+        );
+    } else if !threshold_passed {
+        log_preflight_blocked(
+            stats,
+            "meteora_exact",
+            token_mint,
+            buy_venue,
+            sell_venue,
+            "below_threshold",
+            &format!(
+                "exact quote stayed below min_profit_threshold ({:.2}%) after fees/slippage",
+                active_offchain_profit_threshold_pct(execution_manager, config)
+            ),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn maybe_simulate_meteora_raydium(
+        execution_manager: &ExecutionManager,
+        config: &Config,
+        meteora: &MeteoraState,
+        raydium: &RaydiumState,
+        token_mint: &str,
+        meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+        raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+        quote: &ExactPreflightQuote,
+        trade_size_usdc: f64,
+        direction: MeteoraClmmDirection,
+        stats: &mut RuntimeStats,
+    ) -> bool {
+        if !execution_pre_send_simulation_enabled(execution_manager) {
+            return maybe_send_meteora_raydium_direct_with_trade_size(
+                execution_manager,
+                config,
+                meteora,
+                raydium,
+                token_mint,
+                direction,
+                meteora_bin_arrays,
+                raydium_clmm_tick_arrays,
+                trade_size_usdc,
+                quote.net_profit_pct,
+                stats,
+            )
+            .await;
+        }
+
+        let net_profit_pct = quote.net_profit_pct;
+        let live_send_min_profit_pct = execution_manager.live_send_min_profit_pct();
+        let jito_tip_usdc = (execution_manager.jito_tip_lamports() as f64 / 1_000_000_000.0)
+            * config.strategy.sol_usdc_price;
+        let quoted_effective_net_profit_pct =
+            ((quote.net_profit_usdc - jito_tip_usdc) / trade_size_usdc) * 100.0;
+        let path_label = match direction {
+            MeteoraClmmDirection::MeteoraToClmm => "Meteora DLMM->Raydium CLMM",
+            MeteoraClmmDirection::ClmmToMeteora => "Raydium CLMM->Meteora DLMM",
+        };
+        let key = format!(
+            "simulate:meteora_clmm:{}:{}:{:.2}",
+            raydium.pool_address, path_label, trade_size_usdc
+        );
+        if !should_attempt_candidate_key(stats, key, net_profit_pct) {
+            return true;
+        }
+
+        stats.tx_build_required += 1;
+        let plan = match build_meteora_raydium_simulation_instructions(
+            config,
+            execution_manager,
+            meteora,
+            raydium,
+            token_mint,
+            direction,
+            meteora_bin_arrays,
+            raydium_clmm_tick_arrays,
+            quote,
+            trade_size_usdc,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                stats.tx_build_blocked += 1;
+                tracing::debug!(
+                    "构建 Meteora 到 Raydium 原子交易失败：路径={}，币种={}，原因={}",
+                    path_label,
+                    token_mint,
+                    summarize_block_reason(&error.to_string())
+                );
+                return false;
+            }
+        };
+
+        let atomic_instructions = match maybe_wrap_plan_with_two_hop_executor(
+            execution_manager,
+            config,
+            path_label,
+            trade_size_usdc,
+            &plan,
+        ) {
+            Ok(instructions) => instructions,
+            Err(error) => {
+                stats.tx_build_blocked += 1;
+                tracing::debug!(
+                    "构建链上两腿指令失败：路径={}，币种={}，原因={}",
+                    path_label,
+                    token_mint,
+                    summarize_block_reason(&error.to_string())
+                );
+                return false;
+            }
+        };
+
+        stats.simulation_required += 1;
+        match execution_manager
+            .simulate_instructions_with_accounts(
+                atomic_instructions.clone(),
+                &[plan.net_quote_token_account.to_string()],
+            )
+            .await
+        {
+            Ok((report, accounts)) => {
+                stats.simulation_passed += 1;
+                stats.last_simulation_error = None;
+                let simulated_quote_net_change_raw = simulated_token_account_net_change(
+                    &accounts,
+                    &plan.net_quote_token_account,
+                    plan.net_quote_start_balance,
+                );
+                let simulated_quote_net_change_usdc = simulated_quote_net_change_raw
+                    .and_then(|amount| {
+                        raw_to_usdc_for_mint(
+                            &plan.net_quote_mint,
+                            amount as f64,
+                            &config.tokens.usdc_mint,
+                            &config.tokens.sol_mint,
+                            config.strategy.sol_usdc_price,
+                        )
+                    })
+                    .unwrap_or(f64::NEG_INFINITY);
+                let simulated_effective_net_profit_pct =
+                    direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                        execution_manager,
+                        config,
+                        trade_size_usdc,
+                        simulated_quote_net_change_usdc,
+                    );
+                let live_send_eligible =
+                    passes_direct_execution_gate(simulated_effective_net_profit_pct);
+                tracing::debug!(
+                "Meteora/Raydium 原子模拟通过: 路径={} 币种={} CU={:?} 预估收益率={:.2}% 模拟净变化={:?} 模拟收益率={:.2}% 交易数据={}",
+                path_label,
+                token_mint,
+                report.units_consumed,
+                quoted_effective_net_profit_pct,
+                simulated_quote_net_change_raw,
+                simulated_effective_net_profit_pct,
+                report.transaction_base64.as_deref().unwrap_or("<missing>")
+                );
+                let live_send_enabled = execution_manager.live_send_enabled();
+                if live_send_enabled && live_send_eligible {
+                    match send_direct_plan_with_optional_setup_split_and_units(
+                        execution_manager,
+                        config,
+                        "meteora_clmm",
+                        path_label,
+                        token_mint,
+                        trade_size_usdc,
+                        &plan,
+                        report.units_consumed,
+                    )
+                    .await
+                    {
+                        Ok(bundle_id) => {
+                            log_send_success(
+                                "meteora_clmm",
+                                path_label,
+                                token_mint,
+                                &bundle_id,
+                                simulated_effective_net_profit_pct,
+                            );
+                        }
+                        Err(send_error) => {
+                            let error_text = send_error.to_string();
+                            let reduced_raydium = maybe_reduce_raydium_execution_tick_arrays(
+                                raydium,
+                                "meteora_clmm",
+                                path_label,
+                                token_mint,
+                                &error_text,
+                            );
+                            let reduced_meteora = if should_reduce_meteora_execution_bin_arrays(
+                                &error_text,
+                            ) {
+                                reduce_meteora_execution_bin_array_count(&meteora.pool_address)
+                                    .map(|(current, next)| {
+                                        tracing::debug!(
+                                            "收缩 Meteora 执行窗口：路线=Meteora到Raydium，路径={}，币种={}，池={}，原因=交易过大，{}到{}",
+                                            path_label,
+                                            token_mint,
+                                            meteora.pool_address,
+                                            current,
+                                            next
+                                        );
+                                    })
+                                    .is_some()
+                            } else {
+                                false
+                            };
+                            if !reduced_raydium && !reduced_meteora {
+                                maybe_bump_meteora_execution_bin_arrays(
+                                    meteora,
+                                    "meteora_clmm",
+                                    path_label,
+                                    token_mint,
+                                    &error_text,
+                                );
+                            }
+                            tracing::debug!(
+                                "实盘发送失败：路线=Meteora到Raydium，路径={}，币种={}，原因={}",
+                                path_label,
+                                token_mint,
+                                send_error
+                            );
+                        }
+                    }
+                } else {
+                    let reason = if !live_send_enabled {
+                        "live_send_disabled"
+                    } else {
+                        "negative_simulated_profit"
+                    };
+                    tracing::debug!(
+                    "跳过实盘: 路径={} 币种={} 原因={} 预估收益率={:.2}% 模拟收益率={:.2}% 实盘阈值={:.2}%",
+                    path_label,
+                    token_mint,
+                    summarize_live_send_skip_reason(reason),
+                    quoted_effective_net_profit_pct,
+                    simulated_effective_net_profit_pct,
+                    live_send_min_profit_pct
+                );
+                }
+                true
+            }
+            Err(error) => {
+                stats.simulation_failed += 1;
+                stats.last_simulation_error = Some(error.to_string());
+                let error_text = error.to_string();
+                if is_setup_split_send_error(&error_text) {
+                    maybe_reduce_raydium_execution_tick_arrays(
+                        raydium,
+                        "meteora_clmm",
+                        path_label,
+                        token_mint,
+                        &error_text,
+                    );
+                    if should_reduce_meteora_execution_bin_arrays(&error_text) {
+                        if let Some((current, next)) =
+                            reduce_meteora_execution_bin_array_count(&meteora.pool_address)
+                        {
+                            tracing::debug!(
+                                "收缩 Meteora 执行窗口：路线=Meteora到Raydium，路径={}，币种={}，池={}，原因=模拟交易过大，{}到{}",
+                                path_label,
+                                token_mint,
+                                meteora.pool_address,
+                                current,
+                                next
+                            );
+                        }
+                    }
+                } else if should_expand_meteora_execution_bin_arrays(&error_text) {
+                    maybe_bump_meteora_execution_bin_arrays(
+                        meteora,
+                        "meteora_clmm",
+                        path_label,
+                        token_mint,
+                        &error_text,
+                    );
+                }
+                tracing::debug!(
+                    "Meteora 到 Raydium 原子模拟失败：路径={}，币种={}，原因={}",
+                    path_label,
+                    token_mint,
+                    summarize_simulation_error(&error_text)
+                );
+                false
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_meteora_raydium_simulation_instructions(
+        config: &Config,
+        execution_manager: &ExecutionManager,
+        meteora_pool: &MeteoraState,
+        raydium: &RaydiumState,
+        token_mint: &str,
+        direction: MeteoraClmmDirection,
+        meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+        raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+        quote: &ExactPreflightQuote,
+        trade_size_usdc: f64,
+    ) -> Result<SimulationInstructionPlan> {
+        if raydium.venue != RaydiumVenue::Clmm {
+            anyhow::bail!(
+                "Meteora executable route currently supports Raydium CLMM only; got {}",
+                raydium.venue.label()
+            );
+        }
+
+        let user = execution_manager
+            .wallet_pubkey()
+            .ok_or_else(|| anyhow::anyhow!("executor wallet is not configured"))?;
+        let max_sol_input_lamports =
+            max_sol_input_lamports_for_trade_size(config, trade_size_usdc)?;
+        let raydium_pool_tick_arrays: Vec<&raydium_clmm::ClmmTickArrayState> =
+            raydium_clmm_tick_arrays
+                .values()
+                .filter(|tick_array| tick_array.pool_id == raydium.pool_address)
+                .collect();
+        if raydium_pool_tick_arrays.is_empty() {
+            anyhow::bail!(
+                "no hydrated Raydium CLMM tick arrays available for pool {}",
+                raydium.pool_address
+            );
+        }
+
+        let quote_mint = meteora_pool
+            .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+            .ok_or_else(|| anyhow::anyhow!("Meteora quote mint not found"))?;
+        let raydium_quote_mint = raydium_counter_mint(raydium, token_mint)
+            .ok_or_else(|| anyhow::anyhow!("Raydium CLMM counter mint not found"))?;
+        if quote_mint != raydium_quote_mint {
+            anyhow::bail!(
+                "Meteora/Raydium quote mint mismatch: meteora={} raydium={}",
+                quote_mint,
+                raydium_quote_mint
+            );
+        }
+
+        let quote_mint_pubkey = Pubkey::from_str(&quote_mint)?;
+        let token_mint_pubkey = Pubkey::from_str(token_mint)?;
+        let quote_token_program = token_program_for_simulation(config, &quote_mint).await?;
+        let token_token_program = token_program_for_simulation(config, token_mint).await?;
+        let ata_specs = vec![
+            (quote_mint_pubkey, quote_token_program),
+            (token_mint_pubkey, token_token_program),
+        ];
+        let mut prepared_atas =
+            existing_associated_token_accounts(&config.rpc.http_url, &user, &ata_specs).await?;
+        let mut instructions = Vec::new();
+        push_ata_setup(
+            &mut instructions,
+            &user,
+            &quote_mint_pubkey,
+            &quote_token_program,
+            &mut prepared_atas,
+        )?;
+        push_ata_setup(
+            &mut instructions,
+            &user,
+            &token_mint_pubkey,
+            &token_token_program,
+            &mut prepared_atas,
+        )?;
+        let net_quote_token_account = executor::swap::associated_token_address(
+            &user,
+            &quote_mint_pubkey,
+            &quote_token_program,
+        )?;
+        let net_quote_start_balance =
+            token_account_balance(&config.rpc.http_url, &net_quote_token_account).await?;
+        let use_meteora_bitmap_extension = maybe_prepare_meteora_bitmap_extension_setup(
+            config,
+            meteora_pool,
+            &user,
+            &mut instructions,
+        )
+        .await?;
+        let setup_instructions = instructions.clone();
+
+        match direction {
+            MeteoraClmmDirection::MeteoraToClmm => {
+                let quote_amount_in = ceil_u64(
+                    usdc_to_raw_for_mint(
+                        &quote_mint,
+                        trade_size_usdc,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                        config.strategy.sol_usdc_price,
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unsupported Meteora quote mint {}", quote_mint)
+                    })?,
+                );
+                if quote_mint == config.tokens.sol_mint {
+                    ensure_simulation_sol_input_within_cap(
+                        "Meteora quote input",
+                        quote_amount_in,
+                        max_sol_input_lamports,
+                    )?;
+                    ensure_existing_associated_token_account_balance(
+                        &config.rpc.http_url,
+                        &user,
+                        &quote_mint_pubkey,
+                        &quote_token_program,
+                        &mut prepared_atas,
+                        quote_amount_in,
+                        "pre-wrapped SOL ATA",
+                    )
+                    .await?;
+                }
+
+                let meteora_remaining_arrays =
+                    meteora_swap_remaining_bin_arrays_for_exact_input_execution_async(
+                        config,
+                        meteora_pool,
+                        meteora_bin_arrays,
+                        &quote_mint,
+                        token_mint,
+                        quote_amount_in,
+                    )
+                    .await?;
+                let meteora_accounts =
+                    executor::swap::derive_meteora_dlmm_accounts_with_token_programs(
+                        meteora_pool,
+                        &user,
+                        &quote_mint,
+                        &quote_token_program,
+                        &token_token_program,
+                        use_meteora_bitmap_extension,
+                    )?;
+                let meteora_output_start_balance =
+                    token_account_balance(&config.rpc.http_url, &meteora_accounts.user_token_out)
+                        .await?;
+                let diagnostic_meteora_instruction = executor::swap::build_meteora_dlmm_swap_v2(
+                    &meteora_accounts.swap_v2_accounts(),
+                    &meteora_remaining_arrays
+                        .iter()
+                        .map(|(_, pubkey)| *pubkey)
+                        .collect::<Vec<_>>(),
+                    quote_amount_in,
+                    1,
+                )?;
+                let calibrated_token_amount = execution_manager
+                    .simulate_instructions_with_accounts(
+                        {
+                            let mut first_leg_instructions = setup_instructions.clone();
+                            first_leg_instructions.push(diagnostic_meteora_instruction.clone());
+                            first_leg_instructions
+                        },
+                        &[meteora_accounts.user_token_out.to_string()],
+                    )
+                    .await
+                    .ok()
+                    .and_then(|(_, accounts)| {
+                        simulated_token_account_positive_delta(
+                            &accounts,
+                            &meteora_accounts.user_token_out,
+                            meteora_output_start_balance,
+                        )
+                    })
+                    .filter(|amount| *amount > 0)
+                    .unwrap_or(slippage_floor_u64(quote.token_amount).max(1));
+                let meteora_min_token_out =
+                    execution_min_output(execution_manager, calibrated_token_amount);
+                let exact_meteora_instruction = executor::swap::build_meteora_dlmm_swap_v2(
+                    &meteora_accounts.swap_v2_accounts(),
+                    &meteora_remaining_arrays
+                        .iter()
+                        .map(|(_, pubkey)| *pubkey)
+                        .collect::<Vec<_>>(),
+                    quote_amount_in,
+                    meteora_min_token_out,
+                )?;
+                let settled_meteora_output_amount = execution_manager
+                    .simulate_instructions_with_accounts(
+                        {
+                            let mut first_leg_instructions = setup_instructions.clone();
+                            first_leg_instructions.push(exact_meteora_instruction.clone());
+                            first_leg_instructions
+                        },
+                        &[meteora_accounts.user_token_out.to_string()],
+                    )
+                    .await
+                    .ok()
+                    .and_then(|(_, accounts)| {
+                        simulated_token_account_positive_delta(
+                            &accounts,
+                            &meteora_accounts.user_token_out,
+                            meteora_output_start_balance,
+                        )
+                    })
+                    .filter(|amount| *amount > 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Meteora exact first-leg settlement amount unavailable: 币种={} min_out={}",
+                            token_mint,
+                            meteora_min_token_out
+                        )
+                    })?;
+
+                let raydium_input_amount = settled_meteora_output_amount.max(1);
+                let raydium_output_token_program =
+                    token_program_for_simulation(config, &quote_mint).await?;
+                let raydium_route = raydium_clmm_quote_swap_v2_route_for_mints(
+                    raydium,
+                    raydium_clmm_tick_arrays,
+                    token_mint,
+                    &quote_mint,
+                    raydium_input_amount,
+                )?;
+                let raydium_accounts =
+                    executor::swap::derive_raydium_clmm_exact_input_accounts_with_token_programs(
+                        raydium,
+                        &user,
+                        token_mint,
+                        &quote_mint,
+                        &token_token_program,
+                        &raydium_output_token_program,
+                        &raydium_route.first_tick_array.to_string(),
+                    )?;
+                if raydium_accounts.output_token_account != net_quote_token_account {
+                    anyhow::bail!(
+                    "Meteora->CLMM quote ATA mismatch: meteora quote ATA={} raydium output ATA={}",
+                    net_quote_token_account,
+                    raydium_accounts.output_token_account
+                );
+                }
+                tracing::debug!(
+                    "Meteora 到 CLMM 账户：币种={}，Meteora输出ATA={}，Raydium输入ATA={}，报价ATA={}",
+                    token_mint,
+                    meteora_accounts.user_token_out,
+                    raydium_accounts.input_token_account,
+                    net_quote_token_account
+                );
+                let remaining_tick_arrays = raydium_route.remaining_tick_arrays.clone();
+                let bitmap_extension =
+                    Pubkey::from_str(&raydium_clmm::derive_tickarray_bitmap_extension_address(
+                        &raydium.pool_address,
+                    )?)?;
+                let simulated_clmm_quote_out = execution_manager
+                    .simulate_instructions_with_accounts(
+                        {
+                            let mut diagnostic_atomic_instructions = setup_instructions.clone();
+                            diagnostic_atomic_instructions.push(exact_meteora_instruction.clone());
+                            diagnostic_atomic_instructions.push(
+                                executor::swap::build_raydium_clmm_swap_v2_with_bitmap_extension_and_remaining_tick_arrays(
+                                    &raydium_accounts.swap_v2_accounts(),
+                                &bitmap_extension,
+                                &remaining_tick_arrays,
+                                raydium_input_amount,
+                                1,
+                                raydium_route.sqrt_price_limit_x64,
+                                RAYDIUM_CLMM_EXACT_INPUT,
+                            )?,
+                        );
+                        diagnostic_atomic_instructions
+                    },
+                    &[net_quote_token_account.to_string()],
+                )
+                .await
+                .ok()
+                .and_then(|(_, accounts)| {
+                    simulated_second_leg_quote_output_from_atomic_delta(
+                        &accounts,
+                        &net_quote_token_account,
+                        net_quote_start_balance,
+                        quote_amount_in,
+                    )
+                })
+                .filter(|amount| *amount > 0);
+                let (simulated_clmm_quote_out, clmm_quote_source) =
+                    if let Some(amount) = simulated_clmm_quote_out {
+                        (amount, SecondLegQuoteSource::Simulated)
+                    } else {
+                        (
+                            usdc_to_raw_for_mint(
+                                &quote_mint,
+                                quote.final_amount_usdc,
+                                &config.tokens.usdc_mint,
+                                &config.tokens.sol_mint,
+                                config.strategy.sol_usdc_price,
+                            )
+                            .map(floor_u64)
+                            .unwrap_or(1)
+                            .max(1),
+                            SecondLegQuoteSource::FallbackQuote,
+                        )
+                    };
+                let clmm_min_quote_out =
+                    execution_min_output(execution_manager, simulated_clmm_quote_out);
+                tracing::debug!(
+                "Meteora 第一腿校准: 币种={} 预估产出={} 初始余额={} 模拟增量={} Meteora最小产出={} 一腿实到={} 二腿输入={} CLMM二腿回款={} 来源={} CLMM最小回款={}",
+                token_mint,
+                slippage_floor_u64(quote.token_amount),
+                meteora_output_start_balance,
+                calibrated_token_amount,
+                meteora_min_token_out,
+                settled_meteora_output_amount,
+                raydium_input_amount,
+                simulated_clmm_quote_out,
+                second_leg_quote_source_label(clmm_quote_source),
+                clmm_min_quote_out
+            );
+
+                instructions = setup_instructions.clone();
+                instructions.push(exact_meteora_instruction);
+                let mut fallback_instructions = setup_instructions.clone();
+                fallback_instructions.push(diagnostic_meteora_instruction);
+                instructions.push(
+                    executor::swap::build_raydium_clmm_swap_v2_with_bitmap_extension_and_remaining_tick_arrays(
+                        &raydium_accounts.swap_v2_accounts(),
+                        &bitmap_extension,
+                        &remaining_tick_arrays,
+                        raydium_input_amount,
+                        clmm_min_quote_out,
+                        raydium_route.sqrt_price_limit_x64,
+                        RAYDIUM_CLMM_EXACT_INPUT,
+                    )?,
+                );
+                let observed_intermediate_token_account = second_leg_input_observed_account(
+                    "Meteora DLMM->Raydium CLMM",
+                    token_mint,
+                    meteora_accounts.user_token_out,
+                    raydium_accounts.input_token_account,
+                );
+
+                Ok(SimulationInstructionPlan {
+                    atomic_instructions: instructions,
+                    fallback_instructions,
+                    fallback_label: "Meteora DLMM swap",
+                    setup_instructions,
+                    net_quote_token_account,
+                    net_quote_start_balance,
+                    net_quote_mint: quote_mint.to_string(),
+                    intermediate_token_account: observed_intermediate_token_account,
+                })
+            }
+            MeteoraClmmDirection::ClmmToMeteora => {
+                let clmm_quote_amount_in = ceil_u64(
+                    usdc_to_raw_for_mint(
+                        &quote_mint,
+                        trade_size_usdc,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                        config.strategy.sol_usdc_price,
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unsupported route quote mint {}", quote_mint)
+                    })?,
+                );
+                if quote_mint == config.tokens.sol_mint {
+                    ensure_simulation_sol_input_within_cap(
+                        "Raydium CLMM SOL input",
+                        clmm_quote_amount_in,
+                        max_sol_input_lamports,
+                    )?;
+                    ensure_existing_associated_token_account_balance(
+                        &config.rpc.http_url,
+                        &user,
+                        &quote_mint_pubkey,
+                        &quote_token_program,
+                        &mut prepared_atas,
+                        clmm_quote_amount_in,
+                        "pre-wrapped SOL ATA",
+                    )
+                    .await?;
+                }
+
+                let raydium_route = raydium_clmm_quote_swap_v2_route_for_mints(
+                    raydium,
+                    raydium_clmm_tick_arrays,
+                    &quote_mint,
+                    token_mint,
+                    clmm_quote_amount_in,
+                )?;
+                let raydium_accounts =
+                    executor::swap::derive_raydium_clmm_exact_input_accounts_with_token_programs(
+                        raydium,
+                        &user,
+                        &quote_mint,
+                        token_mint,
+                        &quote_token_program,
+                        &token_token_program,
+                        &raydium_route.first_tick_array.to_string(),
+                    )?;
+                let raydium_output_start_balance = token_account_balance(
+                    &config.rpc.http_url,
+                    &raydium_accounts.output_token_account,
+                )
+                .await?;
+                let remaining_tick_arrays = raydium_route.remaining_tick_arrays.clone();
+                let bitmap_extension =
+                    Pubkey::from_str(&raydium_clmm::derive_tickarray_bitmap_extension_address(
+                        &raydium.pool_address,
+                    )?)?;
+                let diagnostic_clmm_instruction =
+                executor::swap::build_raydium_clmm_swap_v2_with_bitmap_extension_and_remaining_tick_arrays(
+                    &raydium_accounts.swap_v2_accounts(),
+                    &bitmap_extension,
+                    &remaining_tick_arrays,
+                    clmm_quote_amount_in,
+                    1,
+                    raydium_route.sqrt_price_limit_x64,
+                    RAYDIUM_CLMM_EXACT_INPUT,
+                )?;
+                let calibrated_token_amount = execution_manager
+                    .simulate_instructions_with_accounts(
+                        {
+                            let mut first_leg_instructions = setup_instructions.clone();
+                            first_leg_instructions.push(diagnostic_clmm_instruction.clone());
+                            first_leg_instructions
+                        },
+                        &[raydium_accounts.output_token_account.to_string()],
+                    )
+                    .await
+                    .ok()
+                    .and_then(|(_, accounts)| {
+                        simulated_token_account_positive_delta(
+                            &accounts,
+                            &raydium_accounts.output_token_account,
+                            raydium_output_start_balance,
+                        )
+                    })
+                    .filter(|amount| *amount > 0)
+                    .unwrap_or(slippage_floor_u64(quote.token_amount).max(1));
+                let clmm_min_token_out =
+                    execution_min_output(execution_manager, calibrated_token_amount);
+                let exact_clmm_instruction =
+                    executor::swap::build_raydium_clmm_swap_v2_with_bitmap_extension_and_remaining_tick_arrays(
+                        &raydium_accounts.swap_v2_accounts(),
+                        &bitmap_extension,
+                        &remaining_tick_arrays,
+                        clmm_quote_amount_in,
+                        clmm_min_token_out,
+                        raydium_route.sqrt_price_limit_x64,
+                        RAYDIUM_CLMM_EXACT_INPUT,
+                    )?;
+                let settled_clmm_output_amount = execution_manager
+                    .simulate_instructions_with_accounts(
+                        {
+                            let mut first_leg_instructions = setup_instructions.clone();
+                            first_leg_instructions.push(exact_clmm_instruction.clone());
+                            first_leg_instructions
+                        },
+                        &[raydium_accounts.output_token_account.to_string()],
+                    )
+                    .await
+                    .ok()
+                    .and_then(|(_, accounts)| {
+                        simulated_token_account_positive_delta(
+                            &accounts,
+                            &raydium_accounts.output_token_account,
+                            raydium_output_start_balance,
+                        )
+                    })
+                    .filter(|amount| *amount > 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Raydium exact first-leg settlement amount unavailable: 币种={} min_out={}",
+                            token_mint,
+                            clmm_min_token_out
+                        )
+                    })?;
+
+                let meteora_remaining_arrays =
+                    meteora_swap_remaining_bin_arrays_for_exact_input_execution_async(
+                        config,
+                        meteora_pool,
+                        meteora_bin_arrays,
+                        token_mint,
+                        &quote_mint,
+                        settled_clmm_output_amount.max(1),
+                    )
+                    .await?;
+                let meteora_accounts =
+                    executor::swap::derive_meteora_dlmm_accounts_with_token_programs(
+                        meteora_pool,
+                        &user,
+                        token_mint,
+                        &token_token_program,
+                        &quote_token_program,
+                        use_meteora_bitmap_extension,
+                    )?;
+                if meteora_accounts.user_token_out != net_quote_token_account {
+                    anyhow::bail!(
+                    "CLMM->Meteora quote ATA mismatch: meteora output ATA={} expected quote ATA={}",
+                    meteora_accounts.user_token_out,
+                    net_quote_token_account
+                );
+                }
+                tracing::debug!(
+                    "CLMM 到 Meteora 账户：币种={}，Raydium输出ATA={}，Meteora输入ATA={}，报价ATA={}",
+                    token_mint,
+                    raydium_accounts.output_token_account,
+                    meteora_accounts.user_token_in,
+                    net_quote_token_account
+                );
+                let meteora_input_amount = settled_clmm_output_amount.max(1);
+                let simulated_meteora_quote_out = execution_manager
+                    .simulate_instructions_with_accounts(
+                        {
+                            let mut diagnostic_atomic_instructions = setup_instructions.clone();
+                            diagnostic_atomic_instructions.push(exact_clmm_instruction.clone());
+                            diagnostic_atomic_instructions.push(
+                                executor::swap::build_meteora_dlmm_swap_v2(
+                                    &meteora_accounts.swap_v2_accounts(),
+                                    &meteora_remaining_arrays
+                                        .iter()
+                                        .map(|(_, pubkey)| *pubkey)
+                                        .collect::<Vec<_>>(),
+                                    meteora_input_amount,
+                                    1,
+                                )?,
+                            );
+                            diagnostic_atomic_instructions
+                        },
+                        &[net_quote_token_account.to_string()],
+                    )
+                    .await
+                    .ok()
+                    .and_then(|(_, accounts)| {
+                        simulated_second_leg_quote_output_from_atomic_delta(
+                            &accounts,
+                            &net_quote_token_account,
+                            net_quote_start_balance,
+                            clmm_quote_amount_in,
+                        )
+                    })
+                    .filter(|amount| *amount > 0);
+                let (simulated_meteora_quote_out, meteora_quote_source) =
+                    if let Some(amount) = simulated_meteora_quote_out {
+                        (amount, SecondLegQuoteSource::Simulated)
+                    } else {
+                        (
+                            usdc_to_raw_for_mint(
+                                &quote_mint,
+                                quote.final_amount_usdc,
+                                &config.tokens.usdc_mint,
+                                &config.tokens.sol_mint,
+                                config.strategy.sol_usdc_price,
+                            )
+                            .map(floor_u64)
+                            .unwrap_or(1)
+                            .max(1),
+                            SecondLegQuoteSource::FallbackQuote,
+                        )
+                    };
+                let meteora_min_quote_out =
+                    execution_min_output(execution_manager, simulated_meteora_quote_out);
+                tracing::debug!(
+                "CLMM 第一腿校准(接 Meteora): 币种={} 预估产出={} 初始余额={} 模拟增量={} CLMM最小产出={} 一腿实到={} 二腿输入={} Meteora二腿回款={} 来源={} Meteora最小回款={}",
+                token_mint,
+                slippage_floor_u64(quote.token_amount),
+                raydium_output_start_balance,
+                calibrated_token_amount,
+                clmm_min_token_out,
+                settled_clmm_output_amount,
+                meteora_input_amount,
+                simulated_meteora_quote_out,
+                second_leg_quote_source_label(meteora_quote_source),
+                meteora_min_quote_out
+            );
+
+                instructions = setup_instructions.clone();
+                instructions.push(exact_clmm_instruction);
+                let mut fallback_instructions = setup_instructions.clone();
+                fallback_instructions.push(diagnostic_clmm_instruction);
+                instructions.push(executor::swap::build_meteora_dlmm_swap_v2(
+                    &meteora_accounts.swap_v2_accounts(),
+                    &meteora_remaining_arrays
+                        .iter()
+                        .map(|(_, pubkey)| *pubkey)
+                        .collect::<Vec<_>>(),
+                    meteora_input_amount,
+                    meteora_min_quote_out,
+                )?);
+                let observed_intermediate_token_account = second_leg_input_observed_account(
+                    "Raydium CLMM->Meteora DLMM",
+                    token_mint,
+                    raydium_accounts.output_token_account,
+                    meteora_accounts.user_token_in,
+                );
+
+                Ok(SimulationInstructionPlan {
+                    atomic_instructions: instructions,
+                    fallback_instructions,
+                    fallback_label: "Raydium CLMM swap",
+                    setup_instructions,
+                    net_quote_token_account,
+                    net_quote_start_balance,
+                    net_quote_mint: quote_mint.to_string(),
+                    intermediate_token_account: observed_intermediate_token_account,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExactPreflightQuote {
+    token_amount: f64,
+    final_amount_usdc: f64,
+    gross_profit_usdc: f64,
+    slippage_buffer_usdc: f64,
+    gas_cost_usdc: f64,
+    gross_profit_pct: f64,
+    net_profit_usdc: f64,
+    net_profit_pct: f64,
+    arb_quote: Option<ArbQuote>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpportunityClass {
+    A,
+    B,
+    C,
+}
+
+impl OpportunityClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+            Self::C => "C",
+        }
+    }
+
+    fn send_allowed(self) -> bool {
+        !matches!(self, Self::C)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ArbFeeBreakdown {
+    pump_lp_fee_raw: u64,
+    pump_protocol_fee_raw: u64,
+    pump_coin_creator_fee_raw: u64,
+    meteora_fee_raw: u64,
+    priority_fee_raw: u64,
+    jito_tip_raw: u64,
+    wrap_unwrap_cost_raw: u64,
+    ata_cost_raw: u64,
+    failure_buffer_cost_raw: u64,
+    total_raw: u64,
+    total_usdc: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SendFeePlan {
+    jito_tip_lamports: u64,
+    base_fee_lamports: u64,
+    min_profit_raw: u64,
+    gross_profit_raw: i128,
+    net_after_tip_and_base_raw: i128,
+    tip_share: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ArbQuote {
+    token_mint: String,
+    forward_dex: &'static str,
+    backward_dex: &'static str,
+    forward_pool: String,
+    backward_pool: String,
+    quote_mint: String,
+    quote_in_raw: u64,
+    quote_in_principal_raw: u64,
+    expected_base_out_raw: u64,
+    expected_base_out_safe: u64,
+    expected_quote_back_raw: u64,
+    expected_quote_back_safe: u64,
+    expected_quote_back_before_meteora_fee_raw: u64,
+    buy_slippage_bps: f64,
+    sell_slippage_bps: f64,
+    pump_quote_liquidity_usdc: f64,
+    meteora_liquidity_usdc: f64,
+    trade_depth_bps: f64,
+    meteora_fee_bps: f64,
+    touched_bin_arrays: usize,
+    touched_bins: usize,
+    fees: ArbFeeBreakdown,
+    real_net_profit_raw: i128,
+    real_net_profit_usdc: f64,
+}
+
+#[derive(Debug, Clone)]
+struct OpportunityAssessment {
+    confidence_score: f64,
+    opportunity_class: OpportunityClass,
+    path_hit_rate: f64,
+    path_samples: u64,
+    send_allowed: bool,
+    filter_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RouteExecutionEvent {
+    event_kind: &'static str,
+    token: String,
+    dex_route: String,
+    forward_pool: String,
+    backward_pool: String,
+    opportunity_class: Option<&'static str>,
+    expected_forward_out: u64,
+    expected_backward_out: u64,
+    expected_profit_usdc: f64,
+    real_profit_usdc: f64,
+    sent: bool,
+    landed: bool,
+    success: bool,
+    fail_reason: Option<String>,
+    cu_used: Option<u64>,
+    priority_fee_raw: u64,
+    jito_tip_raw: u64,
+    timestamp: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MeteoraQuoteDetail {
+    amount_out: f64,
+    amount_out_without_fee: f64,
+    touched_bin_array_indices: Vec<i64>,
+    touched_bins: usize,
+}
+
+impl ExactPreflightQuote {
+    fn basic(
+        trade_size_usdc: f64,
+        token_amount: f64,
+        final_amount_usdc: f64,
+        slippage_buffer_usdc: f64,
+        gas_cost_usdc: f64,
+    ) -> Self {
+        let gross_profit_usdc = final_amount_usdc - trade_size_usdc;
+        let net_profit_usdc = gross_profit_usdc - slippage_buffer_usdc - gas_cost_usdc;
+        let gross_profit_pct = (gross_profit_usdc / trade_size_usdc) * 100.0;
+        let net_profit_pct = (net_profit_usdc / trade_size_usdc) * 100.0;
+        Self {
+            token_amount,
+            final_amount_usdc,
+            gross_profit_usdc,
+            slippage_buffer_usdc,
+            gas_cost_usdc,
+            gross_profit_pct,
+            net_profit_usdc,
+            net_profit_pct,
+            arb_quote: None,
+        }
+    }
+
+    fn from_arb_quote(config: &Config, trade_size_usdc: f64, arb_quote: ArbQuote) -> Self {
+        let effective_trade_size_usdc = raw_to_usdc_for_mint(
+            &arb_quote.quote_mint,
+            arb_quote.quote_in_raw as f64,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+        )
+        .unwrap_or(trade_size_usdc)
+        .max(trade_size_usdc);
+        let final_amount_usdc = raw_to_usdc_for_mint(
+            &arb_quote.quote_mint,
+            arb_quote.expected_quote_back_safe as f64,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+        )
+        .unwrap_or_default();
+        let gross_profit_usdc = final_amount_usdc - effective_trade_size_usdc;
+        let gas_cost_raw = arb_quote
+            .fees
+            .priority_fee_raw
+            .saturating_add(arb_quote.fees.jito_tip_raw);
+        let gas_cost_usdc = raw_to_usdc_for_mint(
+            &arb_quote.quote_mint,
+            gas_cost_raw as f64,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+        )
+        .unwrap_or_default();
+        let slippage_and_fee_buffer_usdc =
+            (gross_profit_usdc - arb_quote.real_net_profit_usdc - gas_cost_usdc).max(0.0);
+        let gross_profit_pct = if effective_trade_size_usdc > 0.0 {
+            (gross_profit_usdc / effective_trade_size_usdc) * 100.0
+        } else {
+            0.0
+        };
+        let net_profit_pct = if effective_trade_size_usdc > 0.0 {
+            (arb_quote.real_net_profit_usdc / effective_trade_size_usdc) * 100.0
+        } else {
+            0.0
+        };
+        Self {
+            token_amount: arb_quote.expected_base_out_safe as f64,
+            final_amount_usdc,
+            gross_profit_usdc,
+            slippage_buffer_usdc: slippage_and_fee_buffer_usdc,
+            gas_cost_usdc,
+            gross_profit_pct,
+            net_profit_usdc: arb_quote.real_net_profit_usdc,
+            net_profit_pct,
+            arb_quote: Some(arb_quote),
+        }
+    }
+}
+
+fn quote_constant_product_in_for_exact_out(
+    input_reserve: f64,
+    output_reserve: f64,
+    amount_out: f64,
+    fee_bps: f64,
+) -> Option<f64> {
+    if input_reserve <= 0.0
+        || output_reserve <= 0.0
+        || amount_out <= 0.0
+        || amount_out >= output_reserve
+    {
+        return None;
+    }
+    let fee_multiplier = 1.0 - (fee_bps / 10_000.0);
+    if fee_multiplier <= 0.0 {
+        return None;
+    }
+    let numerator = input_reserve * amount_out;
+    let denominator = (output_reserve - amount_out) * fee_multiplier;
+    if denominator <= 0.0 {
+        return None;
+    }
+    Some(numerator / denominator)
+}
+
+fn quote_raw_to_usdc_signed(quote_mint: &str, amount_raw: i128, config: &Config) -> Option<f64> {
+    let sign = if amount_raw < 0 { -1.0 } else { 1.0 };
+    let magnitude = raw_to_usdc_for_mint(
+        quote_mint,
+        amount_raw.unsigned_abs() as f64,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    Some(sign * magnitude)
+}
+
+fn quote_cost_raw_from_usdc(config: &Config, quote_mint: &str, cost_usdc: f64) -> u64 {
+    if cost_usdc <= 0.0 || !cost_usdc.is_finite() {
+        return 0;
+    }
+    usdc_to_raw_for_mint(
+        quote_mint,
+        cost_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )
+    .map(ceil_u64)
+    .unwrap_or(0)
+}
+
+fn quote_cost_raw_from_sol(config: &Config, quote_mint: &str, cost_sol: f64) -> u64 {
+    if cost_sol <= 0.0 || !cost_sol.is_finite() {
+        return 0;
+    }
+    quote_cost_raw_from_usdc(
+        config,
+        quote_mint,
+        cost_sol * config.strategy.sol_usdc_price,
+    )
+}
+
+fn configured_priority_fee_lamports(config: &Config) -> u64 {
+    let cu_limit = config.execution.compute_unit_limit.unwrap_or(1_400_000) as u128;
+    let cu_price = config
+        .execution
+        .compute_unit_price_micro_lamports
+        .unwrap_or(1_000) as u128;
+    ((cu_limit * cu_price) / 1_000_000).min(u64::MAX as u128) as u64
+}
+
+fn configured_jito_tip_lamports(config: &Config) -> u64 {
+    config.execution.jito_tip_lamports.unwrap_or(0)
+}
+
+fn dynamic_jito_tip_enabled() -> bool {
+    parse_bool_env("JITO_DYNAMIC_TIP_ENABLED", true)
+}
+
+fn dynamic_jito_tip_share_bounds() -> (f64, f64) {
+    let min_share = parse_non_negative_env_f64(
+        "JITO_TIP_PROFIT_SHARE_MIN",
+        DEFAULT_DYNAMIC_JITO_TIP_MIN_SHARE,
+    )
+    .clamp(0.0, 1.0);
+    let max_share = parse_non_negative_env_f64(
+        "JITO_TIP_PROFIT_SHARE_MAX",
+        DEFAULT_DYNAMIC_JITO_TIP_MAX_SHARE,
+    )
+    .clamp(min_share, 1.0);
+    (min_share, max_share)
+}
+
+fn dynamic_jito_tip_full_share_profit_pct() -> f64 {
+    parse_non_negative_env_f64(
+        "JITO_TIP_FULL_SHARE_PROFIT_PCT",
+        DEFAULT_DYNAMIC_JITO_TIP_FULL_SHARE_PROFIT_PCT,
+    )
+    .max(0.01)
+}
+
+fn jito_min_tip_lamports() -> u64 {
+    parse_non_negative_env_u64("JITO_MIN_TIP_LAMPORTS", DEFAULT_JITO_MIN_TIP_LAMPORTS)
+}
+
+fn jito_max_tip_lamports() -> u64 {
+    parse_non_negative_env_u64("JITO_MAX_TIP_LAMPORTS", DEFAULT_JITO_MAX_TIP_LAMPORTS)
+        .max(jito_min_tip_lamports())
+}
+
+fn dynamic_jito_tip_share(profit_pct: f64) -> f64 {
+    let (min_share, max_share) = dynamic_jito_tip_share_bounds();
+    if !profit_pct.is_finite() || profit_pct <= 0.0 {
+        return min_share;
+    }
+    let progress = (profit_pct / dynamic_jito_tip_full_share_profit_pct()).clamp(0.0, 1.0);
+    min_share + ((max_share - min_share) * progress)
+}
+
+fn quote_profit_raw_to_sol_lamports(
+    config: &Config,
+    quote_mint: &str,
+    profit_raw: i128,
+) -> Option<u64> {
+    if profit_raw <= 0 {
+        return None;
+    }
+    if quote_mint == config.tokens.sol_mint {
+        return Some(profit_raw.min(u64::MAX as i128) as u64);
+    }
+    let profit_usdc = quote_raw_to_usdc_signed(quote_mint, profit_raw, config)?;
+    if profit_usdc <= 0.0 || !profit_usdc.is_finite() || config.strategy.sol_usdc_price <= 0.0 {
+        return None;
+    }
+    Some(ceil_u64(
+        profit_usdc / config.strategy.sol_usdc_price * 1_000_000_000.0,
+    ))
+}
+
+fn dynamic_jito_tip_lamports_for_quote_profit(
+    config: &Config,
+    quote_mint: &str,
+    gross_profit_raw: i128,
+    gross_profit_pct: f64,
+) -> u64 {
+    if !dynamic_jito_tip_enabled() {
+        return configured_jito_tip_lamports(config);
+    }
+    let min_tip = jito_min_tip_lamports();
+    let Some(profit_lamports) =
+        quote_profit_raw_to_sol_lamports(config, quote_mint, gross_profit_raw)
+    else {
+        return min_tip;
+    };
+    if profit_lamports == 0 {
+        return min_tip;
+    }
+    let share = dynamic_jito_tip_share(gross_profit_pct);
+    let calculated = floor_u64((profit_lamports as f64) * share);
+    calculated.max(min_tip).min(jito_max_tip_lamports())
+}
+
+fn jito_bundle_base_fee_lamports(jito_tip_lamports: u64) -> u64 {
+    let transaction_count = if jito_tip_lamports > 0 { 2 } else { 1 };
+    BASE_SIGNATURE_FEE_LAMPORTS.saturating_mul(transaction_count)
+}
+
+fn exact_quote_gross_profit_raw(
+    config: &Config,
+    quote: &ExactPreflightQuote,
+    quote_mint: &str,
+    trade_size_usdc: f64,
+) -> Option<i128> {
+    if let Some(arb_quote) = quote.arb_quote.as_ref() {
+        return Some(
+            (arb_quote.expected_quote_back_safe as i128) - (arb_quote.quote_in_raw as i128),
+        );
+    }
+    let gross_profit_usdc = quote.final_amount_usdc - trade_size_usdc;
+    if !gross_profit_usdc.is_finite() {
+        return None;
+    }
+    let magnitude_raw = usdc_to_raw_for_mint(
+        quote_mint,
+        gross_profit_usdc.abs(),
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )
+    .map(ceil_u64)? as i128;
+    Some(if gross_profit_usdc >= 0.0 {
+        magnitude_raw
+    } else {
+        -magnitude_raw
+    })
+}
+
+fn send_fee_plan_for_exact_quote(
+    config: &Config,
+    quote: &ExactPreflightQuote,
+    quote_mint: &str,
+    trade_size_usdc: f64,
+) -> Option<SendFeePlan> {
+    let gross_profit_raw =
+        exact_quote_gross_profit_raw(config, quote, quote_mint, trade_size_usdc)?;
+    let jito_tip_lamports = dynamic_jito_tip_lamports_for_quote_profit(
+        config,
+        quote_mint,
+        gross_profit_raw,
+        quote.gross_profit_pct,
+    );
+    let base_fee_lamports = jito_bundle_base_fee_lamports(jito_tip_lamports);
+    let tip_raw = quote_cost_raw_from_sol(
+        config,
+        quote_mint,
+        jito_tip_lamports as f64 / 1_000_000_000.0,
+    );
+    let base_fee_raw = quote_cost_raw_from_sol(
+        config,
+        quote_mint,
+        base_fee_lamports as f64 / 1_000_000_000.0,
+    );
+    let required_raw = tip_raw.saturating_add(base_fee_raw);
+    let net_after_tip_and_base_raw = gross_profit_raw - (required_raw as i128);
+    Some(SendFeePlan {
+        jito_tip_lamports,
+        base_fee_lamports,
+        min_profit_raw: required_raw.saturating_add(1).max(1),
+        gross_profit_raw,
+        net_after_tip_and_base_raw,
+        tip_share: dynamic_jito_tip_share(quote.gross_profit_pct),
+    })
+}
+
+fn normalized_pumpswap_fee_shares(config: &Config) -> (u64, u64, u64, u64) {
+    let lp = config.strategy.pumpswap_fee_lp_share_bps;
+    let protocol = config.strategy.pumpswap_fee_protocol_share_bps;
+    let creator = config.strategy.pumpswap_fee_coin_creator_share_bps;
+    let total = lp.saturating_add(protocol).saturating_add(creator).max(1);
+    (lp, protocol, creator, total)
+}
+
+fn proportional_fee_component(total_fee_raw: u64, share_bps: u64, total_share_bps: u64) -> u64 {
+    if total_fee_raw == 0 || share_bps == 0 || total_share_bps == 0 {
+        return 0;
+    }
+    (((total_fee_raw as u128) * (share_bps as u128)) / (total_share_bps as u128))
+        .min(u64::MAX as u128) as u64
+}
+
+fn dynamic_pumpswap_meteora_buy_slippage_bps(
+    config: &Config,
+    pump_quote_liquidity_usdc: f64,
+    trade_depth_bps: f64,
+) -> f64 {
+    let base = config.strategy.pumpswap_meteora_buy_slippage_bps;
+    let small_pool = config.strategy.pumpswap_meteora_buy_slippage_bps_small_pool;
+    if pump_quote_liquidity_usdc < config.strategy.pumpswap_meteora_small_pool_liquidity_usdc
+        || trade_depth_bps > config.strategy.pumpswap_meteora_max_trade_depth_bps * 0.75
+    {
+        small_pool.max(base)
+    } else {
+        base
+    }
+}
+
+fn dynamic_pumpswap_meteora_sell_slippage_bps(
+    config: &Config,
+    meteora_liquidity_usdc: f64,
+    trade_depth_bps: f64,
+    touched_bin_arrays: usize,
+) -> f64 {
+    let base = config.strategy.pumpswap_meteora_sell_slippage_bps;
+    let small_pool = config
+        .strategy
+        .pumpswap_meteora_sell_slippage_bps_small_pool;
+    if meteora_liquidity_usdc < config.strategy.pumpswap_meteora_small_pool_liquidity_usdc
+        || trade_depth_bps > config.strategy.pumpswap_meteora_max_trade_depth_bps * 0.75
+        || touched_bin_arrays > 2
+    {
+        small_pool.max(base)
+    } else {
+        base
+    }
+}
+
+fn assess_pumpswap_meteora_opportunity(
+    config: &Config,
+    stats: &RuntimeStats,
+    quote: &ArbQuote,
+) -> OpportunityAssessment {
+    let profit_checks_disabled = disable_local_profit_checks();
+    let (path_hit_rate, path_samples) = route_hit_rate_snapshot(stats, quote);
+    let profit_floor = config
+        .strategy
+        .pumpswap_meteora_class_a_min_profit_usdc
+        .max(0.01);
+    let liquidity_floor = config
+        .strategy
+        .pumpswap_meteora_small_pool_liquidity_usdc
+        .max(1.0);
+    let profit_score = (quote.real_net_profit_usdc / profit_floor).clamp(0.0, 1.5) / 1.5;
+    let liquidity_score = (quote
+        .pump_quote_liquidity_usdc
+        .min(quote.meteora_liquidity_usdc)
+        / liquidity_floor)
+        .clamp(0.0, 2.0)
+        / 2.0;
+    let depth_penalty = (quote.trade_depth_bps
+        / config
+            .strategy
+            .pumpswap_meteora_max_trade_depth_bps
+            .max(1.0))
+    .clamp(0.0, 2.0);
+    let bin_penalty = (quote.touched_bin_arrays.saturating_sub(1) as f64) * 0.12;
+    let fee_penalty = (quote.meteora_fee_bps
+        / config
+            .strategy
+            .pumpswap_meteora_max_meteora_fee_bps
+            .max(1.0))
+    .clamp(0.0, 2.0)
+        * 0.2;
+    let hit_rate_bonus = if path_samples >= config.strategy.pumpswap_meteora_min_hit_rate_samples {
+        (path_hit_rate - 0.5) * 0.3
+    } else {
+        0.05
+    };
+    let confidence_score =
+        (0.25 + (profit_score * 0.35) + (liquidity_score * 0.2) + hit_rate_bonus
+            - (depth_penalty * 0.15)
+            - bin_penalty
+            - fee_penalty)
+            .clamp(0.0, 1.0);
+
+    let mut filter_reasons = Vec::new();
+    if !profit_checks_disabled
+        && quote.trade_depth_bps > config.strategy.pumpswap_meteora_max_trade_depth_bps
+    {
+        filter_reasons.push(format!(
+            "trade_depth_too_high({:.1}bps>{:.1}bps)",
+            quote.trade_depth_bps, config.strategy.pumpswap_meteora_max_trade_depth_bps
+        ));
+    }
+    if !profit_checks_disabled
+        && quote.touched_bin_arrays > config.strategy.pumpswap_meteora_max_touched_bin_arrays
+    {
+        filter_reasons.push(format!(
+            "too_many_bin_arrays({}>{})",
+            quote.touched_bin_arrays, config.strategy.pumpswap_meteora_max_touched_bin_arrays
+        ));
+    }
+    // High Meteora fees already flow through the real-net-profit model. Keep them as a
+    // confidence penalty, but do not hard-block otherwise profitable routes here.
+    if quote.expected_base_out_safe == 0 {
+        filter_reasons.push("forward_safe_output_zero".to_string());
+    }
+    if !quote.real_net_profit_usdc.is_finite() {
+        filter_reasons.push("real_net_not_finite".to_string());
+    }
+    if !profit_checks_disabled && quote.real_net_profit_usdc <= 0.0 {
+        filter_reasons.push(format!(
+            "non_positive_real_net(${:.4})",
+            quote.real_net_profit_usdc
+        ));
+    }
+    if !profit_checks_disabled
+        && path_samples >= config.strategy.pumpswap_meteora_min_hit_rate_samples
+        && path_hit_rate < config.strategy.pumpswap_meteora_min_hit_rate
+    {
+        filter_reasons.push(format!(
+            "path_hit_rate_too_low({:.2}<{:.2})",
+            path_hit_rate, config.strategy.pumpswap_meteora_min_hit_rate
+        ));
+    }
+
+    let opportunity_class = if quote.real_net_profit_usdc
+        >= config.strategy.pumpswap_meteora_class_a_min_profit_usdc
+        && confidence_score >= config.strategy.pumpswap_meteora_class_a_min_confidence
+    {
+        OpportunityClass::A
+    } else if quote.real_net_profit_usdc >= config.strategy.pumpswap_meteora_class_b_min_profit_usdc
+        && confidence_score >= config.strategy.pumpswap_meteora_class_b_min_confidence
+    {
+        OpportunityClass::B
+    } else {
+        OpportunityClass::C
+    };
+
+    OpportunityAssessment {
+        confidence_score,
+        opportunity_class,
+        path_hit_rate,
+        path_samples,
+        send_allowed: filter_reasons.is_empty(),
+        filter_reasons,
+    }
+}
+
+fn log_pumpswap_meteora_quote_decision(
+    path_label: &str,
+    token_mint: &str,
+    trade_size_usdc: f64,
+    quote: &ArbQuote,
+    assessment: &OpportunityAssessment,
+    action: &str,
+    reason: &str,
+) {
+    let reason_text = if reason.is_empty() {
+        assessment.filter_reasons.join(",")
+    } else {
+        reason.to_string()
+    };
+    if action == "观察" {
+        tracing::info!(
+            "跳过发送：路径={}，币种={}，原因={}，金额=${:.2}，实际净利=${:.4}，分类={}，置信度={:.2}",
+            path_label,
+            token_mint,
+            reason_text,
+            trade_size_usdc,
+            quote.real_net_profit_usdc,
+            assessment.opportunity_class.label(),
+            assessment.confidence_score,
+        );
+    } else {
+        tracing::debug!(
+            "PumpSwap/Meteora 报价{}：路径={}，币种={}，分类={}，置信度={:.2}，命中率={:.2}，样本={}，金额=${:.2}，实际净利=${:.4}，买滑点={:.1}bps，卖滑点={:.1}bps，原因={}",
+            action,
+            path_label,
+            token_mint,
+            assessment.opportunity_class.label(),
+            assessment.confidence_score,
+            assessment.path_hit_rate,
+            assessment.path_samples,
+            trade_size_usdc,
+            quote.real_net_profit_usdc,
+            quote.buy_slippage_bps,
+            quote.sell_slippage_bps,
+            reason_text,
+        );
+    }
+}
+
+fn quote_pumpswap_buy_raydium_sell(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    token_mint: &str,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let raydium_quote_mint = raydium_counter_mint(raydium, token_mint)?;
+    if pumpswap_pool.token_mint != token_mint || pumpswap_pool.quote_mint != raydium_quote_mint {
+        return None;
+    }
+    let quote_amount_in = usdc_to_raw_for_mint(
+        &pumpswap_pool.quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_constant_product_out(
+        pumpswap_pool.quote_reserve as f64,
+        pumpswap_pool.token_reserve as f64,
+        quote_amount_in,
+        pumpswap_pool.fee_bps,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw = quote_raydium_exact_in(
+        config,
+        raydium,
+        raydium_clmm_tick_arrays,
+        token_mint,
+        token_amount,
+    )?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        raydium_quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+fn quote_raydium_buy_pumpswap_sell(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    token_mint: &str,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let raydium_quote_mint = raydium_counter_mint(raydium, token_mint)?;
+    if pumpswap_pool.token_mint != token_mint || pumpswap_pool.quote_mint != raydium_quote_mint {
+        return None;
+    }
+    let quote_amount_in = usdc_to_raw_for_mint(
+        raydium_quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_raydium_exact_in(
+        config,
+        raydium,
+        raydium_clmm_tick_arrays,
+        raydium_quote_mint,
+        quote_amount_in,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw = quote_constant_product_out(
+        pumpswap_pool.token_reserve as f64,
+        pumpswap_pool.quote_reserve as f64,
+        token_amount,
+        pumpswap_pool.fee_bps,
+    )?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        &pumpswap_pool.quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quote_meteora_buy_raydium_sell(
+    config: &Config,
+    meteora: &MeteoraState,
+    raydium: &RaydiumState,
+    token_mint: &str,
+    meteora_bin_arrays: &[&meteora::MeteoraBinArrayState],
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let quote_mint = meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    let quote_amount_in = usdc_to_raw_for_mint(
+        &quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_meteora_exact_in(
+        meteora,
+        meteora_bin_arrays,
+        &quote_mint,
+        token_mint,
+        quote_amount_in,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw = quote_raydium_exact_in(
+        config,
+        raydium,
+        raydium_clmm_tick_arrays,
+        token_mint,
+        token_amount,
+    )?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        raydium_counter_mint(raydium, token_mint)?,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quote_raydium_buy_meteora_sell(
+    config: &Config,
+    meteora: &MeteoraState,
+    raydium: &RaydiumState,
+    token_mint: &str,
+    meteora_bin_arrays: &[&meteora::MeteoraBinArrayState],
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let raydium_quote_mint = raydium_counter_mint(raydium, token_mint)?;
+    let raydium_quote_amount_in = usdc_to_raw_for_mint(
+        raydium_quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_raydium_exact_in(
+        config,
+        raydium,
+        raydium_clmm_tick_arrays,
+        raydium_quote_mint,
+        raydium_quote_amount_in,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let meteora_quote_mint =
+        meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    let final_raw = quote_meteora_exact_in(
+        meteora,
+        meteora_bin_arrays,
+        token_mint,
+        &meteora_quote_mint,
+        token_amount,
+    )?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        &meteora_quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+fn quote_pumpswap_buy_meteora_sell(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    meteora_bin_arrays: &[&meteora::MeteoraBinArrayState],
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let meteora_quote_mint =
+        meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    if pumpswap_pool.token_mint != token_mint || pumpswap_pool.quote_mint != meteora_quote_mint {
+        return None;
+    }
+
+    let quote_amount_target_in = ceil_u64(usdc_to_raw_for_mint(
+        &pumpswap_pool.quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?);
+    let pump_quote_liquidity_usdc = raw_to_usdc_for_mint(
+        &pumpswap_pool.quote_mint,
+        pumpswap_pool.quote_reserve as f64,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let meteora_liquidity_usdc = meteora_pool_liquidity_score_usdc(config, meteora).unwrap_or(0.0);
+    let depth_liquidity = pump_quote_liquidity_usdc
+        .min(meteora_liquidity_usdc)
+        .max(f64::EPSILON);
+    let trade_depth_bps = (trade_size_usdc / depth_liquidity) * 10_000.0;
+    let buy_slippage_bps = dynamic_pumpswap_meteora_buy_slippage_bps(
+        config,
+        pump_quote_liquidity_usdc,
+        trade_depth_bps,
+    );
+
+    let token_amount = quote_constant_product_out(
+        pumpswap_pool.quote_reserve as f64,
+        pumpswap_pool.token_reserve as f64,
+        quote_amount_target_in as f64,
+        pumpswap_pool.fee_bps,
+    )?;
+    let expected_base_out_raw =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 1).ok()?;
+    let expected_base_out_safe =
+        floor_u64((expected_base_out_raw as f64) * (1.0 - (buy_slippage_bps / 10_000.0))).max(1);
+    let required_quote_amount_in = quote_constant_product_in_for_exact_out(
+        pumpswap_pool.quote_reserve as f64,
+        pumpswap_pool.token_reserve as f64,
+        expected_base_out_safe as f64,
+        pumpswap_pool.fee_bps,
+    )
+    .map(ceil_u64)
+    .unwrap_or(quote_amount_target_in)
+    .max(1);
+    let quote_amount_in =
+        ceil_u64((required_quote_amount_in as f64) * (1.0 + (buy_slippage_bps / 10_000.0)))
+            .max(quote_amount_target_in)
+            .max(required_quote_amount_in);
+
+    let quote_detail = quote_meteora_exact_in_detail(
+        meteora,
+        meteora_bin_arrays,
+        token_mint,
+        &pumpswap_pool.quote_mint,
+        expected_base_out_safe as f64,
+    )?;
+    let sell_slippage_bps = dynamic_pumpswap_meteora_sell_slippage_bps(
+        config,
+        meteora_liquidity_usdc,
+        trade_depth_bps,
+        quote_detail.touched_bin_array_indices.len(),
+    );
+    let expected_quote_back_raw = floor_u64(quote_detail.amount_out).max(1);
+    let expected_quote_back_safe =
+        floor_u64((expected_quote_back_raw as f64) * (1.0 - (sell_slippage_bps / 10_000.0))).max(1);
+    let meteora_fee_raw =
+        floor_u64(quote_detail.amount_out_without_fee).saturating_sub(expected_quote_back_raw);
+
+    let (lp_share_bps, protocol_share_bps, creator_share_bps, total_share_bps) =
+        normalized_pumpswap_fee_shares(config);
+    let pump_total_fee_raw =
+        ceil_u64((quote_amount_in as f64) * (pumpswap_pool.fee_bps / 10_000.0));
+    let pump_lp_fee_raw =
+        proportional_fee_component(pump_total_fee_raw, lp_share_bps, total_share_bps);
+    let pump_protocol_fee_raw =
+        proportional_fee_component(pump_total_fee_raw, protocol_share_bps, total_share_bps);
+    let pump_coin_creator_fee_raw = pump_total_fee_raw
+        .saturating_sub(pump_lp_fee_raw)
+        .saturating_sub(pump_protocol_fee_raw)
+        .max(proportional_fee_component(
+            pump_total_fee_raw,
+            creator_share_bps,
+            total_share_bps,
+        ));
+    let gross_profit_raw = (expected_quote_back_safe as i128) - (quote_amount_in as i128);
+    let gross_profit_pct = if quote_amount_in > 0 {
+        (gross_profit_raw as f64 / quote_amount_in as f64) * 100.0
+    } else {
+        0.0
+    };
+    let priority_fee_raw = quote_cost_raw_from_sol(
+        config,
+        &pumpswap_pool.quote_mint,
+        configured_priority_fee_lamports(config) as f64 / 1_000_000_000.0,
+    );
+    let dynamic_jito_tip_lamports = dynamic_jito_tip_lamports_for_quote_profit(
+        config,
+        &pumpswap_pool.quote_mint,
+        gross_profit_raw,
+        gross_profit_pct,
+    );
+    let jito_tip_raw = quote_cost_raw_from_sol(
+        config,
+        &pumpswap_pool.quote_mint,
+        dynamic_jito_tip_lamports as f64 / 1_000_000_000.0,
+    );
+    let wrap_unwrap_cost_raw = quote_cost_raw_from_sol(
+        config,
+        &pumpswap_pool.quote_mint,
+        config.strategy.pumpswap_meteora_wrap_unwrap_cost_sol,
+    );
+    let ata_cost_raw = quote_cost_raw_from_sol(
+        config,
+        &pumpswap_pool.quote_mint,
+        config.strategy.pumpswap_meteora_ata_cost_sol,
+    );
+    let failure_buffer_cost_raw = quote_cost_raw_from_usdc(
+        config,
+        &pumpswap_pool.quote_mint,
+        config.strategy.pumpswap_meteora_failure_buffer_usdc,
+    );
+    let total_fee_raw = pump_lp_fee_raw
+        .saturating_add(pump_protocol_fee_raw)
+        .saturating_add(pump_coin_creator_fee_raw)
+        .saturating_add(meteora_fee_raw)
+        .saturating_add(priority_fee_raw)
+        .saturating_add(jito_tip_raw)
+        .saturating_add(wrap_unwrap_cost_raw)
+        .saturating_add(ata_cost_raw)
+        .saturating_add(failure_buffer_cost_raw);
+    let fees_total_usdc = raw_to_usdc_for_mint(
+        &pumpswap_pool.quote_mint,
+        total_fee_raw as f64,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )
+    .unwrap_or_default();
+    let quote_in_principal_raw = quote_amount_in.saturating_sub(pump_total_fee_raw);
+    let expected_quote_back_before_meteora_fee_raw =
+        expected_quote_back_safe.saturating_add(meteora_fee_raw);
+    let real_net_profit_raw = (expected_quote_back_before_meteora_fee_raw as i128)
+        - (quote_in_principal_raw as i128)
+        - (pump_total_fee_raw as i128)
+        - (meteora_fee_raw as i128)
+        - (priority_fee_raw as i128)
+        - (jito_tip_raw as i128)
+        - (wrap_unwrap_cost_raw as i128)
+        - (ata_cost_raw as i128)
+        - (failure_buffer_cost_raw as i128);
+    let real_net_profit_usdc =
+        quote_raw_to_usdc_signed(&pumpswap_pool.quote_mint, real_net_profit_raw, config)?;
+
+    let arb_quote = ArbQuote {
+        token_mint: token_mint.to_string(),
+        forward_dex: "PumpSwap",
+        backward_dex: "Meteora",
+        forward_pool: pumpswap_pool.token_mint.clone(),
+        backward_pool: meteora.pool_address.clone(),
+        quote_mint: pumpswap_pool.quote_mint.clone(),
+        quote_in_raw: quote_amount_in,
+        quote_in_principal_raw,
+        expected_base_out_raw,
+        expected_base_out_safe,
+        expected_quote_back_raw,
+        expected_quote_back_safe,
+        expected_quote_back_before_meteora_fee_raw,
+        buy_slippage_bps,
+        sell_slippage_bps,
+        pump_quote_liquidity_usdc,
+        meteora_liquidity_usdc,
+        trade_depth_bps,
+        meteora_fee_bps: meteora.fee_bps,
+        touched_bin_arrays: quote_detail.touched_bin_array_indices.len(),
+        touched_bins: quote_detail.touched_bins,
+        fees: ArbFeeBreakdown {
+            pump_lp_fee_raw,
+            pump_protocol_fee_raw,
+            pump_coin_creator_fee_raw,
+            meteora_fee_raw,
+            priority_fee_raw,
+            jito_tip_raw,
+            wrap_unwrap_cost_raw,
+            ata_cost_raw,
+            failure_buffer_cost_raw,
+            total_raw: total_fee_raw,
+            total_usdc: fees_total_usdc,
+        },
+        real_net_profit_raw,
+        real_net_profit_usdc,
+    };
+    Some(ExactPreflightQuote::from_arb_quote(
+        config,
+        trade_size_usdc,
+        arb_quote,
+    ))
+}
+
+fn quote_meteora_buy_pumpswap_sell(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    meteora_bin_arrays: &[&meteora::MeteoraBinArrayState],
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let meteora_quote_mint =
+        meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    if pumpswap_pool.token_mint != token_mint || pumpswap_pool.quote_mint != meteora_quote_mint {
+        return None;
+    }
+
+    let quote_amount_in = usdc_to_raw_for_mint(
+        &pumpswap_pool.quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_meteora_exact_in(
+        meteora,
+        meteora_bin_arrays,
+        &pumpswap_pool.quote_mint,
+        token_mint,
+        quote_amount_in,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw = quote_constant_product_out(
+        pumpswap_pool.token_reserve as f64,
+        pumpswap_pool.quote_reserve as f64,
+        token_amount,
+        pumpswap_pool.fee_bps,
+    )?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        &pumpswap_pool.quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+fn quote_meteora_buy_meteora_sell(
+    config: &Config,
+    buy_meteora: &MeteoraState,
+    sell_meteora: &MeteoraState,
+    token_mint: &str,
+    buy_bin_arrays: &[&meteora::MeteoraBinArrayState],
+    sell_bin_arrays: &[&meteora::MeteoraBinArrayState],
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let buy_quote_mint =
+        buy_meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    let sell_quote_mint =
+        sell_meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    if buy_quote_mint != sell_quote_mint {
+        return None;
+    }
+    if buy_meteora.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)? != token_mint
+        || sell_meteora.traded_token(&config.tokens.usdc_mint, &config.tokens.sol_mint)?
+            != token_mint
+    {
+        return None;
+    }
+
+    let quote_amount_in = usdc_to_raw_for_mint(
+        &buy_quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_meteora_exact_in(
+        buy_meteora,
+        buy_bin_arrays,
+        &buy_quote_mint,
+        token_mint,
+        quote_amount_in,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw = quote_meteora_exact_in(
+        sell_meteora,
+        sell_bin_arrays,
+        token_mint,
+        &sell_quote_mint,
+        token_amount,
+    )?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        &sell_quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+fn whirlpool_counter_mint<'a>(whirlpool: &'a WhirlpoolState, token_mint: &str) -> Option<&'a str> {
+    if whirlpool.token_mint_a == token_mint {
+        Some(&whirlpool.token_mint_b)
+    } else if whirlpool.token_mint_b == token_mint {
+        Some(&whirlpool.token_mint_a)
+    } else {
+        None
+    }
+}
+
+fn whirlpool_tick_array_facade(start_tick_index: i32) -> orca_whirlpools_core::TickArrayFacade {
+    orca_whirlpools_core::TickArrayFacade {
+        start_tick_index,
+        ticks: [orca_whirlpools_core::TickFacade::default(); orca_whirlpools_core::TICK_ARRAY_SIZE],
+    }
+}
+
+fn whirlpool_tick_arrays_for_quote(
+    whirlpool: &WhirlpoolState,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+) -> Option<orca_whirlpools_core::TickArrays> {
+    let matching = whirlpool_tick_arrays
+        .values()
+        .filter(|array| array.whirlpool == whirlpool.pool_address)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return None;
+    }
+
+    let current_start_tick_index = orca_whirlpools_core::get_tick_array_start_tick_index(
+        whirlpool.tick_current_index,
+        whirlpool.tick_spacing,
+    );
+    let offset = whirlpool.tick_spacing as i32 * orca_whirlpools_core::TICK_ARRAY_SIZE as i32;
+    let ordered_start_indexes = [
+        current_start_tick_index,
+        current_start_tick_index + offset,
+        current_start_tick_index + offset * 2,
+        current_start_tick_index - offset,
+        current_start_tick_index - offset * 2,
+    ];
+    let by_start_index = matching
+        .into_iter()
+        .map(|array| (array.start_tick_index, array.tick_array))
+        .collect::<HashMap<_, _>>();
+    let facades = ordered_start_indexes.map(|start_tick_index| {
+        by_start_index
+            .get(&start_tick_index)
+            .copied()
+            .unwrap_or_else(|| whirlpool_tick_array_facade(start_tick_index))
+    });
+    Some(facades.into())
+}
+
+fn whirlpool_to_facade(state: &WhirlpoolState) -> orca_whirlpools_core::WhirlpoolFacade {
+    orca_whirlpools_core::WhirlpoolFacade {
+        fee_tier_index_seed: [0, 0],
+        tick_spacing: state.tick_spacing,
+        fee_rate: state.fee_rate,
+        protocol_fee_rate: state.protocol_fee_rate,
+        liquidity: state.liquidity,
+        sqrt_price: state.sqrt_price,
+        tick_current_index: state.tick_current_index,
+        fee_growth_global_a: 0,
+        fee_growth_global_b: 0,
+        reward_last_updated_timestamp: 0,
+        reward_infos: [
+            orca_whirlpools_core::WhirlpoolRewardInfoFacade::default(),
+            orca_whirlpools_core::WhirlpoolRewardInfoFacade::default(),
+            orca_whirlpools_core::WhirlpoolRewardInfoFacade::default(),
+        ],
+    }
+}
+
+fn quote_whirlpool_exact_in(
+    whirlpool: &WhirlpoolState,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    input_mint: &str,
+    amount_in: f64,
+) -> Option<f64> {
+    if amount_in <= 0.0 || !amount_in.is_finite() {
+        return None;
+    }
+
+    let amount_in = floor_u64(amount_in);
+    if amount_in == 0 {
+        return None;
+    }
+
+    let specified_token_a = if input_mint == whirlpool.token_mint_a {
+        true
+    } else if input_mint == whirlpool.token_mint_b {
+        false
+    } else {
+        return None;
+    };
+    let tick_arrays = whirlpool_tick_arrays_for_quote(whirlpool, whirlpool_tick_arrays)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let quote = orca_whirlpools_core::swap_quote_by_input_token(
+        amount_in,
+        specified_token_a,
+        0,
+        whirlpool_to_facade(whirlpool),
+        None,
+        tick_arrays,
+        timestamp,
+        None,
+        None,
+    )
+    .ok()?;
+    Some(quote.token_est_out as f64)
+}
+
+fn quote_pumpswap_buy_whirlpool_sell(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    whirlpool: &WhirlpoolState,
+    token_mint: &str,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let whirlpool_quote_mint =
+        whirlpool.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    if pumpswap_pool.token_mint != token_mint || pumpswap_pool.quote_mint != whirlpool_quote_mint {
+        return None;
+    }
+    let quote_amount_in = usdc_to_raw_for_mint(
+        &pumpswap_pool.quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_constant_product_out(
+        pumpswap_pool.quote_reserve as f64,
+        pumpswap_pool.token_reserve as f64,
+        quote_amount_in,
+        pumpswap_pool.fee_bps,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw =
+        quote_whirlpool_exact_in(whirlpool, whirlpool_tick_arrays, token_mint, token_amount)?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        &pumpswap_pool.quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+fn quote_whirlpool_buy_pumpswap_sell(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    whirlpool: &WhirlpoolState,
+    token_mint: &str,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let whirlpool_quote_mint =
+        whirlpool.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    if pumpswap_pool.token_mint != token_mint || pumpswap_pool.quote_mint != whirlpool_quote_mint {
+        return None;
+    }
+    let quote_amount_in = usdc_to_raw_for_mint(
+        &pumpswap_pool.quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_whirlpool_exact_in(
+        whirlpool,
+        whirlpool_tick_arrays,
+        &pumpswap_pool.quote_mint,
+        quote_amount_in,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw = quote_constant_product_out(
+        pumpswap_pool.token_reserve as f64,
+        pumpswap_pool.quote_reserve as f64,
+        token_amount,
+        pumpswap_pool.fee_bps,
+    )?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        &pumpswap_pool.quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+fn quote_meteora_buy_whirlpool_sell(
+    config: &Config,
+    meteora: &MeteoraState,
+    whirlpool: &WhirlpoolState,
+    token_mint: &str,
+    meteora_bin_arrays: &[&meteora::MeteoraBinArrayState],
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let meteora_quote_mint =
+        meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    let whirlpool_quote_mint =
+        whirlpool.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    if meteora_quote_mint != whirlpool_quote_mint {
+        return None;
+    }
+    let quote_amount_in = usdc_to_raw_for_mint(
+        &meteora_quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_meteora_exact_in(
+        meteora,
+        meteora_bin_arrays,
+        &meteora_quote_mint,
+        token_mint,
+        quote_amount_in,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw =
+        quote_whirlpool_exact_in(whirlpool, whirlpool_tick_arrays, token_mint, token_amount)?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        &meteora_quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+fn quote_whirlpool_buy_meteora_sell(
+    config: &Config,
+    meteora: &MeteoraState,
+    whirlpool: &WhirlpoolState,
+    token_mint: &str,
+    meteora_bin_arrays: &[&meteora::MeteoraBinArrayState],
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let meteora_quote_mint =
+        meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    let whirlpool_quote_mint =
+        whirlpool.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    if meteora_quote_mint != whirlpool_quote_mint {
+        return None;
+    }
+    let quote_amount_in = usdc_to_raw_for_mint(
+        &meteora_quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_whirlpool_exact_in(
+        whirlpool,
+        whirlpool_tick_arrays,
+        &meteora_quote_mint,
+        quote_amount_in,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw = quote_meteora_exact_in(
+        meteora,
+        meteora_bin_arrays,
+        token_mint,
+        &meteora_quote_mint,
+        token_amount,
+    )?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        &meteora_quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+fn quote_raydium_buy_whirlpool_sell(
+    config: &Config,
+    raydium: &RaydiumState,
+    whirlpool: &WhirlpoolState,
+    token_mint: &str,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let raydium_quote_mint = raydium_counter_mint(raydium, token_mint)?;
+    let whirlpool_quote_mint =
+        whirlpool.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    if raydium_quote_mint != whirlpool_quote_mint {
+        return None;
+    }
+    let quote_amount_in = usdc_to_raw_for_mint(
+        raydium_quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_raydium_exact_in(
+        config,
+        raydium,
+        raydium_clmm_tick_arrays,
+        raydium_quote_mint,
+        quote_amount_in,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw =
+        quote_whirlpool_exact_in(whirlpool, whirlpool_tick_arrays, token_mint, token_amount)?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        raydium_quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+fn quote_whirlpool_buy_raydium_sell(
+    config: &Config,
+    raydium: &RaydiumState,
+    whirlpool: &WhirlpoolState,
+    token_mint: &str,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    whirlpool_tick_arrays: &HashMap<String, WhirlpoolTickArrayState>,
+    trade_size_usdc: f64,
+) -> Option<ExactPreflightQuote> {
+    let raydium_quote_mint = raydium_counter_mint(raydium, token_mint)?;
+    let whirlpool_quote_mint =
+        whirlpool.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)?;
+    if raydium_quote_mint != whirlpool_quote_mint {
+        return None;
+    }
+    let quote_amount_in = usdc_to_raw_for_mint(
+        &whirlpool_quote_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    let token_amount = quote_whirlpool_exact_in(
+        whirlpool,
+        whirlpool_tick_arrays,
+        &whirlpool_quote_mint,
+        quote_amount_in,
+    )?;
+    let token_amount =
+        token_2022_post_fee_amount(config, token_mint, floor_u64(token_amount), 2).ok()? as f64;
+    let final_raw = quote_raydium_exact_in(
+        config,
+        raydium,
+        raydium_clmm_tick_arrays,
+        token_mint,
+        token_amount,
+    )?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        &whirlpool_quote_mint,
+        final_raw,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )?;
+    build_exact_preflight_quote(trade_size_usdc, token_amount, final_amount_usdc, config)
+}
+
+fn build_exact_preflight_quote(
+    trade_size_usdc: f64,
+    token_amount: f64,
+    final_amount_usdc: f64,
+    config: &Config,
+) -> Option<ExactPreflightQuote> {
+    if token_amount <= 0.0 || final_amount_usdc <= 0.0 {
+        return None;
+    }
+    let slippage_buffer_usdc = trade_size_usdc * strategy::quote::SLIPPAGE_BUFFER_BPS / 10_000.0;
+    let gas_cost_usdc = atomic_execution_gas_cost_usdc(
+        config.strategy.preflight_gas_cost_sol,
+        config.strategy.sol_usdc_price,
+    );
+
+    Some(ExactPreflightQuote::basic(
+        trade_size_usdc,
+        token_amount,
+        final_amount_usdc,
+        slippage_buffer_usdc,
+        gas_cost_usdc,
+    ))
+}
+
+fn quote_raydium_exact_in(
+    config: &Config,
+    raydium: &RaydiumState,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    input_mint: &str,
+    amount_in: f64,
+) -> Option<f64> {
+    if raydium.venue == RaydiumVenue::Clmm {
+        let tick_arrays: Vec<&raydium_clmm::ClmmTickArrayState> = raydium_clmm_tick_arrays
+            .values()
+            .filter(|tick_array| tick_array.pool_id == raydium.pool_address)
+            .collect();
+
+        if tick_arrays.is_empty() {
+            tracing::debug!(
+                "Raydium CLMM quote failed: no tick arrays 池={} input={} amount={}",
+                raydium.pool_address,
+                input_mint,
+                amount_in
+            );
+            return None;
+        }
+
+        let result =
+            strategy::clmm::quote_exact_input(raydium, &tick_arrays, input_mint, amount_in);
+        match result {
+            Ok(quote) => Some(quote.amount_out),
+            Err(e) => {
+                tracing::debug!(
+                    "Raydium CLMM quote failed: 池={} input={} amount={} error={:?}",
+                    raydium.pool_address,
+                    input_mint,
+                    amount_in,
+                    e
+                );
+                None
+            }
+        }
+    } else if input_mint == raydium.base_mint {
+        quote_constant_product_out(
+            raydium.effective_base_reserve() as f64,
+            raydium.effective_quote_reserve() as f64,
+            amount_in,
+            raydium.fee_bps,
+        )
+    } else if input_mint == raydium.quote_mint {
+        quote_constant_product_out(
+            raydium.effective_quote_reserve() as f64,
+            raydium.effective_base_reserve() as f64,
+            amount_in,
+            raydium.fee_bps,
+        )
+    } else {
+        tracing::debug!(
+            "Raydium quote failed: mint mismatch 池={} input={} base={} quote={}",
+            raydium.pool_address,
+            input_mint,
+            raydium.base_mint,
+            raydium.quote_mint
+        );
+        let _ = config;
+        None
+    }
+}
+
+fn quote_meteora_exact_in(
+    meteora: &MeteoraState,
+    bin_arrays: &[&meteora::MeteoraBinArrayState],
+    input_mint: &str,
+    output_mint: &str,
+    amount_in: f64,
+) -> Option<f64> {
+    quote_meteora_exact_in_detail(meteora, bin_arrays, input_mint, output_mint, amount_in)
+        .map(|detail| detail.amount_out)
+}
+
+fn quote_meteora_exact_in_detail(
+    meteora: &MeteoraState,
+    bin_arrays: &[&meteora::MeteoraBinArrayState],
+    input_mint: &str,
+    output_mint: &str,
+    amount_in: f64,
+) -> Option<MeteoraQuoteDetail> {
+    quote_meteora_exact_in_detail_with_fee_override(
+        meteora,
+        bin_arrays,
+        input_mint,
+        output_mint,
+        amount_in,
+        None,
+    )
+}
+
+fn quote_meteora_exact_in_detail_with_fee_override(
+    meteora: &MeteoraState,
+    bin_arrays: &[&meteora::MeteoraBinArrayState],
+    input_mint: &str,
+    output_mint: &str,
+    amount_in: f64,
+    total_fee_rate_override: Option<u64>,
+) -> Option<MeteoraQuoteDetail> {
+    if amount_in <= 0.0 || !amount_in.is_finite() {
+        tracing::debug!(
+            "Meteora quote failed: invalid amount_in={} 池={}",
+            amount_in,
+            meteora.pool_address
+        );
+        return None;
+    }
+
+    let x_to_y = input_mint == meteora.token_x_mint && output_mint == meteora.token_y_mint;
+    let y_to_x = input_mint == meteora.token_y_mint && output_mint == meteora.token_x_mint;
+    if !x_to_y && !y_to_x {
+        tracing::debug!(
+            "Meteora quote failed: mint mismatch 池={} input={} output={} x={} y={}",
+            meteora.pool_address,
+            input_mint,
+            output_mint,
+            meteora.token_x_mint,
+            meteora.token_y_mint
+        );
+        return None;
+    }
+
+    if meteora.is_damm_v2() {
+        let amount_in_raw = floor_u64(amount_in);
+        if amount_in_raw == 0 {
+            return None;
+        }
+        let pool_data = meteora.damm_v2_pool_data.as_ref()?;
+        let pool_data_len = std::mem::size_of::<MeteoraDammV2Pool>();
+        if pool_data.len() < pool_data_len {
+            tracing::debug!(
+                "Meteora DAMM v2 quote failed: pool data too short 池={} len={} required={}",
+                meteora.pool_address,
+                pool_data.len(),
+                pool_data_len
+            );
+            return None;
+        }
+        let pool: MeteoraDammV2Pool = pod_read_unaligned(&pool_data[..pool_data_len]);
+        if !meteora_damm_v2_pool_is_quoteable(&meteora.pool_address, &pool) {
+            return None;
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let rpc_url =
+            std::env::var("RPC_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
+        let slot = cached_current_slot(&rpc_url).ok()?;
+        let amount_out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            damm_v2_sdk::quote_exact_in::get_quote(
+                &pool,
+                timestamp,
+                slot,
+                amount_in_raw,
+                x_to_y,
+                false,
+            )
+        })) {
+            Ok(Ok(result)) if result.output_amount > 0 => result.output_amount as f64,
+            Ok(Ok(_)) => {
+                tracing::debug!(
+                    "Meteora DAMM v2 quote failed: zero output 池={} input={} output={} amount_in_raw={} liquidity={} sqrt_price={}",
+                    meteora.pool_address,
+                    input_mint,
+                    output_mint,
+                    amount_in_raw,
+                    pool.liquidity,
+                    pool.sqrt_price
+                );
+                return None;
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    "Meteora DAMM v2 quote failed: 池={} input={} output={} amount_in_raw={} liquidity={} sqrt_price={} error={:?}",
+                    meteora.pool_address,
+                    input_mint,
+                    output_mint,
+                    amount_in_raw,
+                    pool.liquidity,
+                    pool.sqrt_price,
+                    error
+                );
+                return None;
+            }
+            Err(panic_payload) => {
+                let panic_message = if let Some(message) = panic_payload.downcast_ref::<&str>() {
+                    *message
+                } else if let Some(message) = panic_payload.downcast_ref::<String>() {
+                    message.as_str()
+                } else {
+                    "<non-string panic>"
+                };
+                tracing::debug!(
+                    "Meteora 报价异常，已跳过：池={}，输入={}，输出={}，数量={}，流动性={}，价格={}，原因={}",
+                    meteora.pool_address,
+                    input_mint,
+                    output_mint,
+                    amount_in_raw,
+                    pool.liquidity,
+                    pool.sqrt_price,
+                    panic_message
+                );
+                return None;
+            }
+        };
+        let amount_out_without_fee = if total_fee_rate_override == Some(0) {
+            amount_out
+        } else {
+            amount_out * (1.0 + (meteora.fee_bps / 10_000.0))
+        };
+        return Some(MeteoraQuoteDetail {
+            amount_out,
+            amount_out_without_fee,
+            touched_bin_array_indices: vec![meteora::bin_array_index(meteora.active_id)],
+            touched_bins: 1,
+        });
+    }
+
+    let mut bins: Vec<(i64, &meteora::MeteoraBinState)> = bin_arrays
+        .iter()
+        .flat_map(|array| array.bins.iter().map(move |bin| (array.index, bin)))
+        .collect();
+
+    if bins.is_empty() {
+        tracing::debug!(
+            "Meteora quote failed: no bins available 池={} arrays={}",
+            meteora.pool_address,
+            bin_arrays.len()
+        );
+        return None;
+    }
+
+    if x_to_y {
+        bins.sort_by(|(_, a), (_, b)| b.bin_id.cmp(&a.bin_id));
+    } else {
+        bins.sort_by(|(_, a), (_, b)| a.bin_id.cmp(&b.bin_id));
+    }
+
+    let total_fee_rate =
+        total_fee_rate_override.unwrap_or_else(|| meteora.current_total_fee_rate());
+    let mut remaining = floor_u64(amount_in);
+    let mut amount_out = 0.0;
+    let mut amount_out_without_fee = 0.0;
+    let mut bins_used = 0;
+    let mut bins_skipped_empty = 0;
+    let mut bins_skipped_price = 0;
+    let mut touched_bin_array_indices = HashSet::new();
+
+    for (array_index, bin) in bins {
+        if x_to_y && bin.bin_id > meteora.active_id {
+            continue;
+        }
+        if y_to_x && bin.bin_id < meteora.active_id {
+            continue;
+        }
+
+        let price_y_per_x = meteora_bin_price_y_per_x(meteora, bin);
+        if price_y_per_x <= 0.0 || !price_y_per_x.is_finite() {
+            bins_skipped_price += 1;
+            continue;
+        }
+
+        if x_to_y {
+            let available_out = bin.amount_y as f64;
+            if available_out <= 0.0 {
+                bins_skipped_empty += 1;
+                continue;
+            }
+            let max_net_input_for_bin = ceil_u64(available_out / price_y_per_x);
+            let max_fee_for_bin =
+                meteora_compute_fee_for_net_input(total_fee_rate, max_net_input_for_bin);
+            let max_gross_input_for_bin = max_net_input_for_bin.saturating_add(max_fee_for_bin);
+            let used_gross_input = remaining.min(max_gross_input_for_bin);
+            let fee_amount = meteora_compute_fee_from_gross_input(total_fee_rate, used_gross_input);
+            let used_net_input = used_gross_input.saturating_sub(fee_amount);
+            amount_out += (used_net_input as f64) * price_y_per_x;
+            amount_out_without_fee += (used_gross_input as f64) * price_y_per_x;
+            bins_used += 1;
+            touched_bin_array_indices.insert(array_index);
+            remaining = remaining.saturating_sub(used_gross_input);
+        } else {
+            let available_out = bin.amount_x as f64;
+            if available_out <= 0.0 {
+                bins_skipped_empty += 1;
+                continue;
+            }
+            let max_net_input_for_bin = ceil_u64(available_out * price_y_per_x);
+            let max_fee_for_bin =
+                meteora_compute_fee_for_net_input(total_fee_rate, max_net_input_for_bin);
+            let max_gross_input_for_bin = max_net_input_for_bin.saturating_add(max_fee_for_bin);
+            let used_gross_input = remaining.min(max_gross_input_for_bin);
+            let fee_amount = meteora_compute_fee_from_gross_input(total_fee_rate, used_gross_input);
+            let used_net_input = used_gross_input.saturating_sub(fee_amount);
+            amount_out += (used_net_input as f64) / price_y_per_x;
+            amount_out_without_fee += (used_gross_input as f64) / price_y_per_x;
+            bins_used += 1;
+            touched_bin_array_indices.insert(array_index);
+            remaining = remaining.saturating_sub(used_gross_input);
+        }
+
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    if remaining > 0 || amount_out <= 0.0 || !amount_out.is_finite() {
+        tracing::debug!(
+            "Meteora quote failed: insufficient liquidity 池={} amount_in={} remaining={} amount_out={} bins_used={} bins_skipped_empty={} bins_skipped_price={} direction={}",
+            meteora.pool_address,
+            amount_in,
+            remaining,
+            amount_out,
+            bins_used,
+            bins_skipped_empty,
+            bins_skipped_price,
+            if x_to_y { "x_to_y" } else { "y_to_x" }
+        );
+        None
+    } else {
+        let conservative_amount_out = conservative_meteora_local_quote_amount(amount_out);
+        if conservative_amount_out > 0.0 && conservative_amount_out.is_finite() {
+            let conservative_amount_out_without_fee =
+                conservative_meteora_local_quote_amount(amount_out_without_fee);
+            let mut touched_bin_array_indices =
+                touched_bin_array_indices.into_iter().collect::<Vec<_>>();
+            if touched_bin_array_indices.is_empty() {
+                touched_bin_array_indices.push(meteora::bin_array_index(meteora.active_id));
+            }
+            if x_to_y {
+                touched_bin_array_indices.sort_by(|left, right| right.cmp(left));
+            } else {
+                touched_bin_array_indices.sort();
+            }
+            Some(MeteoraQuoteDetail {
+                amount_out: conservative_amount_out,
+                amount_out_without_fee: conservative_amount_out_without_fee
+                    .max(conservative_amount_out),
+                touched_bin_array_indices,
+                touched_bins: bins_used,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+fn meteora_damm_v2_pool_is_quoteable(pool_address: &str, pool: &MeteoraDammV2Pool) -> bool {
+    if pool.liquidity == 0 {
+        tracing::debug!(
+            "Meteora DAMM v2 quote skipped: zero liquidity 池={} sqrt_price={} token_a_amount={} token_b_amount={}",
+            pool_address,
+            pool.sqrt_price,
+            pool.token_a_amount,
+            pool.token_b_amount
+        );
+        return false;
+    }
+    if pool.sqrt_price == 0 {
+        tracing::debug!(
+            "Meteora DAMM v2 quote skipped: zero sqrt_price 池={} liquidity={} token_a_amount={} token_b_amount={}",
+            pool_address,
+            pool.liquidity,
+            pool.token_a_amount,
+            pool.token_b_amount
+        );
+        return false;
+    }
+    true
+}
+
+fn meteora_bin_price_y_per_x(meteora: &MeteoraState, bin: &meteora::MeteoraBinState) -> f64 {
+    if bin.price > 0 {
+        return bin.price as f64 / 18_446_744_073_709_551_616.0;
+    }
+
+    let base = 1.0 + (meteora.bin_step as f64 / 10_000.0);
+    base.powf(bin.bin_id as f64)
+}
+
+fn meteora_compute_fee_from_gross_input(total_fee_rate: u64, gross_amount: u64) -> u64 {
+    const FEE_PRECISION: u128 = 1_000_000_000;
+    if total_fee_rate == 0 || gross_amount == 0 {
+        return 0;
+    }
+    (((gross_amount as u128) * (total_fee_rate as u128)).saturating_add(FEE_PRECISION - 1)
+        / FEE_PRECISION)
+        .min(u64::MAX as u128) as u64
+}
+
+fn meteora_compute_fee_for_net_input(total_fee_rate: u64, net_input: u64) -> u64 {
+    const FEE_PRECISION: u128 = 1_000_000_000;
+    if total_fee_rate == 0 || net_input == 0 {
+        return 0;
+    }
+    let denominator = FEE_PRECISION.saturating_sub(total_fee_rate as u128).max(1);
+    (((net_input as u128) * (total_fee_rate as u128)).saturating_add(denominator - 1) / denominator)
+        .min(u64::MAX as u128) as u64
+}
+
+fn meteora_bin_arrays_for_quote_detail(
+    meteora_pool: &MeteoraState,
+    quote_detail: &MeteoraQuoteDetail,
+    input_mint: &str,
+    output_mint: &str,
+) -> Result<Vec<(i64, Pubkey)>> {
+    let x_to_y =
+        input_mint == meteora_pool.token_x_mint && output_mint == meteora_pool.token_y_mint;
+    let y_to_x =
+        input_mint == meteora_pool.token_y_mint && output_mint == meteora_pool.token_x_mint;
+    if !x_to_y && !y_to_x {
+        anyhow::bail!(
+            "Meteora swap mint mismatch: input={} output={} x={} y={}",
+            input_mint,
+            output_mint,
+            meteora_pool.token_x_mint,
+            meteora_pool.token_y_mint
+        );
+    }
+
+    let current_index = meteora::bin_array_index(meteora_pool.active_id);
+    let mut indices = quote_detail.touched_bin_array_indices.clone();
+    if !indices.contains(&current_index) {
+        indices.push(current_index);
+    }
+
+    let min_index = indices.iter().copied().min().unwrap_or(current_index);
+    let max_index = indices.iter().copied().max().unwrap_or(current_index);
+    for step in 1..=METEORA_EXECUTION_QUOTE_DETAIL_SAFETY_BIN_ARRAYS {
+        if x_to_y {
+            indices.push(max_index.saturating_add(step));
+            indices.push(min_index.saturating_sub(step));
+        } else {
+            indices.push(min_index.saturating_sub(step));
+            indices.push(max_index.saturating_add(step));
+        }
+    }
+
+    indices.sort();
+    indices.dedup();
+    if x_to_y {
+        indices.sort_by(|left, right| right.cmp(left));
+    }
+    indices
+        .into_iter()
+        .map(|index| {
+            Ok((
+                index,
+                Pubkey::from_str(&meteora::derive_bin_array_address(
+                    &meteora_pool.pool_address,
+                    index,
+                )?)?,
+            ))
+        })
+        .collect()
+}
+
+fn hydrated_meteora_bin_arrays_for_pool<'a>(
+    meteora_pool: &MeteoraState,
+    meteora_bin_arrays: &'a HashMap<String, meteora::MeteoraBinArrayState>,
+) -> Vec<&'a meteora::MeteoraBinArrayState> {
+    let mut arrays = meteora_bin_arrays
+        .values()
+        .filter(|array| array.lb_pair == meteora_pool.pool_address)
+        .collect::<Vec<_>>();
+    arrays.sort_by_key(|array| array.index);
+    arrays
+}
+
+fn meteora_swap_remaining_bin_arrays_for_exact_input_execution(
+    meteora_pool: &MeteoraState,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    input_mint: &str,
+    output_mint: &str,
+    amount_in: u64,
+) -> Result<Vec<(i64, Pubkey)>> {
+    let target_count = meteora_execution_bin_array_count(&meteora_pool.pool_address).max(1);
+    if !meteora_pool.is_damm_v2() && amount_in > 0 {
+        let hydrated_arrays =
+            hydrated_meteora_bin_arrays_for_pool(meteora_pool, meteora_bin_arrays);
+        if !hydrated_arrays.is_empty() {
+            if let Some(quote_detail) = quote_meteora_exact_in_detail(
+                meteora_pool,
+                &hydrated_arrays,
+                input_mint,
+                output_mint,
+                amount_in as f64,
+            ) {
+                let exact_arrays = meteora_bin_arrays_for_quote_detail(
+                    meteora_pool,
+                    &quote_detail,
+                    input_mint,
+                    output_mint,
+                )?;
+                if !exact_arrays.is_empty() {
+                    let mut merged_arrays = exact_arrays.clone();
+                    let pad_exact_arrays = meteora_pad_exact_bin_arrays(&meteora_pool.pool_address);
+                    if pad_exact_arrays && merged_arrays.len() < target_count {
+                        let window_arrays = meteora_swap_remaining_bin_arrays_for_execution(
+                            meteora_pool,
+                            meteora_bin_arrays,
+                            input_mint,
+                            output_mint,
+                        )?;
+                        let mut seen_indices = merged_arrays
+                            .iter()
+                            .map(|(index, _)| *index)
+                            .collect::<HashSet<_>>();
+                        for array in window_arrays {
+                            if merged_arrays.len() >= target_count {
+                                break;
+                            }
+                            if seen_indices.insert(array.0) {
+                                merged_arrays.push(array);
+                            }
+                        }
+                        let x_to_y = input_mint == meteora_pool.token_x_mint
+                            && output_mint == meteora_pool.token_y_mint;
+                        if x_to_y {
+                            merged_arrays.sort_by(|(left, _), (right, _)| right.cmp(left));
+                        } else {
+                            merged_arrays.sort_by(|(left, _), (right, _)| left.cmp(right));
+                        }
+                    }
+                    tracing::debug!(
+                        "Meteora exact execution arrays selected: 池={} input_mint={} output_mint={} amount_in={} exact_arrays={} final_arrays={} target_arrays={} pad_exact={}",
+                        meteora_pool.pool_address,
+                        input_mint,
+                        output_mint,
+                        amount_in,
+                        exact_arrays.len(),
+                        merged_arrays.len(),
+                        target_count,
+                        pad_exact_arrays
+                    );
+                    return Ok(merged_arrays);
+                }
+            }
+        }
+    }
+
+    meteora_swap_remaining_bin_arrays_for_execution(
+        meteora_pool,
+        meteora_bin_arrays,
+        input_mint,
+        output_mint,
+    )
+}
+
+fn estimated_meteora_exact_input_output_amount(
+    meteora_pool: &MeteoraState,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    input_mint: &str,
+    output_mint: &str,
+    amount_in: u64,
+) -> Option<u64> {
+    if meteora_pool.is_damm_v2() || amount_in == 0 {
+        return None;
+    }
+    let hydrated_arrays = hydrated_meteora_bin_arrays_for_pool(meteora_pool, meteora_bin_arrays);
+    quote_meteora_exact_in_detail(
+        meteora_pool,
+        &hydrated_arrays,
+        input_mint,
+        output_mint,
+        amount_in as f64,
+    )
+    .map(|detail| floor_u64(detail.amount_out).max(1))
+}
+
+async fn meteora_swap_remaining_bin_arrays_for_exact_input_execution_async(
+    config: &Config,
+    meteora_pool: &MeteoraState,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    input_mint: &str,
+    output_mint: &str,
+    amount_in: u64,
+) -> Result<Vec<(i64, Pubkey)>> {
+    let target_count = meteora_execution_bin_array_count(&meteora_pool.pool_address).max(1);
+    if !meteora_pool.is_damm_v2() && amount_in > 0 {
+        let hydrated_arrays =
+            hydrated_meteora_bin_arrays_for_pool(meteora_pool, meteora_bin_arrays);
+        if !hydrated_arrays.is_empty() {
+            if let Some(quote_detail) = quote_meteora_exact_in_detail(
+                meteora_pool,
+                &hydrated_arrays,
+                input_mint,
+                output_mint,
+                amount_in as f64,
+            ) {
+                let exact_arrays = meteora_bin_arrays_for_quote_detail(
+                    meteora_pool,
+                    &quote_detail,
+                    input_mint,
+                    output_mint,
+                )?;
+                let exact_arrays =
+                    retain_existing_meteora_dlmm_bin_arrays(config, meteora_pool, &exact_arrays)
+                        .await?;
+                if !exact_arrays.is_empty() {
+                    let mut merged_arrays = exact_arrays.clone();
+                    let pad_exact_arrays = meteora_pad_exact_bin_arrays(&meteora_pool.pool_address);
+                    if pad_exact_arrays && merged_arrays.len() < target_count {
+                        let window_arrays = meteora_swap_remaining_bin_arrays_for_execution_async(
+                            config,
+                            meteora_pool,
+                            meteora_bin_arrays,
+                            input_mint,
+                            output_mint,
+                        )
+                        .await?;
+                        let mut seen_indices = merged_arrays
+                            .iter()
+                            .map(|(index, _)| *index)
+                            .collect::<HashSet<_>>();
+                        for array in window_arrays {
+                            if merged_arrays.len() >= target_count {
+                                break;
+                            }
+                            if seen_indices.insert(array.0) {
+                                merged_arrays.push(array);
+                            }
+                        }
+                        let x_to_y = input_mint == meteora_pool.token_x_mint
+                            && output_mint == meteora_pool.token_y_mint;
+                        if x_to_y {
+                            merged_arrays.sort_by(|(left, _), (right, _)| right.cmp(left));
+                        } else {
+                            merged_arrays.sort_by(|(left, _), (right, _)| left.cmp(right));
+                        }
+                    }
+                    tracing::debug!(
+                        "Meteora exact execution arrays selected: 池={} input_mint={} output_mint={} amount_in={} exact_arrays={} final_arrays={} target_arrays={} pad_exact={}",
+                        meteora_pool.pool_address,
+                        input_mint,
+                        output_mint,
+                        amount_in,
+                        exact_arrays.len(),
+                        merged_arrays.len(),
+                        target_count,
+                        pad_exact_arrays
+                    );
+                    validate_meteora_dlmm_accounts(config, meteora_pool, &merged_arrays).await?;
+                    return Ok(merged_arrays);
+                }
+            }
+        }
+    }
+
+    meteora_swap_remaining_bin_arrays_for_execution_async(
+        config,
+        meteora_pool,
+        meteora_bin_arrays,
+        input_mint,
+        output_mint,
+    )
+    .await
+}
+
+async fn preflight_pumpswap_clmm(
+    execution_manager: Option<&ExecutionManager>,
+    config: &Config,
+    pumpswap_state: Option<&PumpSwapState>,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+    direction: ClmmSpotDirection,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    stats: &mut RuntimeStats,
+) {
+    let tick_arrays: Vec<&raydium_clmm::ClmmTickArrayState> = raydium_clmm_tick_arrays
+        .values()
+        .filter(|tick_array| tick_array.pool_id == raydium.pool_address)
+        .collect();
+    let path_label = pumpswap_clmm_direction_label(direction);
+    if !pumpswap_clmm_execution_direction_enabled(direction) {
+        return;
+    }
+
+    if tick_arrays.is_empty() {
+        stats.clmm_preflight_missing_tick_arrays += 1;
+        return;
+    }
+
+    for trade_size_usdc in effective_trade_sizes_usdc(execution_manager, config) {
+        let preflight_result = match direction {
+            ClmmSpotDirection::PumpSwapToClmm => preflight_pumpswap_buy_clmm_sell(
+                config,
+                pumpswap_pool,
+                raydium,
+                raydium_token,
+                &tick_arrays,
+                trade_size_usdc,
+            ),
+            ClmmSpotDirection::ClmmToPumpSwap => preflight_clmm_buy_pumpswap_sell(
+                config,
+                pumpswap_pool,
+                raydium,
+                raydium_token,
+                &tick_arrays,
+                trade_size_usdc,
+            ),
+        };
+
+        match preflight_result {
+            Ok(clmm_quote) => {
+                let net_profit_pct = (clmm_quote.net_profit_usdc / trade_size_usdc) * 100.0;
+                let threshold_passed = should_attempt_simulation_after_preflight(
+                    net_profit_pct,
+                    active_offchain_profit_threshold_pct(execution_manager, config),
+                );
+
+                if threshold_passed {
+                    stats.clmm_preflight_passed += 1;
+                    if should_log_candidate(stats, "clmm_preflight", raydium_token, net_profit_pct)
+                    {
+                        tracing::debug!(
+                            "预检通过: 路径={} 币种={} 金额=${:.2} 预估回款=${:.4} 预估净利润=${:.4} 收益率={:.2}% CLMM手续费={:.0}",
+                            clmm_quote.path_label,
+                            raydium_token,
+                            trade_size_usdc,
+                            clmm_quote.final_amount_usdc,
+                            clmm_quote.net_profit_usdc,
+                            net_profit_pct,
+                            clmm_quote.clmm_fee_amount
+                        );
+                    }
+                    let simulated = if let Some(execution_manager) = execution_manager {
+                        maybe_simulate_pumpswap_clmm(
+                            execution_manager,
+                            config,
+                            pumpswap_state,
+                            pumpswap_pool,
+                            raydium,
+                            raydium_token,
+                            direction,
+                            raydium_clmm_tick_arrays,
+                            pumpswap_protocol_fee_recipient,
+                            &clmm_quote,
+                            trade_size_usdc,
+                            stats,
+                        )
+                        .await
+                    } else {
+                        false
+                    };
+                    if !simulated {
+                        record_tx_build_blocked(
+                            stats,
+                            "pumpswap_clmm",
+                            raydium_token,
+                            match direction {
+                                ClmmSpotDirection::PumpSwapToClmm => "PumpSwap",
+                                ClmmSpotDirection::ClmmToPumpSwap => raydium.venue.label(),
+                            },
+                            match direction {
+                                ClmmSpotDirection::PumpSwapToClmm => raydium.venue.label(),
+                                ClmmSpotDirection::ClmmToPumpSwap => "PumpSwap",
+                            },
+                            &pumpswap_clmm_send_blocker(
+                                pumpswap_state,
+                                raydium,
+                                tick_arrays.len(),
+                                pumpswap_protocol_fee_recipient,
+                            ),
+                        );
+                    }
+                } else if should_log_candidate(
+                    stats,
+                    "clmm_preflight_invalid_profit",
+                    raydium_token,
+                    0.0,
+                ) {
+                    tracing::debug!(
+                        "跳过模拟：预检收益低于阈值，路径={}，币种={}，金额=${:.2}，净利=${:.4}，收益={:.2}%，阈值={:.2}%",
+                        clmm_quote.path_label,
+                        raydium_token,
+                        trade_size_usdc,
+                        clmm_quote.net_profit_usdc,
+                        net_profit_pct,
+                        active_offchain_profit_threshold_pct(execution_manager, config)
+                    );
+                }
+            }
+            Err(strategy::clmm::ClmmQuoteError::TickCrossingRequired) => {
+                stats.clmm_preflight_tick_crossing_required += 1;
+                let key = format!(
+                    "clmm_preflight_blocked:{}:{}:tick_crossing",
+                    raydium.pool_address, raydium_token
+                );
+                if should_log_candidate_key(stats, key, 0.0) {
+                    tracing::debug!(
+                        "CLMM 预检需要更多 tick：币种={}，路径={}",
+                        raydium_token,
+                        path_label
+                    );
+                }
+            }
+            Err(e @ strategy::clmm::ClmmQuoteError::MissingTickArray)
+            | Err(e @ strategy::clmm::ClmmQuoteError::MissingBoundaryTick) => {
+                stats.clmm_preflight_missing_tick_arrays += 1;
+                let key = format!(
+                    "clmm_preflight_blocked:{}:{}:missing_ticks",
+                    raydium.pool_address, raydium_token
+                );
+                if should_log_candidate_key(stats, key, 0.0) {
+                    tracing::debug!(
+                        "CLMM 预检缺少 tick：币种={}，路径={}，原因={:?}",
+                        raydium_token,
+                        path_label,
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                let key = format!(
+                    "clmm_preflight_blocked:{}:{}:other",
+                    raydium.pool_address, raydium_token
+                );
+                if should_log_candidate_key(stats, key, 0.0) {
+                    tracing::debug!(
+                        "CLMM 预检报价失败：币种={}，路径={}，原因={:?}",
+                        raydium_token,
+                        path_label,
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn clmm_quote_sol_input_lamports(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+    direction: ClmmSpotDirection,
+    quote: &ClmmPreflightQuote,
+) -> Option<u64> {
+    match direction {
+        ClmmSpotDirection::PumpSwapToClmm => {
+            (pumpswap_pool.quote_mint == config.tokens.sol_mint).then_some(quote.quote_amount_in)
+        }
+        ClmmSpotDirection::ClmmToPumpSwap => {
+            let clmm_input_mint = raydium_counter_mint(raydium, raydium_token)?;
+            (clmm_input_mint == config.tokens.sol_mint).then_some(quote.clmm_amount_in)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_simulate_pumpswap_clmm(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    pumpswap_state: Option<&PumpSwapState>,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+    direction: ClmmSpotDirection,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    quote: &ClmmPreflightQuote,
+    trade_size_usdc: f64,
+    stats: &mut RuntimeStats,
+) -> bool {
+    if !pumpswap_clmm_execution_direction_enabled(direction) {
+        return true;
+    }
+    let Some(pumpswap_state) = pumpswap_state else {
+        return false;
+    };
+    if !execution_pre_send_simulation_enabled(execution_manager) {
+        return maybe_send_pumpswap_clmm_direct_with_trade_size(
+            execution_manager,
+            config,
+            pumpswap_state,
+            pumpswap_pool,
+            raydium,
+            raydium_token,
+            direction,
+            raydium_clmm_tick_arrays,
+            pumpswap_protocol_fee_recipient,
+            trade_size_usdc,
+            (quote.net_profit_usdc / trade_size_usdc) * 100.0,
+            stats,
+        )
+        .await;
+    }
+
+    let net_profit_pct = (quote.net_profit_usdc / trade_size_usdc) * 100.0;
+    let live_send_min_profit_pct = execution_manager.live_send_min_profit_pct();
+    let jito_tip_usdc = (execution_manager.jito_tip_lamports() as f64 / 1_000_000_000.0)
+        * config.strategy.sol_usdc_price;
+    let quoted_effective_net_profit_pct =
+        ((quote.net_profit_usdc - jito_tip_usdc) / trade_size_usdc) * 100.0;
+    let key = format!(
+        "simulate:pumpswap_clmm:{}:{}:{:.2}",
+        raydium.pool_address, quote.path_label, trade_size_usdc
+    );
+    if !should_attempt_candidate_key(stats, key, net_profit_pct) {
+        return true;
+    }
+
+    stats.tx_build_required += 1;
+    let plan = match build_pumpswap_clmm_simulation_instructions(
+        config,
+        execution_manager,
+        Some(pumpswap_state),
+        pumpswap_pool,
+        raydium,
+        raydium_token,
+        direction,
+        raydium_clmm_tick_arrays,
+        pumpswap_protocol_fee_recipient,
+        quote,
+        trade_size_usdc,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(e) => {
+            stats.tx_build_blocked += 1;
+            tracing::debug!(
+                "构建原子交易失败：路径={}，币种={}，原因={}",
+                quote.path_label,
+                raydium_token,
+                summarize_block_reason(&e.to_string())
+            );
+            return false;
+        }
+    };
+
+    let atomic_instructions = match maybe_wrap_plan_with_two_hop_executor(
+        execution_manager,
+        config,
+        quote.path_label,
+        trade_size_usdc,
+        &plan,
+    ) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            stats.tx_build_blocked += 1;
+            tracing::debug!(
+                "构建链上两腿指令失败：路径={}，币种={}，原因={}",
+                quote.path_label,
+                raydium_token,
+                summarize_block_reason(&error.to_string())
+            );
+            return false;
+        }
+    };
+
+    stats.simulation_required += 1;
+    match execution_manager
+        .simulate_instructions_with_accounts(
+            atomic_instructions.clone(),
+            &[plan.net_quote_token_account.to_string()],
+        )
+        .await
+    {
+        Ok((report, accounts)) => {
+            stats.simulation_passed += 1;
+            stats.last_simulation_error = None;
+            let simulated_quote_net_change_raw = simulated_token_account_net_change(
+                &accounts,
+                &plan.net_quote_token_account,
+                plan.net_quote_start_balance,
+            );
+            let simulated_quote_net_change_usdc = simulated_quote_net_change_raw
+                .and_then(|amount| {
+                    raw_to_usdc_for_mint(
+                        &plan.net_quote_mint,
+                        amount as f64,
+                        &config.tokens.usdc_mint,
+                        &config.tokens.sol_mint,
+                        config.strategy.sol_usdc_price,
+                    )
+                })
+                .unwrap_or(f64::NEG_INFINITY);
+            let simulated_effective_net_profit_pct =
+                direct_execution_gate_profit_pct_from_gross_profit_usdc(
+                    execution_manager,
+                    config,
+                    trade_size_usdc,
+                    simulated_quote_net_change_usdc,
+                );
+            let live_send_eligible =
+                passes_direct_execution_gate(simulated_effective_net_profit_pct);
+            tracing::debug!(
+                "原子模拟通过: 路径={} 币种={} CU={:?} 预估收益率={:.2}% 模拟净变化={:?} 模拟收益率={:.2}% 交易数据={}",
+                quote.path_label,
+                raydium_token,
+                report.units_consumed,
+                quoted_effective_net_profit_pct,
+                simulated_quote_net_change_raw,
+                simulated_effective_net_profit_pct,
+                report.transaction_base64.as_deref().unwrap_or("<missing>")
+            );
+            let live_send_enabled = execution_manager.live_send_enabled();
+            if live_send_enabled && live_send_eligible {
+                match send_direct_plan_with_optional_setup_split_and_units(
+                    execution_manager,
+                    config,
+                    "pumpswap_clmm",
+                    quote.path_label,
+                    raydium_token,
+                    trade_size_usdc,
+                    &plan,
+                    report.units_consumed,
+                )
+                .await
+                {
+                    Ok(bundle_id) => {
+                        log_send_success(
+                            "pumpswap_clmm",
+                            quote.path_label,
+                            raydium_token,
+                            &bundle_id,
+                            simulated_effective_net_profit_pct,
+                        );
+                    }
+                    Err(send_error) => {
+                        tracing::debug!(
+                            "实盘发送失败：路线=PumpSwap到Raydium CLMM，路径={}，币种={}，原因={}",
+                            quote.path_label,
+                            raydium_token,
+                            send_error
+                        );
+                    }
+                }
+            } else {
+                let reason = if !live_send_enabled {
+                    "live_send_disabled"
+                } else {
+                    "negative_simulated_profit"
+                };
+                tracing::debug!(
+                    "跳过实盘: 路径={} 币种={} 原因={} 预估收益率={:.2}% 模拟收益率={:.2}% 实盘阈值={:.2}%",
+                    quote.path_label,
+                    raydium_token,
+                    summarize_live_send_skip_reason(reason),
+                    quoted_effective_net_profit_pct,
+                    simulated_effective_net_profit_pct,
+                    live_send_min_profit_pct
+                );
+            }
+            true
+        }
+        Err(e) => {
+            stats.simulation_failed += 1;
+            stats.last_simulation_error = Some(e.to_string());
+            let summarized_error = summarize_simulation_error(&e.to_string());
+            tracing::debug!(
+                "原子模拟失败：路径={}，币种={}，原因={}",
+                quote.path_label,
+                raydium_token,
+                summarized_error
+            );
+            if e.to_string().contains("serialized transaction too large") {
+                let alt_key = format!(
+                    "alt_candidate:{}:{}",
+                    raydium.pool_address, quote.path_label
+                );
+                if should_log_candidate_key(stats, alt_key, 0.0) {
+                    let candidate_addresses =
+                        collect_instruction_account_addresses(&plan.atomic_instructions);
+                    tracing::debug!(
+                        "地址表候选账户: 路径={} 币种={} count={} addresses={}",
+                        quote.path_label,
+                        raydium_token,
+                        candidate_addresses.len(),
+                        candidate_addresses.join(",")
+                    );
+                }
+                match execution_manager
+                    .simulate_instructions(plan.fallback_instructions)
+                    .await
+                {
+                    Ok(report) => {
+                        tracing::debug!(
+                            "单腿模拟通过: leg={} 路径={} 币种={} CU={:?} 备注=两腿原子交易过大 交易数据={}",
+                            plan.fallback_label,
+                            quote.path_label,
+                            raydium_token,
+                            report.units_consumed,
+                            report.transaction_base64.as_deref().unwrap_or("<missing>")
+                        );
+                    }
+                    Err(fallback_error) => {
+                        let summarized_error =
+                            summarize_simulation_error(&fallback_error.to_string());
+                        tracing::debug!(
+                            "单腿模拟失败：腿={}，路径={}，币种={}，原因={}",
+                            plan.fallback_label,
+                            quote.path_label,
+                            raydium_token,
+                            summarized_error
+                        );
+                        if !plan.setup_instructions.is_empty() {
+                            match execution_manager
+                                .simulate_instructions(plan.setup_instructions)
+                                .await
+                            {
+                                Ok(report) => {
+                                    tracing::debug!(
+                                        "钱包准备模拟通过: 路径={} 币种={} CU={:?} 备注=DEX腿仍失败 交易数据={}",
+                                        quote.path_label,
+                                        raydium_token,
+                                        report.units_consumed,
+                                        report.transaction_base64.as_deref().unwrap_or("<missing>")
+                                    );
+                                }
+                                Err(setup_error) => {
+                                    let summarized_error =
+                                        summarize_simulation_error(&setup_error.to_string());
+                                    tracing::debug!(
+                                        "钱包准备模拟失败：路径={}，币种={}，原因={}",
+                                        quote.path_label,
+                                        raydium_token,
+                                        summarized_error
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+fn collect_instruction_account_addresses(instructions: &[Instruction]) -> Vec<String> {
+    collect_instruction_account_pubkeys(instructions)
+        .into_iter()
+        .map(|pubkey| pubkey.to_string())
+        .collect()
+}
+
+fn instruction_account_lock_summary(instructions: &[Instruction]) -> (usize, usize, usize) {
+    let mut unique_accounts = HashSet::new();
+    let mut unique_writable_accounts = HashSet::new();
+    for instruction in instructions {
+        unique_accounts.insert(instruction.program_id);
+        for account in &instruction.accounts {
+            unique_accounts.insert(account.pubkey);
+            if account.is_writable {
+                unique_writable_accounts.insert(account.pubkey);
+            }
+        }
+    }
+    (
+        instructions.len(),
+        unique_accounts.len(),
+        unique_writable_accounts.len(),
+    )
+}
+
+fn log_instruction_account_lock_summary(
+    route_kind: &str,
+    path_label: &str,
+    token_mint: &str,
+    instructions: &[Instruction],
+) {
+    let (instruction_count, unique_accounts, unique_writable_accounts) =
+        instruction_account_lock_summary(instructions);
+    tracing::debug!(
+        "账户锁统计：路线={}，路径={}，币种={}，指令={}，账户={}，可写账户={}",
+        route_kind,
+        path_label,
+        token_mint,
+        instruction_count,
+        unique_accounts,
+        unique_writable_accounts,
+    );
+}
+
+fn collect_instruction_account_pubkeys(instructions: &[Instruction]) -> Vec<Pubkey> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    for instruction in instructions {
+        if seen.insert(instruction.program_id) {
+            ordered.push(instruction.program_id);
+        }
+        for account in &instruction.accounts {
+            if seen.insert(account.pubkey) {
+                ordered.push(account.pubkey);
+            }
+        }
+    }
+    ordered
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_pumpswap_clmm_simulation_instructions(
+    config: &Config,
+    execution_manager: &ExecutionManager,
+    pumpswap_state: Option<&PumpSwapState>,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+    direction: ClmmSpotDirection,
+    raydium_clmm_tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    pumpswap_protocol_fee_recipient: Option<&str>,
+    quote: &ClmmPreflightQuote,
+    trade_size_usdc: f64,
+) -> Result<SimulationInstructionPlan> {
+    if !pumpswap_clmm_execution_direction_enabled(direction) {
+        anyhow::bail!(
+            "PumpSwap/Raydium CLMM reverse direction disabled: {}",
+            pumpswap_clmm_direction_label(direction)
+        );
+    }
+    let pumpswap = pumpswap_state.ok_or_else(|| anyhow::anyhow!("missing PumpSwap pool state"))?;
+    if pumpswap.base_mint != pumpswap_pool.token_mint
+        || pumpswap.quote_mint != pumpswap_pool.quote_mint
+    {
+        anyhow::bail!(
+            "Pump AMM simulation supports base=token quote=SOL/USDC pools only; pool base={} quote={} normalized 币种={} quote={}",
+            pumpswap.base_mint,
+            pumpswap.quote_mint,
+            pumpswap_pool.token_mint,
+            pumpswap_pool.quote_mint
+        );
+    }
+
+    let user = execution_manager
+        .wallet_pubkey()
+        .ok_or_else(|| anyhow::anyhow!("executor wallet is not configured"))?;
+    let protocol_fee_recipient = Pubkey::from_str(
+        pumpswap_protocol_fee_recipient
+            .ok_or_else(|| anyhow::anyhow!("missing Pump AMM protocol_fee_recipient"))?,
+    )?;
+    let base_token_program = token_program_for_simulation(config, &pumpswap.base_mint).await?;
+    let quote_token_program = token_program_for_simulation(config, &pumpswap.quote_mint).await?;
+    let base_mint = Pubkey::from_str(&pumpswap.base_mint)?;
+    let quote_mint = Pubkey::from_str(&pumpswap.quote_mint)?;
+    let max_sol_input_lamports = max_sol_input_lamports_for_trade_size(config, trade_size_usdc)?;
+    let pump_accounts = executor::swap::derive_pump_amm_accounts_with_token_programs(
+        pumpswap,
+        &user,
+        &protocol_fee_recipient,
+        &base_token_program,
+        &quote_token_program,
+    )?;
+    let net_quote_start_balance = token_account_balance(
+        &config.rpc.http_url,
+        &pump_accounts.user_quote_token_account,
+    )
+    .await?;
+    let mut ata_specs = vec![
+        (base_mint, base_token_program),
+        (quote_mint, quote_token_program),
+    ];
+    if let ClmmSpotDirection::ClmmToPumpSwap = direction {
+        let clmm_input_mint = raydium_counter_mint(raydium, raydium_token)
+            .ok_or_else(|| anyhow::anyhow!("Raydium CLMM counter mint not found"))?;
+        ata_specs.push((
+            Pubkey::from_str(clmm_input_mint)?,
+            token_program_for_simulation(config, clmm_input_mint).await?,
+        ));
+    } else if let Some(raydium_output_mint) = raydium_counter_mint(raydium, raydium_token) {
+        ata_specs.push((
+            Pubkey::from_str(raydium_output_mint)?,
+            token_program_for_simulation(config, raydium_output_mint).await?,
+        ));
+    }
+    let mut prepared_atas =
+        existing_associated_token_accounts(&config.rpc.http_url, &user, &ata_specs).await?;
+
+    let mut instructions = Vec::new();
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &base_mint,
+        &base_token_program,
+        &mut prepared_atas,
+    )?;
+    push_ata_setup(
+        &mut instructions,
+        &user,
+        &quote_mint,
+        &quote_token_program,
+        &mut prepared_atas,
+    )?;
+
+    match direction {
+        ClmmSpotDirection::PumpSwapToClmm => {
+            let raydium_input_token_program =
+                token_program_for_simulation(config, raydium_token).await?;
+            let raydium_output_mint = raydium_counter_mint(raydium, raydium_token)
+                .ok_or_else(|| anyhow::anyhow!("Raydium CLMM counter mint not found"))?;
+            if raydium_output_mint != pumpswap.quote_mint {
+                anyhow::bail!(
+                    "PumpSwap->CLMM round-trip quote mint mismatch: pump quote={} raydium output={}",
+                    pumpswap.quote_mint,
+                    raydium_output_mint
+                );
+            }
+            if raydium_output_mint != config.tokens.sol_mint {
+                anyhow::bail!(
+                    "PumpSwap->Raydium CLMM currently only supports token->WSOL second leg; output={}",
+                    raydium_output_mint
+                );
+            }
+            let raydium_output_token_program =
+                token_program_for_simulation(config, raydium_output_mint).await?;
+            let pool_tick_arrays =
+                raydium_clmm_tick_array_refs_for_pool(raydium, raydium_clmm_tick_arrays);
+            let best_input = calculate_best_pump_to_raydium_input(
+                config,
+                pumpswap_pool,
+                raydium,
+                raydium_token,
+                &pool_tick_arrays,
+                max_sol_input_lamports,
+            )?;
+            let pump_max_quote_amount_in =
+                pump_buy_max_quote_amount_in(best_input.pump_quote_in_lamports);
+            if pumpswap.quote_mint == config.tokens.sol_mint {
+                ensure_simulation_sol_input_within_cap(
+                    "PumpSwap quote input",
+                    pump_max_quote_amount_in,
+                    max_sol_input_lamports,
+                )?;
+                ensure_existing_associated_token_account_balance(
+                    &config.rpc.http_url,
+                    &user,
+                    &quote_mint,
+                    &quote_token_program,
+                    &mut prepared_atas,
+                    pump_max_quote_amount_in,
+                    "pre-wrapped SOL ATA",
+                )
+                .await?;
+            }
+            let setup_instructions = instructions.clone();
+            let mut diagnostic_buy_instruction = executor::swap::build_pump_amm_buy(
+                &pump_accounts.buy_exact_quote_in_accounts(),
+                best_input.expected_pump_token_out,
+                pump_max_quote_amount_in,
+                false,
+            )?;
+            diagnostic_buy_instruction
+                .accounts
+                .extend(pump_amm_buy_remaining_accounts(
+                    config,
+                    pumpswap,
+                    &pump_accounts,
+                )?);
+            let raydium_route = raydium_clmm_quote_swap_v2_route_for_mints(
+                raydium,
+                raydium_clmm_tick_arrays,
+                raydium_token,
+                raydium_output_mint,
+                best_input.raydium_token_in,
+            )?;
+            let remaining_tick_arrays = raydium_route.remaining_tick_arrays.clone();
+            let raydium_accounts =
+                executor::swap::derive_raydium_clmm_exact_input_accounts_with_token_programs(
+                    raydium,
+                    &user,
+                    raydium_token,
+                    raydium_output_mint,
+                    &raydium_input_token_program,
+                    &raydium_output_token_program,
+                    &raydium_route.first_tick_array.to_string(),
+                )?;
+            if raydium_accounts.output_token_account != pump_accounts.user_quote_token_account {
+                anyhow::bail!(
+                    "PumpSwap->CLMM round-trip quote ATA mismatch: pump quote ATA={} raydium output ATA={}",
+                    pump_accounts.user_quote_token_account,
+                    raydium_accounts.output_token_account
+                );
+            }
+            tracing::debug!(
+                "Pump 到 CLMM 账户：币种={}，Pump用户ATA={}，Raydium输入ATA={}，固定输入={}",
+                raydium_token,
+                pump_accounts.user_base_token_account,
+                raydium_accounts.input_token_account,
+                best_input.raydium_token_in
+            );
+            tracing::debug!(
+                "Pump 到 Raydium 最优输入：币种={}，Pump付款={}，Pump最大付款={}，Pump产出={}，Raydium输入={}，Raydium最小回款={}，Raydium预计回款={}",
+                raydium_token,
+                best_input.pump_quote_in_lamports,
+                pump_max_quote_amount_in,
+                best_input.expected_pump_token_out,
+                best_input.raydium_token_in,
+                best_input.min_raydium_wsol_out,
+                raydium_route.expected_output
+            );
+            log_raydium_clmm_swap_v2_wiring(
+                "PumpSwap->Raydium CLMM",
+                raydium_token,
+                raydium,
+                &raydium_accounts,
+                raydium_route.zero_for_one,
+                raydium_route.sqrt_price_limit_x64,
+                &remaining_tick_arrays,
+                best_input.raydium_token_in,
+                best_input.min_raydium_wsol_out,
+            );
+            let diagnostic_atomic_clmm_instruction =
+                executor::swap::build_raydium_clmm_swap_v2_with_remaining_tick_arrays(
+                    &raydium_accounts.swap_v2_accounts(),
+                    &remaining_tick_arrays,
+                    best_input.raydium_token_in,
+                    best_input.min_raydium_wsol_out,
+                    raydium_route.sqrt_price_limit_x64,
+                    RAYDIUM_CLMM_EXACT_INPUT,
+                )?;
+            let simulated_clmm_quote_out = simulate_raydium_execution_accounts_best_effort(
+                execution_manager,
+                {
+                    let mut diagnostic_atomic_instructions = setup_instructions.clone();
+                    diagnostic_atomic_instructions.push(diagnostic_buy_instruction.clone());
+                    diagnostic_atomic_instructions.push(diagnostic_atomic_clmm_instruction.clone());
+                    diagnostic_atomic_instructions
+                },
+                &[pump_accounts.user_quote_token_account.to_string()],
+                raydium,
+                "pumpswap_clmm",
+                "PumpSwap->Raydium CLMM",
+                raydium_token,
+                "PumpSwap->Raydium CLMM atomic calibration",
+            )
+            .await?
+            .and_then(|accounts| {
+                simulated_second_leg_quote_output_from_atomic_delta(
+                    &accounts,
+                    &pump_accounts.user_quote_token_account,
+                    net_quote_start_balance,
+                    best_input.pump_quote_in_lamports,
+                )
+            })
+            .filter(|amount| *amount > 0);
+            let (simulated_clmm_quote_out, clmm_quote_source) =
+                if let Some(amount) = simulated_clmm_quote_out {
+                    (amount, SecondLegQuoteSource::Simulated)
+                } else {
+                    (
+                        raydium_route.expected_output,
+                        SecondLegQuoteSource::FallbackQuote,
+                    )
+                };
+            let old_execution_min_quote_out =
+                execution_min_output(execution_manager, simulated_clmm_quote_out);
+            let clmm_min_quote_out = best_input.min_raydium_wsol_out;
+            instructions = setup_instructions.clone();
+            instructions.push(diagnostic_buy_instruction.clone());
+            let mut fallback_instructions = setup_instructions.clone();
+            fallback_instructions.push(diagnostic_buy_instruction);
+            tracing::debug!(
+                "执行保护 Pump 到 CLMM：币种={}，Pump固定产出={}，Pump最大付款={}，Raydium输入={}，CLMM回款={}，来源={}，CLMM最小回款={}，原估算最小回款={}",
+                raydium_token,
+                best_input.expected_pump_token_out,
+                pump_max_quote_amount_in,
+                best_input.raydium_token_in,
+                simulated_clmm_quote_out,
+                second_leg_quote_source_label(clmm_quote_source),
+                clmm_min_quote_out,
+                old_execution_min_quote_out
+            );
+            instructions.push(
+                executor::swap::build_raydium_clmm_swap_v2_with_remaining_tick_arrays(
+                    &raydium_accounts.swap_v2_accounts(),
+                    &remaining_tick_arrays,
+                    best_input.raydium_token_in,
+                    clmm_min_quote_out,
+                    raydium_route.sqrt_price_limit_x64,
+                    RAYDIUM_CLMM_EXACT_INPUT,
+                )?,
+            );
+
+            return Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions,
+                fallback_label: "PumpSwap buy",
+                setup_instructions,
+                net_quote_token_account: pump_accounts.user_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: pumpswap.quote_mint.clone(),
+                intermediate_token_account: pump_accounts.user_base_token_account,
+            });
+        }
+        ClmmSpotDirection::ClmmToPumpSwap => {
+            let clmm_input_mint = raydium_counter_mint(raydium, raydium_token)
+                .ok_or_else(|| anyhow::anyhow!("Raydium CLMM counter mint not found"))?;
+            if clmm_input_mint != pumpswap.quote_mint {
+                anyhow::bail!(
+                    "CLMM->PumpSwap round-trip quote mint mismatch: CLMM input={} PumpSwap quote={}",
+                    clmm_input_mint,
+                    pumpswap.quote_mint
+                );
+            }
+            push_ata_setup(
+                &mut instructions,
+                &user,
+                &Pubkey::from_str(clmm_input_mint)?,
+                &token_program_for_simulation(config, clmm_input_mint).await?,
+                &mut prepared_atas,
+            )?;
+            if clmm_input_mint == config.tokens.sol_mint {
+                ensure_simulation_sol_input_within_cap(
+                    "Raydium CLMM SOL input",
+                    quote.clmm_amount_in,
+                    max_sol_input_lamports,
+                )?;
+                ensure_existing_associated_token_account_balance(
+                    &config.rpc.http_url,
+                    &user,
+                    &Pubkey::from_str(clmm_input_mint)?,
+                    &token_program_for_simulation(config, clmm_input_mint).await?,
+                    &mut prepared_atas,
+                    quote.clmm_amount_in,
+                    "pre-wrapped SOL ATA",
+                )
+                .await?;
+            }
+            let setup_instructions = instructions.clone();
+            let raydium_input_token_program =
+                token_program_for_simulation(config, clmm_input_mint).await?;
+            let raydium_output_token_program =
+                token_program_for_simulation(config, raydium_token).await?;
+            let raydium_route = raydium_clmm_quote_swap_v2_route_for_mints(
+                raydium,
+                raydium_clmm_tick_arrays,
+                clmm_input_mint,
+                raydium_token,
+                quote.clmm_amount_in,
+            )?;
+            let raydium_accounts =
+                executor::swap::derive_raydium_clmm_exact_input_accounts_with_token_programs(
+                    raydium,
+                    &user,
+                    clmm_input_mint,
+                    raydium_token,
+                    &raydium_input_token_program,
+                    &raydium_output_token_program,
+                    &raydium_route.first_tick_array.to_string(),
+                )?;
+            if raydium_accounts.input_token_account != pump_accounts.user_quote_token_account {
+                anyhow::bail!(
+                    "CLMM->PumpSwap round-trip quote ATA mismatch: CLMM input ATA={} PumpSwap quote ATA={}",
+                    raydium_accounts.input_token_account,
+                    pump_accounts.user_quote_token_account
+                );
+            }
+            let clmm_output_start_balance =
+                token_account_balance(&config.rpc.http_url, &raydium_accounts.output_token_account)
+                    .await?;
+            let remaining_tick_arrays = raydium_route.remaining_tick_arrays.clone();
+            let bitmap_extension = Pubkey::from_str(
+                &raydium_clmm::derive_tickarray_bitmap_extension_address(&raydium.pool_address)?,
+            )?;
+            let diagnostic_clmm_swap_instruction =
+                executor::swap::build_raydium_clmm_swap_v2_with_bitmap_extension_and_remaining_tick_arrays(
+                    &raydium_accounts.swap_v2_accounts(),
+                    &bitmap_extension,
+                    &remaining_tick_arrays,
+                    quote.clmm_amount_in,
+                    1,
+                    raydium_route.sqrt_price_limit_x64,
+                    RAYDIUM_CLMM_EXACT_INPUT,
+                )?;
+            let mut first_leg_instructions = setup_instructions.clone();
+            first_leg_instructions.push(diagnostic_clmm_swap_instruction.clone());
+            let calibrated_clmm_output_amount = simulate_raydium_execution_accounts_best_effort(
+                execution_manager,
+                first_leg_instructions,
+                &[raydium_accounts.output_token_account.to_string()],
+                raydium,
+                "pumpswap_clmm",
+                "Raydium CLMM->PumpSwap",
+                raydium_token,
+                "Raydium CLMM first-leg calibration before PumpSwap leg",
+            )
+            .await?
+            .and_then(|accounts| {
+                simulated_token_account_positive_delta(
+                    &accounts,
+                    &raydium_accounts.output_token_account,
+                    clmm_output_start_balance,
+                )
+            })
+            .filter(|amount| *amount > 0)
+            .unwrap_or(quote.min_clmm_amount_out.max(1));
+            let clmm_min_token_out =
+                execution_min_output(execution_manager, calibrated_clmm_output_amount);
+            let quoted_min_pumpswap_quote_out = quote_constant_product_out(
+                pumpswap_pool.token_reserve as f64,
+                pumpswap_pool.quote_reserve as f64,
+                calibrated_clmm_output_amount as f64,
+                pumpswap_pool.fee_bps,
+            )
+            .map(slippage_floor_u64)
+            .unwrap_or(1)
+            .max(1);
+            let mut diagnostic_pump_sell_instruction = executor::swap::build_pump_amm_sell(
+                &pump_accounts.sell_accounts(),
+                calibrated_clmm_output_amount,
+                1,
+            )?;
+            diagnostic_pump_sell_instruction
+                .accounts
+                .extend(pump_amm_sell_remaining_accounts(
+                    config,
+                    pumpswap,
+                    &pump_accounts,
+                )?);
+            let simulated_pumpswap_quote_out = simulate_raydium_execution_accounts_best_effort(
+                execution_manager,
+                {
+                    let mut diagnostic_atomic_instructions = setup_instructions.clone();
+                    diagnostic_atomic_instructions.push(diagnostic_clmm_swap_instruction.clone());
+                    diagnostic_atomic_instructions.push(diagnostic_pump_sell_instruction.clone());
+                    diagnostic_atomic_instructions
+                },
+                &[pump_accounts.user_quote_token_account.to_string()],
+                raydium,
+                "pumpswap_clmm",
+                "Raydium CLMM->PumpSwap",
+                raydium_token,
+                "Raydium CLMM->PumpSwap atomic calibration",
+            )
+            .await?
+            .and_then(|accounts| {
+                simulated_second_leg_quote_output_from_atomic_delta(
+                    &accounts,
+                    &pump_accounts.user_quote_token_account,
+                    net_quote_start_balance,
+                    quote.clmm_amount_in,
+                )
+            })
+            .filter(|amount| *amount > 0);
+            let (simulated_pumpswap_quote_out, pumpswap_quote_source) =
+                if let Some(amount) = simulated_pumpswap_quote_out {
+                    (amount, SecondLegQuoteSource::Simulated)
+                } else {
+                    (
+                        quoted_min_pumpswap_quote_out,
+                        SecondLegQuoteSource::FallbackQuote,
+                    )
+                };
+            let calibrated_min_pumpswap_quote_out =
+                execution_min_output(execution_manager, simulated_pumpswap_quote_out);
+            tracing::debug!(
+                "第一腿校准(CLMM卖出): 币种={} 预估产出={} 初始余额={} 模拟增量={} CLMM最小产出={} Pump二腿回款={} 来源={} Pump最小回款={}",
+                raydium_token,
+                quote.min_clmm_amount_out,
+                clmm_output_start_balance,
+                calibrated_clmm_output_amount,
+                clmm_min_token_out,
+                simulated_pumpswap_quote_out,
+                second_leg_quote_source_label(pumpswap_quote_source),
+                calibrated_min_pumpswap_quote_out
+            );
+            instructions = setup_instructions.clone();
+            let clmm_swap_instruction =
+                executor::swap::build_raydium_clmm_swap_v2_with_bitmap_extension_and_remaining_tick_arrays(
+                    &raydium_accounts.swap_v2_accounts(),
+                    &bitmap_extension,
+                    &remaining_tick_arrays,
+                    quote.clmm_amount_in,
+                    clmm_min_token_out,
+                    raydium_route.sqrt_price_limit_x64,
+                    RAYDIUM_CLMM_EXACT_INPUT,
+                )?;
+            instructions.push(clmm_swap_instruction);
+            let mut fallback_instructions = setup_instructions.clone();
+            fallback_instructions.push(diagnostic_clmm_swap_instruction);
+            let mut pump_sell_instruction = executor::swap::build_pump_amm_sell(
+                &pump_accounts.sell_accounts(),
+                calibrated_clmm_output_amount,
+                calibrated_min_pumpswap_quote_out,
+            )?;
+            pump_sell_instruction
+                .accounts
+                .extend(pump_amm_sell_remaining_accounts(
+                    config,
+                    pumpswap,
+                    &pump_accounts,
+                )?);
+            instructions.push(pump_sell_instruction);
+
+            return Ok(SimulationInstructionPlan {
+                atomic_instructions: instructions,
+                fallback_instructions,
+                fallback_label: "Raydium CLMM swap",
+                setup_instructions,
+                net_quote_token_account: pump_accounts.user_quote_token_account,
+                net_quote_start_balance,
+                net_quote_mint: pumpswap.quote_mint.clone(),
+                intermediate_token_account: raydium_accounts.output_token_account,
+            });
+        }
+    }
+}
+
+fn raydium_swap_remaining_tick_arrays(
+    raydium: &RaydiumState,
+    tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    is_base_input: bool,
+) -> Result<Vec<Pubkey>> {
+    let tick_current = raydium
+        .tick_current
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM missing current tick"))?;
+    let tick_spacing = raydium
+        .tick_spacing
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM missing tick spacing"))?;
+    let current_start = raydium_clmm::tick_array_start_index(tick_current, tick_spacing);
+    let mut pool_tick_arrays: Vec<(i32, String)> = tick_arrays
+        .iter()
+        .filter_map(|(address, tick_array)| {
+            (tick_array.pool_id == raydium.pool_address)
+                .then(|| (tick_array.start_tick_index, address.clone()))
+        })
+        .collect();
+
+    if pool_tick_arrays.is_empty() {
+        anyhow::bail!("no hydrated Raydium CLMM tick arrays available for swap");
+    }
+
+    pool_tick_arrays.sort_by(|(start_a, _), (start_b, _)| {
+        if *start_a == current_start {
+            return std::cmp::Ordering::Less;
+        }
+        if *start_b == current_start {
+            return std::cmp::Ordering::Greater;
+        }
+        if is_base_input {
+            start_b.cmp(start_a)
+        } else {
+            start_a.cmp(start_b)
+        }
+    });
+    pool_tick_arrays.dedup_by(|left, right| left.0 == right.0);
+
+    pool_tick_arrays
+        .into_iter()
+        .map(|(_, address)| Pubkey::from_str(&address).map_err(Into::into))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct RaydiumClmmSwapV2Route {
+    zero_for_one: bool,
+    sqrt_price_limit_x64: u128,
+    first_tick_array: Pubkey,
+    remaining_tick_arrays: Vec<Pubkey>,
+}
+
+#[derive(Debug, Clone)]
+struct RaydiumClmmQuotedSwapV2Route {
+    zero_for_one: bool,
+    sqrt_price_limit_x64: u128,
+    first_tick_array: Pubkey,
+    remaining_tick_arrays: Vec<Pubkey>,
+    expected_output: u64,
+}
+
+fn raydium_clmm_exact_input_zero_for_one(
+    raydium: &RaydiumState,
+    input_mint: &str,
+    output_mint: &str,
+) -> Result<bool> {
+    if input_mint == raydium.base_mint && output_mint == raydium.quote_mint {
+        Ok(true)
+    } else if input_mint == raydium.quote_mint && output_mint == raydium.base_mint {
+        Ok(false)
+    } else {
+        anyhow::bail!(
+            "invalid pool direction for Raydium CLMM exact-input swap: input={} output={} pool_token0={} pool_token1={}",
+            input_mint,
+            output_mint,
+            raydium.base_mint,
+            raydium.quote_mint
+        );
+    }
+}
+
+fn raydium_clmm_sqrt_price_limit_x64(zero_for_one: bool) -> u128 {
+    if zero_for_one {
+        RAYDIUM_CLMM_MIN_SQRT_PRICE_X64_PLUS_ONE
+    } else {
+        RAYDIUM_CLMM_MAX_SQRT_PRICE_X64_MINUS_ONE
+    }
+}
+
+fn raydium_clmm_swap_v2_route_for_mints(
+    raydium: &RaydiumState,
+    input_mint: &str,
+    output_mint: &str,
+    tick_array_count: usize,
+) -> Result<RaydiumClmmSwapV2Route> {
+    let zero_for_one = raydium_clmm_exact_input_zero_for_one(raydium, input_mint, output_mint)?;
+    let sqrt_price_limit_x64 = raydium_clmm_sqrt_price_limit_x64(zero_for_one);
+    let remaining_tick_arrays =
+        raydium_swap_remaining_tick_arrays_for_direction(raydium, zero_for_one, tick_array_count)?;
+    let first_tick_array = *remaining_tick_arrays
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM missing derived tick_array_0"))?;
+
+    Ok(RaydiumClmmSwapV2Route {
+        zero_for_one,
+        sqrt_price_limit_x64,
+        first_tick_array,
+        remaining_tick_arrays,
+    })
+}
+
+fn raydium_clmm_quote_swap_v2_route_for_mints(
+    raydium: &RaydiumState,
+    tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    input_mint: &str,
+    output_mint: &str,
+    amount_in: u64,
+) -> Result<RaydiumClmmQuotedSwapV2Route> {
+    if amount_in == 0 {
+        anyhow::bail!("Raydium CLMM quote skipped: zero input amount");
+    }
+
+    let zero_for_one = raydium_clmm_exact_input_zero_for_one(raydium, input_mint, output_mint)?;
+    let sqrt_price_limit_x64 = raydium_clmm_sqrt_price_limit_x64(zero_for_one);
+    let tick_current = raydium
+        .tick_current
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM missing current tick"))?;
+    let tick_spacing = raydium
+        .tick_spacing
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM missing tick spacing"))?;
+    let mut pool_tick_arrays = Vec::new();
+    let mut addresses_by_start_index = HashMap::new();
+    for (address, tick_array) in tick_arrays {
+        if tick_array.pool_id != raydium.pool_address {
+            continue;
+        }
+        let pubkey = Pubkey::from_str(address)
+            .with_context(|| format!("invalid Raydium CLMM tick array address {}", address))?;
+        addresses_by_start_index
+            .entry(tick_array.start_tick_index)
+            .or_insert(pubkey);
+        pool_tick_arrays.push(tick_array);
+    }
+    if pool_tick_arrays.is_empty() {
+        anyhow::bail!(
+            "Raydium CLMM quote skipped: no hydrated tick arrays for pool {}",
+            raydium.pool_address
+        );
+    }
+
+    let quote =
+        strategy::clmm::quote_exact_input(raydium, &pool_tick_arrays, input_mint, amount_in as f64)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Raydium CLMM quote failed for 池={} input={} output={} amount={}: {:?}",
+                    raydium.pool_address,
+                    input_mint,
+                    output_mint,
+                    amount_in,
+                    error
+                )
+            })?;
+    if quote.touched_tick_array_start_indexes.is_empty() {
+        anyhow::bail!(
+            "Raydium CLMM quote skipped: quote returned empty tick arrays for pool {}",
+            raydium.pool_address
+        );
+    }
+
+    let current_start = raydium_clmm::tick_array_start_index(tick_current, tick_spacing);
+    let mut required_starts = quote.touched_tick_array_start_indexes.clone();
+    if zero_for_one {
+        required_starts.sort_unstable_by(|a, b| b.cmp(a));
+    } else {
+        required_starts.sort_unstable();
+    }
+    required_starts.dedup();
+
+    let mut missing_starts = Vec::new();
+    let mut remaining_tick_arrays = Vec::new();
+    for start_index in &required_starts {
+        if let Some(pubkey) = addresses_by_start_index.get(start_index) {
+            remaining_tick_arrays.push(*pubkey);
+        } else {
+            missing_starts.push(*start_index);
+        }
+    }
+    if !missing_starts.is_empty() {
+        anyhow::bail!(
+            "Raydium CLMM quote skipped: quote path tick arrays are not hydrated 池={} missing_starts={:?} quote_touched={:?}",
+            raydium.pool_address,
+            missing_starts,
+            quote.touched_tick_array_start_indexes
+        );
+    }
+
+    let first_tick_array = *remaining_tick_arrays
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM quote returned no remaining tick arrays"))?;
+    let expected_output = floor_u64(quote.amount_out).max(1);
+    tracing::debug!(
+        "Raydium CLMM 报价路径：池={}，输入币种={}，输出币种={}，数量={}，预计输出={}，方向={}，当前start={}，触达={:?}，选择={:?}",
+        raydium.pool_address,
+        input_mint,
+        output_mint,
+        amount_in,
+        expected_output,
+        zero_for_one,
+        current_start,
+        quote.touched_tick_array_start_indexes,
+        required_starts
+    );
+
+    Ok(RaydiumClmmQuotedSwapV2Route {
+        zero_for_one,
+        sqrt_price_limit_x64,
+        first_tick_array,
+        remaining_tick_arrays,
+        expected_output,
+    })
+}
+
+fn raydium_swap_remaining_tick_arrays_for_direction(
+    raydium: &RaydiumState,
+    zero_for_one: bool,
+    count: usize,
+) -> Result<Vec<Pubkey>> {
+    let tick_current = raydium
+        .tick_current
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM missing current tick"))?;
+    let tick_spacing = raydium
+        .tick_spacing
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM missing tick spacing"))?;
+    let current_start = raydium_clmm::tick_array_start_index(tick_current, tick_spacing);
+    let stride = 60 * i32::from(tick_spacing);
+    let count = count.max(1);
+
+    (0..count)
+        .map(|index| {
+            let offset = i32::try_from(index).context("Raydium tick array index overflow")?;
+            let start = if zero_for_one {
+                current_start - offset * stride
+            } else {
+                current_start + offset * stride
+            };
+            let address = raydium_clmm::derive_tick_array_address(&raydium.pool_address, start)?;
+            Pubkey::from_str(&address).map_err(Into::into)
+        })
+        .collect()
+}
+
+fn log_raydium_clmm_swap_v2_wiring(
+    path_label: &str,
+    token_mint: &str,
+    raydium: &RaydiumState,
+    accounts: &executor::swap::RaydiumClmmDerivedAccounts,
+    zero_for_one: bool,
+    sqrt_price_limit_x64: u128,
+    remaining_tick_arrays: &[Pubkey],
+    amount: u64,
+    other_amount_threshold: u64,
+) {
+    let tick_array_0 = remaining_tick_arrays
+        .first()
+        .map(|pubkey| pubkey.to_string())
+        .unwrap_or_else(|| "<missing>".to_string());
+    let tick_array_1 = remaining_tick_arrays
+        .get(1)
+        .map(|pubkey| pubkey.to_string())
+        .unwrap_or_else(|| "<missing>".to_string());
+    let tick_arrays = remaining_tick_arrays
+        .iter()
+        .map(|pubkey| pubkey.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let bitmap_extension =
+        executor::swap::derive_raydium_clmm_tickarray_bitmap_extension(&accounts.pool_state)
+            .map(|pubkey| pubkey.to_string())
+            .unwrap_or_else(|_| "<derive_failed>".to_string());
+    tracing::debug!(
+        "Raydium CLMM 交易账户：路径={}，币种={}，输入币种={}，输出币种={}，池token0={}，池token1={}，方向={}，输入vault={}，输出vault={}，价格限制={}，tick0={}，tick1={}，tick数组=[{}]，位图扩展={}，数量={}，最小输出={}",
+        path_label,
+        token_mint,
+        accounts.input_vault_mint,
+        accounts.output_vault_mint,
+        raydium.base_mint,
+        raydium.quote_mint,
+        zero_for_one,
+        accounts.input_vault,
+        accounts.output_vault,
+        sqrt_price_limit_x64,
+        tick_array_0,
+        tick_array_1,
+        tick_arrays,
+        bitmap_extension,
+        amount,
+        other_amount_threshold
+    );
+}
+
+fn raydium_swap_remaining_tick_arrays_for_execution(
+    raydium: &RaydiumState,
+    tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+    is_base_input: bool,
+) -> Result<Vec<Pubkey>> {
+    let current_tick_array = Pubkey::from_str(&current_tick_array_address(raydium, tick_arrays)?)?;
+    let max_count = raydium_execution_tick_array_count(&raydium.pool_address).max(1);
+    let mut arrays = vec![current_tick_array];
+    let mut additional_arrays =
+        raydium_swap_remaining_tick_arrays(raydium, tick_arrays, is_base_input)?;
+    additional_arrays.retain(|pubkey| *pubkey != current_tick_array);
+    additional_arrays.truncate(max_count.saturating_sub(1));
+    arrays.extend(additional_arrays);
+    Ok(arrays)
+}
+
+fn meteora_swap_remaining_bin_arrays(
+    meteora_pool: &MeteoraState,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    input_mint: &str,
+    output_mint: &str,
+) -> Result<Vec<(i64, Pubkey)>> {
+    let x_to_y =
+        input_mint == meteora_pool.token_x_mint && output_mint == meteora_pool.token_y_mint;
+    let y_to_x =
+        input_mint == meteora_pool.token_y_mint && output_mint == meteora_pool.token_x_mint;
+    if !x_to_y && !y_to_x {
+        anyhow::bail!(
+            "Meteora swap mint mismatch: input={} output={} x={} y={}",
+            input_mint,
+            output_mint,
+            meteora_pool.token_x_mint,
+            meteora_pool.token_y_mint
+        );
+    }
+
+    let current_index = meteora::bin_array_index(meteora_pool.active_id);
+    let mut arrays = meteora_bin_arrays
+        .iter()
+        .filter(|(_, state)| state.lb_pair == meteora_pool.pool_address)
+        .filter(|(_, state)| {
+            if x_to_y {
+                state.index <= current_index
+            } else {
+                state.index >= current_index
+            }
+        })
+        .map(|(address, state)| Ok((state.index, Pubkey::from_str(address)?)))
+        .collect::<Result<Vec<_>>>()?;
+
+    if arrays.is_empty() {
+        arrays = meteora_bin_arrays
+            .iter()
+            .filter(|(_, state)| state.lb_pair == meteora_pool.pool_address)
+            .map(|(address, state)| Ok((state.index, Pubkey::from_str(address)?)))
+            .collect::<Result<Vec<_>>>()?;
+    }
+
+    if arrays.is_empty() {
+        anyhow::bail!(
+            "no hydrated Meteora bin arrays available for swap on pool {}",
+            meteora_pool.pool_address
+        );
+    }
+
+    arrays.sort_by(|(left_index, _), (right_index, _)| {
+        if x_to_y {
+            right_index.cmp(left_index)
+        } else {
+            left_index.cmp(right_index)
+        }
+    });
+    arrays.dedup_by(|left, right| left.0 == right.0);
+    Ok(arrays)
+}
+
+fn meteora_swap_remaining_bin_arrays_for_execution(
+    meteora_pool: &MeteoraState,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    input_mint: &str,
+    output_mint: &str,
+) -> Result<Vec<(i64, Pubkey)>> {
+    let x_to_y =
+        input_mint == meteora_pool.token_x_mint && output_mint == meteora_pool.token_y_mint;
+    let y_to_x =
+        input_mint == meteora_pool.token_y_mint && output_mint == meteora_pool.token_x_mint;
+    if !x_to_y && !y_to_x {
+        anyhow::bail!(
+            "Meteora swap mint mismatch: input={} output={} x={} y={}",
+            input_mint,
+            output_mint,
+            meteora_pool.token_x_mint,
+            meteora_pool.token_y_mint
+        );
+    }
+
+    let max_count = meteora_execution_bin_array_count(&meteora_pool.pool_address).max(1);
+    let current_index = meteora::bin_array_index(meteora_pool.active_id);
+    let mut selected = Vec::new();
+    let mut selected_indices = HashSet::new();
+
+    let bitmap_step = if x_to_y { -1 } else { 1 };
+    let mut bitmap_index = current_index;
+    while selected.len() < max_count
+        && (-meteora::BIN_ARRAY_BITMAP_SIZE..meteora::BIN_ARRAY_BITMAP_SIZE).contains(&bitmap_index)
+    {
+        if meteora::default_bitmap_has_bin_array_liquidity(
+            &meteora_pool.bin_array_bitmap,
+            bitmap_index,
+        ) {
+            let pubkey = Pubkey::from_str(&meteora::derive_bin_array_address(
+                &meteora_pool.pool_address,
+                bitmap_index,
+            )?)?;
+            if selected_indices.insert(bitmap_index) {
+                selected.push((bitmap_index, pubkey));
+            }
+        }
+        bitmap_index += bitmap_step;
+    }
+
+    let mut hydrated_arrays = meteora_bin_arrays
+        .iter()
+        .filter(|(_, state)| state.lb_pair == meteora_pool.pool_address)
+        .filter_map(|(address, state)| {
+            let has_relevant_liquidity = state.bins.iter().any(|bin| {
+                if x_to_y {
+                    bin.amount_y > 0
+                } else {
+                    bin.amount_x > 0
+                }
+            });
+            has_relevant_liquidity
+                .then(|| {
+                    Pubkey::from_str(address)
+                        .ok()
+                        .map(|pubkey| (state.index, pubkey))
+                })
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    hydrated_arrays.sort_by(|(left, _), (right, _)| {
+        if x_to_y {
+            right.cmp(left)
+        } else {
+            left.cmp(right)
+        }
+    });
+    for (index, pubkey) in hydrated_arrays {
+        if selected.len() >= max_count {
+            break;
+        }
+        if selected_indices.insert(index) {
+            selected.push((index, pubkey));
+        }
+    }
+
+    let derived_arrays = meteora_swap_remaining_bin_array_pubkeys(
+        meteora_pool,
+        input_mint,
+        output_mint,
+        max_count as i64,
+    )?;
+    for (index, pubkey) in derived_arrays {
+        if selected.len() >= max_count {
+            break;
+        }
+        if selected_indices.insert(index) {
+            selected.push((index, pubkey));
+        }
+    }
+
+    if x_to_y {
+        selected.sort_by(|(left, _), (right, _)| right.cmp(left));
+    } else {
+        selected.sort_by(|(left, _), (right, _)| left.cmp(right));
+    }
+
+    Ok(selected)
+}
+
+async fn meteora_swap_remaining_bin_arrays_for_execution_async(
+    config: &Config,
+    meteora_pool: &MeteoraState,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    input_mint: &str,
+    output_mint: &str,
+) -> Result<Vec<(i64, Pubkey)>> {
+    let x_to_y =
+        input_mint == meteora_pool.token_x_mint && output_mint == meteora_pool.token_y_mint;
+    let y_to_x =
+        input_mint == meteora_pool.token_y_mint && output_mint == meteora_pool.token_x_mint;
+    if !x_to_y && !y_to_x {
+        anyhow::bail!(
+            "Meteora swap mint mismatch: input={} output={} x={} y={}",
+            input_mint,
+            output_mint,
+            meteora_pool.token_x_mint,
+            meteora_pool.token_y_mint
+        );
+    }
+
+    let max_count = meteora_execution_bin_array_count(&meteora_pool.pool_address).max(1);
+    let current_index = meteora::bin_array_index(meteora_pool.active_id);
+    let mut selected = Vec::new();
+    let mut selected_indices = HashSet::new();
+    let bitmap_extension_state = fetch_meteora_bitmap_extension_state(config, meteora_pool).await?;
+
+    let bitmap_step = if x_to_y { -1 } else { 1 };
+    let mut bitmap_index = current_index;
+    while selected.len() < max_count
+        && (meteora::BIN_ARRAY_INDEX_BOUND_MIN..=meteora::BIN_ARRAY_INDEX_BOUND_MAX)
+            .contains(&bitmap_index)
+    {
+        let has_liquidity = meteora::default_bitmap_has_bin_array_liquidity(
+            &meteora_pool.bin_array_bitmap,
+            bitmap_index,
+        ) || bitmap_extension_state.as_ref().is_some_and(|state| {
+            meteora::bitmap_extension_has_bin_array_liquidity(state, bitmap_index)
+        });
+        if has_liquidity {
+            let pubkey = Pubkey::from_str(&meteora::derive_bin_array_address(
+                &meteora_pool.pool_address,
+                bitmap_index,
+            )?)?;
+            if selected_indices.insert(bitmap_index) {
+                selected.push((bitmap_index, pubkey));
+            }
+        }
+        bitmap_index += bitmap_step;
+    }
+
+    if selected.is_empty() {
+        return meteora_swap_remaining_bin_arrays_for_execution(
+            meteora_pool,
+            meteora_bin_arrays,
+            input_mint,
+            output_mint,
+        );
+    }
+
+    let mut hydrated_arrays = meteora_bin_arrays
+        .iter()
+        .filter(|(_, state)| state.lb_pair == meteora_pool.pool_address)
+        .filter_map(|(address, state)| {
+            let has_relevant_liquidity = state.bins.iter().any(|bin| {
+                if x_to_y {
+                    bin.amount_y > 0
+                } else {
+                    bin.amount_x > 0
+                }
+            });
+            has_relevant_liquidity
+                .then(|| {
+                    Pubkey::from_str(address)
+                        .ok()
+                        .map(|pubkey| (state.index, pubkey))
+                })
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    hydrated_arrays.sort_by(|(left, _), (right, _)| {
+        if x_to_y {
+            right.cmp(left)
+        } else {
+            left.cmp(right)
+        }
+    });
+    for (index, pubkey) in hydrated_arrays {
+        if selected.len() >= max_count {
+            break;
+        }
+        if selected_indices.insert(index) {
+            selected.push((index, pubkey));
+        }
+    }
+
+    let derived_arrays = meteora_swap_remaining_bin_array_pubkeys(
+        meteora_pool,
+        input_mint,
+        output_mint,
+        max_count as i64,
+    )?;
+    for (index, pubkey) in derived_arrays {
+        if selected.len() >= max_count {
+            break;
+        }
+        if selected_indices.insert(index) {
+            selected.push((index, pubkey));
+        }
+    }
+
+    if x_to_y {
+        selected.sort_by(|(left, _), (right, _)| right.cmp(left));
+    } else {
+        selected.sort_by(|(left, _), (right, _)| left.cmp(right));
+    }
+
+    selected = retain_existing_meteora_dlmm_bin_arrays(config, meteora_pool, &selected).await?;
+    validate_meteora_dlmm_accounts(config, meteora_pool, &selected).await?;
+
+    Ok(selected)
+}
+
+async fn retain_existing_meteora_dlmm_bin_arrays(
+    config: &Config,
+    meteora_pool: &MeteoraState,
+    bin_arrays: &[(i64, Pubkey)],
+) -> Result<Vec<(i64, Pubkey)>> {
+    if meteora_pool.is_damm_v2() || bin_arrays.is_empty() {
+        return Ok(bin_arrays.to_vec());
+    }
+
+    let mut addresses = Vec::with_capacity(1 + bin_arrays.len());
+    addresses.push(meteora_pool.pool_address.clone());
+    addresses.extend(bin_arrays.iter().map(|(_, pubkey)| pubkey.to_string()));
+
+    let owners = rpc::get_multiple_accounts_owners(&config.rpc.http_url, &addresses).await?;
+    let expected_owner = executor::swap::METEORA_DLMM_PROGRAM_ID;
+    let pool_owner = owners
+        .get(&meteora_pool.pool_address)
+        .map(String::as_str)
+        .unwrap_or("<missing>");
+    if pool_owner != expected_owner {
+        anyhow::bail!(
+            "Meteora pool owner mismatch: 池={} 程序={} expected={}",
+            meteora_pool.pool_address,
+            pool_owner,
+            expected_owner
+        );
+    }
+
+    Ok(bin_arrays
+        .iter()
+        .copied()
+        .filter(|(_, pubkey)| {
+            owners
+                .get(&pubkey.to_string())
+                .is_some_and(|owner| owner == expected_owner)
+        })
+        .collect())
+}
+
+async fn validate_meteora_dlmm_accounts(
+    config: &Config,
+    meteora_pool: &MeteoraState,
+    bin_arrays: &[(i64, Pubkey)],
+) -> Result<()> {
+    if meteora_pool.is_damm_v2() {
+        return Ok(());
+    }
+
+    let mut addresses = Vec::with_capacity(1 + bin_arrays.len());
+    addresses.push(meteora_pool.pool_address.clone());
+    addresses.extend(bin_arrays.iter().map(|(_, pubkey)| pubkey.to_string()));
+
+    let owners = rpc::get_multiple_accounts_owners(&config.rpc.http_url, &addresses).await?;
+    let expected_owner = executor::swap::METEORA_DLMM_PROGRAM_ID;
+    let pool_owner = owners
+        .get(&meteora_pool.pool_address)
+        .map(String::as_str)
+        .unwrap_or("<missing>");
+    if pool_owner != expected_owner {
+        anyhow::bail!(
+            "Meteora pool owner mismatch: 池={} 程序={} expected={}",
+            meteora_pool.pool_address,
+            pool_owner,
+            expected_owner
+        );
+    }
+
+    let invalid_bin_arrays = bin_arrays
+        .iter()
+        .filter_map(|(index, pubkey)| {
+            let owner = owners.get(&pubkey.to_string()).map(String::as_str);
+            (owner != Some(expected_owner))
+                .then(|| format!("{}:{}:{}", index, pubkey, owner.unwrap_or("<missing>")))
+        })
+        .collect::<Vec<_>>();
+    if !invalid_bin_arrays.is_empty() {
+        anyhow::bail!(
+            "Meteora bin array owner mismatch: 池={} invalid_bin_arrays=[{}] expected_程序={}",
+            meteora_pool.pool_address,
+            invalid_bin_arrays.join(","),
+            expected_owner
+        );
+    }
+
+    Ok(())
+}
+
+fn meteora_requires_bitmap_extension(bin_arrays: &[(i64, Pubkey)]) -> bool {
+    const METEORA_INTERNAL_BITMAP_LOWER: i64 = -512;
+    const METEORA_INTERNAL_BITMAP_UPPER: i64 = 511;
+    bin_arrays.iter().any(|(index, _)| {
+        *index < METEORA_INTERNAL_BITMAP_LOWER || *index > METEORA_INTERNAL_BITMAP_UPPER
+    })
+}
+
+async fn fetch_meteora_bitmap_extension_state(
+    config: &Config,
+    pool: &MeteoraState,
+) -> Result<Option<meteora::MeteoraBitmapExtensionState>> {
+    let bitmap_extension =
+        executor::swap::derive_meteora_dlmm_bitmap_extension_address(&pool.pool_address)?;
+    let now = Instant::now();
+    {
+        let cache = METEORA_BITMAP_EXTENSION_STATE_CACHE.read().await;
+        if let Some((state, timestamp)) = cache.entries.get(&bitmap_extension) {
+            if now.duration_since(*timestamp) < ATA_EXISTENCE_CACHE_DURATION {
+                return Ok(state.clone());
+            }
+        }
+    }
+
+    let account_data =
+        rpc::get_multiple_accounts_data(&config.rpc.http_url, &[bitmap_extension.to_string()])
+            .await?;
+    let parsed = account_data
+        .get(&bitmap_extension.to_string())
+        .map(|data| meteora::parse_bitmap_extension(data))
+        .transpose()?;
+
+    {
+        let mut cache = METEORA_BITMAP_EXTENSION_STATE_CACHE.write().await;
+        cache
+            .entries
+            .insert(bitmap_extension, (parsed.clone(), now));
+    }
+
+    Ok(parsed)
+}
+
+async fn meteora_use_bitmap_extension(
+    config: &Config,
+    pool: &MeteoraState,
+    bin_arrays: &[(i64, Pubkey)],
+) -> Result<bool> {
+    let requires_bitmap_extension = meteora_requires_bitmap_extension(bin_arrays);
+    let current_index = meteora::bin_array_index(pool.active_id);
+    let min_selected_index = bin_arrays
+        .iter()
+        .map(|(index, _)| *index)
+        .min()
+        .unwrap_or(current_index);
+    let max_selected_index = bin_arrays
+        .iter()
+        .map(|(index, _)| *index)
+        .max()
+        .unwrap_or(current_index);
+    let bitmap_extension =
+        executor::swap::derive_meteora_dlmm_bitmap_extension_address(&pool.pool_address)?;
+    let now = Instant::now();
+    {
+        let cache = METEORA_BITMAP_EXTENSION_CACHE.read().await;
+        if let Some((initialized, timestamp)) = cache.entries.get(&bitmap_extension) {
+            if now.duration_since(*timestamp) < ATA_EXISTENCE_CACHE_DURATION {
+                if *initialized {
+                    // Match the official SDK behavior: if the extension account exists, always
+                    // pass it to Swap2 instead of trying to predict whether this swap will cross
+                    // into overflow bitmap space.
+                    return Ok(true);
+                }
+                if requires_bitmap_extension {
+                    anyhow::bail!(
+                        "Meteora bitmap extension {} for pool {} is not initialized on-chain; current_bin_array_index={} selected_bin_array_range=[{}, {}]",
+                        bitmap_extension,
+                        pool.pool_address,
+                        current_index,
+                        min_selected_index,
+                        max_selected_index
+                    );
+                }
+                return Ok(false);
+            }
+        }
+    }
+
+    let owners =
+        rpc::get_multiple_accounts_owners(&config.rpc.http_url, &[bitmap_extension.to_string()])
+            .await?;
+    let initialized = owners
+        .get(&bitmap_extension.to_string())
+        .is_some_and(|owner| owner == executor::swap::METEORA_DLMM_PROGRAM_ID);
+
+    {
+        let mut cache = METEORA_BITMAP_EXTENSION_CACHE.write().await;
+        cache.entries.insert(bitmap_extension, (initialized, now));
+    }
+
+    if initialized {
+        return Ok(true);
+    }
+
+    if requires_bitmap_extension {
+        anyhow::bail!(
+            "Meteora bitmap extension {} for pool {} is not initialized on-chain; current_bin_array_index={} selected_bin_array_range=[{}, {}]",
+            bitmap_extension,
+            pool.pool_address,
+            current_index,
+            min_selected_index,
+            max_selected_index
+        );
+    }
+
+    Ok(false)
+}
+
+async fn maybe_prepare_meteora_bitmap_extension_setup(
+    config: &Config,
+    pool: &MeteoraState,
+    user: &Pubkey,
+    instructions: &mut Vec<Instruction>,
+) -> Result<bool> {
+    if pool.is_damm_v2() {
+        return Ok(false);
+    }
+
+    let bitmap_extension =
+        executor::swap::derive_meteora_dlmm_bitmap_extension_address(&pool.pool_address)?;
+    let now = Instant::now();
+    {
+        let cache = METEORA_BITMAP_EXTENSION_CACHE.read().await;
+        if let Some((initialized, timestamp)) = cache.entries.get(&bitmap_extension) {
+            if now.duration_since(*timestamp) < ATA_EXISTENCE_CACHE_DURATION && *initialized {
+                return Ok(true);
+            }
+        }
+    }
+
+    let owners =
+        rpc::get_multiple_accounts_owners(&config.rpc.http_url, &[bitmap_extension.to_string()])
+            .await?;
+    let initialized = owners
+        .get(&bitmap_extension.to_string())
+        .is_some_and(|owner| owner == executor::swap::METEORA_DLMM_PROGRAM_ID);
+
+    {
+        let mut cache = METEORA_BITMAP_EXTENSION_CACHE.write().await;
+        cache.entries.insert(bitmap_extension, (initialized, now));
+    }
+
+    if initialized {
+        return Ok(true);
+    }
+
+    if !allow_meteora_bitmap_extension_init() {
+        tracing::debug!(
+            "跳过 Meteora 位图初始化：池={}，位图={}，原因=避免支付初始化租金",
+            pool.pool_address,
+            bitmap_extension
+        );
+        return Ok(false);
+    }
+
+    instructions.push(
+        executor::swap::build_initialize_meteora_dlmm_bitmap_extension(&pool.pool_address, user)?,
+    );
+    tracing::debug!(
+        "已加入 Meteora 位图初始化：池={}，位图={}",
+        pool.pool_address,
+        bitmap_extension
+    );
+    Ok(true)
+}
+
+fn ensure_simulation_sol_input_within_cap(
+    label: &str,
+    amount_lamports: u64,
+    max_lamports: u64,
+) -> Result<()> {
+    if amount_lamports > max_lamports {
+        anyhow::bail!(
+            "{} {} lamports exceeds configured live trade size cap {} lamports",
+            label,
+            amount_lamports,
+            max_lamports
+        );
+    }
+    Ok(())
+}
+
+fn current_tick_array_address(
+    raydium: &RaydiumState,
+    tick_arrays: &HashMap<String, raydium_clmm::ClmmTickArrayState>,
+) -> Result<String> {
+    let tick_current = raydium
+        .tick_current
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM missing current tick"))?;
+    let tick_spacing = raydium
+        .tick_spacing
+        .ok_or_else(|| anyhow::anyhow!("Raydium CLMM missing tick spacing"))?;
+    let expected_start = raydium_clmm::tick_array_start_index(tick_current, tick_spacing);
+    for (address, tick_array) in tick_arrays {
+        if tick_array.pool_id == raydium.pool_address
+            && tick_array.start_tick_index == expected_start
+        {
+            return Ok(address.clone());
+        }
+    }
+    raydium_clmm::derive_tick_array_address(&raydium.pool_address, expected_start)
+}
+
+fn push_ata_setup(
+    instructions: &mut Vec<Instruction>,
+    user: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+    prepared_atas: &mut HashSet<Pubkey>,
+) -> Result<Pubkey> {
+    let ata = executor::swap::associated_token_address(user, mint, token_program)?;
+    if prepared_atas.insert(ata) {
+        instructions.push(
+            executor::swap::build_create_associated_token_account_idempotent(
+                user,
+                user,
+                mint,
+                token_program,
+            )?,
+        );
+    }
+    Ok(ata)
+}
+
+async fn existing_associated_token_accounts(
+    rpc_url: &str,
+    user: &Pubkey,
+    ata_specs: &[(Pubkey, Pubkey)],
+) -> Result<HashSet<Pubkey>> {
+    let now = Instant::now();
+    let mut atas_to_fetch = Vec::new();
+    let mut prepared = HashSet::new();
+    let mut seen = HashSet::new();
+
+    {
+        let cache = ATA_EXISTENCE_CACHE.read().await;
+        for (mint, token_program) in ata_specs {
+            let ata = executor::swap::associated_token_address(user, mint, token_program)?;
+            if !seen.insert(ata) {
+                continue;
+            }
+            if cache.entries.get(&ata).is_some_and(|timestamp| {
+                now.duration_since(*timestamp) < ATA_EXISTENCE_CACHE_DURATION
+            }) {
+                prepared.insert(ata);
+            } else {
+                atas_to_fetch.push(ata.to_string());
+            }
+        }
+    }
+
+    if atas_to_fetch.is_empty() {
+        return Ok(prepared);
+    }
+
+    let account_data = rpc::get_multiple_accounts_data(rpc_url, &atas_to_fetch).await?;
+    {
+        let mut cache = ATA_EXISTENCE_CACHE.write().await;
+        for account in account_data.keys() {
+            let ata = Pubkey::from_str(account)?;
+            cache.entries.insert(ata, now);
+            prepared.insert(ata);
+        }
+    }
+
+    Ok(prepared)
+}
+
+async fn cached_token_account_amounts(
+    rpc_url: &str,
+    accounts: &[Pubkey],
+) -> Result<HashMap<Pubkey, Option<u64>>> {
+    let now = Instant::now();
+    let mut out = HashMap::new();
+    let mut accounts_to_fetch = Vec::new();
+    let mut seen = HashSet::new();
+
+    {
+        let cache = TOKEN_ACCOUNT_BALANCE_CACHE.read().await;
+        for account in accounts {
+            if !seen.insert(*account) {
+                continue;
+            }
+            if let Some((amount, timestamp)) = cache.balances.get(account) {
+                if now.duration_since(*timestamp) < TOKEN_ACCOUNT_BALANCE_CACHE_DURATION {
+                    out.insert(*account, *amount);
+                    continue;
+                }
+            }
+            accounts_to_fetch.push(*account);
+        }
+    }
+
+    if !accounts_to_fetch.is_empty() {
+        let account_data = rpc::get_multiple_accounts_data(
+            rpc_url,
+            &accounts_to_fetch
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+        let mut cache = TOKEN_ACCOUNT_BALANCE_CACHE.write().await;
+        for account in accounts_to_fetch {
+            let amount = account_data
+                .get(&account.to_string())
+                .map(|data| pumpswap::parse_token_account_amount(data))
+                .transpose()?;
+            cache.balances.insert(account, (amount, now));
+            out.insert(account, amount);
+        }
+    }
+
+    Ok(out)
+}
+
+async fn token_account_balance(rpc_url: &str, account: &Pubkey) -> Result<u64> {
+    Ok(cached_token_account_amounts(rpc_url, &[*account])
+        .await?
+        .get(account)
+        .copied()
+        .flatten()
+        .unwrap_or(0))
+}
+
+fn simulated_token_account_positive_delta(
+    accounts: &HashMap<String, Vec<u8>>,
+    account: &Pubkey,
+    starting_balance: u64,
+) -> Option<u64> {
+    accounts
+        .get(&account.to_string())
+        .and_then(|data| pumpswap::parse_token_account_amount(data).ok())
+        .map(|post_balance| post_balance.saturating_sub(starting_balance))
+}
+
+fn simulated_token_account_net_change(
+    accounts: &HashMap<String, Vec<u8>>,
+    account: &Pubkey,
+    starting_balance: u64,
+) -> Option<i128> {
+    accounts
+        .get(&account.to_string())
+        .and_then(|data| pumpswap::parse_token_account_amount(data).ok())
+        .map(|post_balance| i128::from(post_balance) - i128::from(starting_balance))
+}
+
+fn simulated_second_leg_quote_output_from_atomic_delta(
+    accounts: &HashMap<String, Vec<u8>>,
+    quote_account: &Pubkey,
+    starting_balance: u64,
+    first_leg_quote_amount_in: u64,
+) -> Option<u64> {
+    simulated_token_account_net_change(accounts, quote_account, starting_balance).and_then(
+        |net_change| {
+            let output_amount = net_change + i128::from(first_leg_quote_amount_in);
+            (output_amount > 0 && output_amount <= i128::from(u64::MAX))
+                .then_some(output_amount as u64)
+        },
+    )
+}
+
+fn second_leg_quote_source_label(source: SecondLegQuoteSource) -> &'static str {
+    match source {
+        SecondLegQuoteSource::Simulated => "simulated",
+        SecondLegQuoteSource::FallbackQuote => "fallback_quote",
+    }
+}
+
+async fn meteora_raydium_executable_block_reason(
+    config: &Config,
+    meteora: &MeteoraState,
+    raydium: &RaydiumState,
+    token_mint: &str,
+) -> Option<ExecutableRouteBlock> {
+    if raydium.venue != RaydiumVenue::Clmm {
+        return Some(ExecutableRouteBlock {
+            reason_key: "unsupported_raydium_venue",
+            reason: format!(
+                "Meteora executable route currently supports Raydium CLMM only; got {}",
+                raydium.venue.label()
+            ),
+        });
+    }
+
+    let meteora_quote_mint = meteora
+        .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        .ok_or_else(|| ExecutableRouteBlock {
+            reason_key: "missing_meteora_quote_mint",
+            reason: "Meteora quote mint not found".to_string(),
+        })
+        .ok()?;
+    let raydium_quote_mint = raydium_counter_mint(raydium, token_mint)
+        .ok_or_else(|| ExecutableRouteBlock {
+            reason_key: "missing_raydium_quote_mint",
+            reason: "Raydium CLMM counter mint not found".to_string(),
+        })
+        .ok()?;
+    if meteora_quote_mint != raydium_quote_mint {
+        return Some(ExecutableRouteBlock {
+            reason_key: "quote_mint_mismatch",
+            reason: format!(
+                "Meteora/Raydium quote mint mismatch: meteora={} raydium={}",
+                meteora_quote_mint, raydium_quote_mint
+            ),
+        });
+    }
+
+    if let Err(error) = token_program_for_simulation(config, token_mint).await {
+        return Some(ExecutableRouteBlock {
+            reason_key: "token_program_lookup_failed",
+            reason: format!(
+                "failed to resolve token program for Meteora/Raydium intermediate mint {}: {}",
+                token_mint, error
+            ),
+        });
+    }
+
+    None
+}
+
+async fn pumpswap_meteora_executable_block_reason(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    meteora: &MeteoraState,
+    token_mint: &str,
+    _direction: MeteoraPumpSwapDirection,
+) -> Option<ExecutableRouteBlock> {
+    if meteora.is_damm_v2() {
+        return Some(ExecutableRouteBlock {
+            reason_key: "meteora_damm_v2_unsupported",
+            reason: "PumpSwap/Meteora direct execution currently supports Meteora DLMM only"
+                .to_string(),
+        });
+    }
+
+    let meteora_quote_mint = meteora
+        .quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+        .ok_or_else(|| ExecutableRouteBlock {
+            reason_key: "missing_meteora_quote_mint",
+            reason: "Meteora quote mint not found".to_string(),
+        })
+        .ok()?;
+    if pumpswap_pool.quote_mint != meteora_quote_mint {
+        return Some(ExecutableRouteBlock {
+            reason_key: "quote_mint_mismatch",
+            reason: format!(
+                "PumpSwap/Meteora quote mint mismatch: pumpswap={} meteora={}",
+                pumpswap_pool.quote_mint, meteora_quote_mint
+            ),
+        });
+    }
+
+    if let Err(error) = token_program_for_simulation(config, token_mint).await {
+        return Some(ExecutableRouteBlock {
+            reason_key: "token_program_lookup_failed",
+            reason: format!(
+                "failed to resolve token program for PumpSwap/Meteora intermediate mint {}: {}",
+                token_mint, error
+            ),
+        });
+    }
+
+    None
+}
+
+async fn meteora_direct_swap_executable_block_reason(
+    config: &Config,
+    meteora: &MeteoraState,
+    meteora_bin_arrays: &HashMap<String, meteora::MeteoraBinArrayState>,
+    input_mint: &str,
+    output_mint: &str,
+) -> Option<ExecutableRouteBlock> {
+    if meteora.is_damm_v2() {
+        return None;
+    }
+
+    let remaining_arrays = match meteora_swap_remaining_bin_arrays_for_execution_async(
+        config,
+        meteora,
+        meteora_bin_arrays,
+        input_mint,
+        output_mint,
+    )
+    .await
+    {
+        Ok(arrays) => arrays,
+        Err(error) => {
+            return Some(ExecutableRouteBlock {
+                reason_key: "missing_bin_arrays",
+                reason: error.to_string(),
+            });
+        }
+    };
+
+    match meteora_use_bitmap_extension(config, meteora, &remaining_arrays).await {
+        Ok(_) => None,
+        Err(error) => Some(ExecutableRouteBlock {
+            reason_key: "bitmap_extension_unavailable",
+            reason: error.to_string(),
+        }),
+    }
+}
+
+fn execution_min_output(execution_manager: &ExecutionManager, amount: u64) -> u64 {
+    execution_manager.slippage_floor(amount.max(1)).max(1)
+}
+
+fn execution_min_output_for_send(execution_manager: &ExecutionManager, amount: u64) -> u64 {
+    if disable_local_profit_checks() {
+        return 1;
+    }
+    execution_min_output(execution_manager, amount)
+}
+
+fn execution_quote_min_output(quoted_min_out: u64, profit_min_out: u64) -> u64 {
+    if disable_local_profit_checks() {
+        return 1;
+    }
+    quoted_min_out.max(profit_min_out).max(1)
+}
+
+fn use_final_guard_only_min_out(execution_manager: &ExecutionManager) -> bool {
+    if disable_local_profit_checks() {
+        return true;
+    }
+    execution_manager.live_send_min_profit_pct() <= 0.0
+}
+
+fn guarded_leg_min_out(execution_manager: &ExecutionManager, quoted_min_out: u64) -> u64 {
+    if use_final_guard_only_min_out(execution_manager) {
+        1
+    } else {
+        execution_min_output_for_send(execution_manager, quoted_min_out)
+    }
+}
+
+fn guarded_quote_min_out(
+    execution_manager: &ExecutionManager,
+    quoted_min_out: u64,
+    profit_min_out: u64,
+) -> u64 {
+    if use_final_guard_only_min_out(execution_manager) {
+        1
+    } else {
+        execution_quote_min_output(quoted_min_out, profit_min_out)
+    }
+}
+
+fn allow_meteora_bitmap_extension_init() -> bool {
+    std::env::var("ALLOW_METEORA_BITMAP_EXTENSION_INIT")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn pumpswap_meteora_enforced_profit_pct(execution_manager: &ExecutionManager) -> f64 {
+    if disable_local_profit_checks() {
+        return 0.0;
+    }
+    let configured = execution_manager.live_send_min_profit_pct();
+    if !configured.is_finite() || configured <= 0.0 {
+        return 0.0;
+    }
+    configured.clamp(
+        PUMPSWAP_METEORA_MIN_PROFIT_PCT_FLOOR,
+        PUMPSWAP_METEORA_MIN_PROFIT_PCT_CEILING,
+    )
+}
+
+fn quote_min_out_above_input(input_raw: u64, profit_pct: f64) -> u64 {
+    if input_raw == 0 {
+        return 1;
+    }
+    if !profit_pct.is_finite() || profit_pct <= 0.0 {
+        return 1;
+    }
+    let profit_pct = profit_pct.clamp(
+        PUMPSWAP_METEORA_MIN_PROFIT_PCT_FLOOR,
+        PUMPSWAP_METEORA_MIN_PROFIT_PCT_CEILING,
+    );
+    ceil_u64((input_raw as f64) * (1.0 + profit_pct / 100.0))
+        .max(input_raw.saturating_add(1))
+        .max(1)
+}
+
+async fn ensure_existing_associated_token_account_balance(
+    rpc_url: &str,
+    user: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+    prepared_atas: &mut HashSet<Pubkey>,
+    required_amount: u64,
+    label: &str,
+) -> Result<Pubkey> {
+    let ata = executor::swap::associated_token_address(user, mint, token_program)?;
+    let amounts = cached_token_account_amounts(rpc_url, &[ata]).await?;
+    let amount = amounts.get(&ata).copied().flatten().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} missing: expected pre-existing ATA {} for mint {}",
+            label,
+            ata,
+            mint
+        )
+    })?;
+    if amount < required_amount {
+        anyhow::bail!(
+            "{} insufficient balance: ATA {} has {} but needs {}",
+            label,
+            ata,
+            amount,
+            required_amount
+        );
+    }
+    prepared_atas.insert(ata);
+    Ok(ata)
+}
+
+async fn prepare_wrapped_sol_input(
+    rpc_url: &str,
+    user: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+    prepared_atas: &mut HashSet<Pubkey>,
+    instructions: &mut Vec<Instruction>,
+    required_amount: u64,
+) -> Result<Pubkey> {
+    let ata = executor::swap::associated_token_address(user, mint, token_program)?;
+    let current_amount = cached_token_account_amounts(rpc_url, &[ata])
+        .await?
+        .get(&ata)
+        .copied()
+        .flatten()
+        .unwrap_or(0);
+    if current_amount < required_amount {
+        let wrap_amount = required_amount.saturating_sub(current_amount);
+        ensure_wallet_has_sol_for_wrap(rpc_url, user, wrap_amount).await?;
+        push_wrap_sol(
+            instructions,
+            user,
+            mint,
+            wrap_amount,
+            token_program,
+            prepared_atas,
+        )?;
+    } else {
+        prepared_atas.insert(ata);
+    }
+    Ok(ata)
+}
+
+async fn token_program_for_simulation(config: &Config, mint: &str) -> Result<Pubkey> {
+    let mint_pubkey = Pubkey::from_str(mint)?;
+    {
+        let cache = MINT_TOKEN_PROGRAM_CACHE.read().await;
+        if let Some(token_program) = cache.entries.get(&mint_pubkey) {
+            return Ok(*token_program);
+        }
+    }
+
+    let token_program = if mint == config.tokens.sol_mint || mint == config.tokens.usdc_mint {
+        Pubkey::from_str(executor::swap::TOKEN_PROGRAM_ID)?
+    } else {
+        let owners =
+            rpc::get_multiple_accounts_owners(&config.rpc.http_url, &[mint.to_string()]).await?;
+        let owner = owners
+            .get(mint)
+            .ok_or_else(|| anyhow::anyhow!("missing mint owner for {}", mint))?;
+        match owner.as_str() {
+            executor::swap::TOKEN_PROGRAM_ID => Pubkey::from_str(executor::swap::TOKEN_PROGRAM_ID)?,
+            executor::swap::TOKEN_2022_PROGRAM_ID => {
+                Pubkey::from_str(executor::swap::TOKEN_2022_PROGRAM_ID)?
+            }
+            _ => anyhow::bail!("unsupported mint owner {} for {}", owner, mint),
+        }
+    };
+
+    {
+        let mut cache = MINT_TOKEN_PROGRAM_CACHE.write().await;
+        if !cache.entries.contains_key(&mint_pubkey)
+            && cache.entries.len() >= MAX_MINT_TOKEN_PROGRAM_CACHE_ENTRIES
+        {
+            let evicted = cache.entries.keys().next().copied();
+            if let Some(evicted) = evicted {
+                cache.entries.remove(&evicted);
+            }
+        }
+        cache.entries.insert(mint_pubkey, token_program);
+    }
+
+    Ok(token_program)
+}
+
+fn cached_current_epoch(rpc_url: &str) -> Result<u64> {
+    let now = Instant::now();
+    {
+        let cache = CURRENT_EPOCH_CACHE.read().unwrap();
+        if let (Some(epoch), Some(timestamp)) = (cache.epoch, cache.timestamp) {
+            if now.duration_since(timestamp) < CURRENT_EPOCH_CACHE_DURATION {
+                return Ok(epoch);
+            }
+        }
+    }
+
+    let epoch = RpcClient::new(rpc_url.to_string())
+        .get_epoch_info()
+        .context("getEpochInfo for Token-2022 fee config")?
+        .epoch;
+
+    {
+        let mut cache = CURRENT_EPOCH_CACHE.write().unwrap();
+        cache.epoch = Some(epoch);
+        cache.timestamp = Some(now);
+    }
+
+    Ok(epoch)
+}
+
+fn cached_current_slot(rpc_url: &str) -> Result<u64> {
+    let now = Instant::now();
+    {
+        let cache = CURRENT_SLOT_CACHE.read().unwrap();
+        if let (Some(slot), Some(timestamp)) = (cache.slot, cache.timestamp) {
+            if now.duration_since(timestamp) < CURRENT_SLOT_CACHE_DURATION {
+                return Ok(slot);
+            }
+        }
+    }
+
+    let slot = RpcClient::new(rpc_url.to_string())
+        .get_slot()
+        .context("getSlot for Meteora DAMM v2 quote")?;
+
+    {
+        let mut cache = CURRENT_SLOT_CACHE.write().unwrap();
+        cache.slot = Some(slot);
+        cache.timestamp = Some(now);
+    }
+
+    Ok(slot)
+}
+
+fn cached_token_2022_transfer_fee_config(
+    rpc_url: &str,
+    mint: &Pubkey,
+) -> Result<Option<TransferFeeConfig>> {
+    let now = Instant::now();
+    {
+        let cache = TOKEN_2022_TRANSFER_FEE_CONFIG_CACHE.read().unwrap();
+        if let Some((config, timestamp)) = cache.entries.get(mint) {
+            if now.duration_since(*timestamp) < TOKEN_2022_TRANSFER_FEE_CACHE_DURATION {
+                return Ok(*config);
+            }
+        }
+    }
+
+    let account = RpcClient::new(rpc_url.to_string())
+        .get_account(mint)
+        .with_context(|| format!("getAccount for Token-2022 mint {}", mint))?;
+    let mint_state = StateWithExtensions::<Mint>::unpack(&account.data)
+        .with_context(|| format!("unpack Token-2022 mint state {}", mint))?;
+    let fee_config = mint_state
+        .get_extension::<TransferFeeConfig>()
+        .ok()
+        .copied();
+
+    {
+        let mut cache = TOKEN_2022_TRANSFER_FEE_CONFIG_CACHE.write().unwrap();
+        cache.entries.insert(*mint, (fee_config, now));
+    }
+
+    Ok(fee_config)
+}
+
+fn token_2022_post_fee_amount(
+    config: &Config,
+    mint: &str,
+    pre_fee_amount: u64,
+    transfer_count: usize,
+) -> Result<u64> {
+    if transfer_count == 0 || pre_fee_amount == 0 {
+        return Ok(pre_fee_amount);
+    }
+
+    let mint_pubkey = match Pubkey::from_str(mint) {
+        Ok(mint_pubkey) => mint_pubkey,
+        Err(error) => {
+            tracing::debug!(
+                "Skipping Token-2022 fee lookup for non-pubkey mint {}: {}",
+                mint,
+                error
+            );
+            return Ok(pre_fee_amount);
+        }
+    };
+    let fee_config = match cached_token_2022_transfer_fee_config(&config.rpc.http_url, &mint_pubkey)
+    {
+        Ok(fee_config) => fee_config,
+        Err(error) => {
+            tracing::debug!(
+                "Token-2022 fee lookup failed for mint {} via {}: {}; assuming no transfer fee",
+                mint,
+                config.rpc.http_url,
+                error
+            );
+            return Ok(pre_fee_amount);
+        }
+    };
+    let Some(fee_config) = fee_config else {
+        return Ok(pre_fee_amount);
+    };
+    let epoch = match cached_current_epoch(&config.rpc.http_url) {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            tracing::debug!(
+                "Current epoch lookup failed for Token-2022 mint {} via {}: {}; assuming no transfer fee",
+                mint,
+                config.rpc.http_url,
+                error
+            );
+            return Ok(pre_fee_amount);
+        }
+    };
+
+    let mut amount = pre_fee_amount;
+    for _ in 0..transfer_count {
+        amount = fee_config
+            .get_epoch_fee(epoch)
+            .calculate_post_fee_amount(amount)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to apply Token-2022 transfer fee for mint {} amount {} epoch {}",
+                    mint,
+                    amount,
+                    epoch
+                )
+            })?;
+    }
+
+    Ok(amount)
+}
+
+async fn wallet_sol_balance_lamports(rpc_url: &str, wallet: &Pubkey) -> Result<u64> {
+    {
+        let cache = WALLET_BALANCE_CACHE.read().await;
+        if let Some((balance, timestamp)) = cache.balances.get(wallet) {
+            if timestamp.elapsed() < WALLET_BALANCE_CACHE_DURATION {
+                return Ok(*balance);
+            }
+        }
+    }
+
+    let balance = rpc::get_balance_lamports(rpc_url, &wallet.to_string()).await?;
+    {
+        let mut cache = WALLET_BALANCE_CACHE.write().await;
+        cache.balances.insert(*wallet, (balance, Instant::now()));
+    }
+    Ok(balance)
+}
+
+async fn ensure_wallet_has_sol_for_wrap(
+    rpc_url: &str,
+    wallet: &Pubkey,
+    amount_lamports: u64,
+) -> Result<()> {
+    let balance = wallet_sol_balance_lamports(rpc_url, wallet).await?;
+    let spendable = balance.saturating_sub(WALLET_SOL_RESERVE_LAMPORTS);
+    if amount_lamports > spendable {
+        anyhow::bail!(
+            "wallet SOL balance {} lamports is insufficient for wrapped SOL input {} lamports with reserve {} lamports",
+            balance,
+            amount_lamports,
+            WALLET_SOL_RESERVE_LAMPORTS
+        );
+    }
+    Ok(())
+}
+
+fn push_wrap_sol(
+    instructions: &mut Vec<Instruction>,
+    user: &Pubkey,
+    mint: &Pubkey,
+    amount_lamports: u64,
+    token_program: &Pubkey,
+    prepared_atas: &mut HashSet<Pubkey>,
+) -> Result<()> {
+    let ata = push_ata_setup(instructions, user, mint, token_program, prepared_atas)?;
+    instructions.push(transfer(user, &ata, amount_lamports));
+    instructions.push(executor::swap::build_sync_native(&ata)?);
+    Ok(())
+}
+
+fn pump_amm_buy_remaining_accounts(
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    accounts: &executor::swap::PumpAmmDerivedAccounts,
+) -> Result<Vec<AccountMeta>> {
+    let mut remaining = Vec::new();
+    if pumpswap.is_cashback_coin {
+        let wsol_cashback_ata = pump_amm_user_volume_accumulator_wsol_ata(config, accounts)?;
+        remaining.push(AccountMeta::new(wsol_cashback_ata, false));
+    }
+    remaining.push(AccountMeta::new_readonly(
+        derive_pump_amm_pool_v2_account(&pumpswap.base_mint)?,
+        false,
+    ));
+    append_pump_amm_buyback_fee_accounts(&mut remaining, accounts)?;
+    Ok(remaining)
+}
+
+fn build_pumpswap_dynamic_buy_instruction(
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    accounts: &executor::swap::PumpAmmDerivedAccounts,
+    arb_quote: &ArbQuote,
+    track_volume: bool,
+    min_base_out_override: Option<u64>,
+) -> Result<Instruction> {
+    let min_base_out = min_base_out_override
+        .unwrap_or_else(|| execution_quote_min_output(arb_quote.expected_base_out_safe, 1));
+    tracing::debug!(
+        "Pump buy exact-in组装: 币种={} 池={} spend_quote_in={} min_base_out={} buy_slippage={:.1}bps",
+        arb_quote.token_mint,
+        pumpswap.pool_address,
+        arb_quote.quote_in_raw,
+        min_base_out,
+        arb_quote.buy_slippage_bps
+    );
+    let mut instruction = executor::swap::build_pump_amm_buy_exact_quote_in(
+        &accounts.buy_exact_quote_in_accounts(),
+        arb_quote.quote_in_raw.max(1),
+        min_base_out,
+        track_volume,
+    )?;
+    instruction
+        .accounts
+        .extend(pump_amm_buy_remaining_accounts(config, pumpswap, accounts)?);
+    Ok(instruction)
+}
+
+fn pump_amm_sell_remaining_accounts(
+    config: &Config,
+    pumpswap: &PumpSwapState,
+    accounts: &executor::swap::PumpAmmDerivedAccounts,
+) -> Result<Vec<AccountMeta>> {
+    let mut remaining = Vec::new();
+    if pumpswap.is_cashback_coin {
+        let wsol_cashback_ata = pump_amm_user_volume_accumulator_wsol_ata(config, accounts)?;
+        remaining.push(AccountMeta::new(wsol_cashback_ata, false));
+        remaining.push(AccountMeta::new(accounts.user_volume_accumulator, false));
+    }
+    remaining.push(AccountMeta::new_readonly(
+        derive_pump_amm_pool_v2_account(&pumpswap.base_mint)?,
+        false,
+    ));
+    append_pump_amm_buyback_fee_accounts(&mut remaining, accounts)?;
+    Ok(remaining)
+}
+
+fn append_pump_amm_buyback_fee_accounts(
+    remaining: &mut Vec<AccountMeta>,
+    accounts: &executor::swap::PumpAmmDerivedAccounts,
+) -> Result<()> {
+    let Some(buyback_fee_recipient) = pump_amm_buyback_fee_recipient()? else {
+        return Ok(());
+    };
+    let buyback_fee_recipient_token_account = executor::swap::associated_token_address(
+        &buyback_fee_recipient,
+        &accounts.quote_mint,
+        &accounts.quote_token_program,
+    )?;
+
+    remaining.push(AccountMeta::new_readonly(buyback_fee_recipient, false));
+    remaining.push(AccountMeta::new(buyback_fee_recipient_token_account, false));
+    Ok(())
+}
+
+fn pump_amm_buyback_fee_recipient() -> Result<Option<Pubkey>> {
+    match PUMP_AMM_BUYBACK_FEE_RECIPIENTS.get() {
+        Some(Some(recipients)) if !recipients.is_empty() => Ok(recipients.first().copied()),
+        Some(Some(_)) => Ok(Some(Pubkey::from_str(
+            PUMP_AMM_FALLBACK_BUYBACK_FEE_RECIPIENTS[0],
+        )?)),
+        Some(None) => Ok(None),
+        None => Ok(Some(Pubkey::from_str(
+            PUMP_AMM_FALLBACK_BUYBACK_FEE_RECIPIENTS[0],
+        )?)),
+    }
+}
+
+fn pump_amm_user_volume_accumulator_wsol_ata(
+    config: &Config,
+    accounts: &executor::swap::PumpAmmDerivedAccounts,
+) -> Result<Pubkey> {
+    let native_mint = Pubkey::from_str(&config.tokens.sol_mint)?;
+    let token_program = Pubkey::from_str(executor::swap::TOKEN_PROGRAM_ID)?;
+    executor::swap::associated_token_address(
+        &accounts.user_volume_accumulator,
+        &native_mint,
+        &token_program,
+    )
+}
+
+fn derive_pump_amm_pool_v2_account(base_mint: &str) -> Result<Pubkey> {
+    let base_mint = Pubkey::from_str(base_mint)?;
+    let program_id = Pubkey::from_str(executor::swap::PUMP_AMM_PROGRAM_ID)?;
+    Ok(Pubkey::find_program_address(&[b"pool-v2", base_mint.as_ref()], &program_id).0)
+}
+
+#[derive(Debug, Clone)]
+struct ClmmPreflightQuote {
+    path_label: &'static str,
+    final_amount_usdc: f64,
+    net_profit_usdc: f64,
+    clmm_fee_amount: f64,
+    clmm_sqrt_price_next_x64: u128,
+    quote_amount_in: u64,
+    token_amount: u64,
+    clmm_amount_in: u64,
+    min_clmm_amount_out: u64,
+    min_pumpswap_quote_out: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BestPumpToClmmInput {
+    pump_quote_in_lamports: u64,
+    expected_pump_token_out: u64,
+    raydium_token_in: u64,
+    expected_raydium_wsol_out: u64,
+    min_raydium_wsol_out: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SimulationInstructionPlan {
+    atomic_instructions: Vec<Instruction>,
+    fallback_instructions: Vec<Instruction>,
+    fallback_label: &'static str,
+    setup_instructions: Vec<Instruction>,
+    net_quote_token_account: Pubkey,
+    net_quote_start_balance: u64,
+    net_quote_mint: String,
+    intermediate_token_account: Pubkey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondLegQuoteSource {
+    Simulated,
+    FallbackQuote,
+}
+
+#[derive(Debug, Clone)]
+struct TwoHopProfitGuard {
+    live_send_min_profit_pct: f64,
+    gas_cost_usdc: f64,
+    jito_tip_usdc: f64,
+    safety_buffer_usdc: f64,
+    required_profit_usdc: f64,
+    min_profit_raw: u64,
+}
+
+fn compute_two_hop_profit_guard(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    trade_size_usdc: f64,
+    quote_mint: &str,
+) -> Result<TwoHopProfitGuard> {
+    let local_checks_disabled = disable_local_profit_checks();
+    let live_send_min_profit_pct = if local_checks_disabled {
+        0.0
+    } else {
+        execution_manager.live_send_min_profit_pct()
+    };
+    let jito_tip_lamports = execution_manager.jito_tip_lamports();
+    let gas_cost_usdc = if local_checks_disabled {
+        (jito_bundle_base_fee_lamports(jito_tip_lamports) as f64 / 1_000_000_000.0)
+            * config.strategy.sol_usdc_price
+    } else {
+        atomic_execution_gas_cost_usdc(
+            config.strategy.preflight_gas_cost_sol,
+            config.strategy.sol_usdc_price,
+        )
+    };
+    let jito_tip_usdc =
+        (jito_tip_lamports as f64 / 1_000_000_000.0) * config.strategy.sol_usdc_price;
+    let safety_buffer_usdc = if local_checks_disabled {
+        0.0
+    } else {
+        (trade_size_usdc * TWO_HOP_PROFIT_GUARD_BPS / 10_000.0).max(two_hop_profit_guard_min_usdc())
+    };
+    let required_profit_usdc = (trade_size_usdc * live_send_min_profit_pct / 100.0)
+        + gas_cost_usdc
+        + jito_tip_usdc
+        + safety_buffer_usdc;
+    let min_profit_raw = ceil_u64(
+        usdc_to_raw_for_mint(
+            quote_mint,
+            required_profit_usdc,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!("unsupported quote mint for 两跳 executor {}", quote_mint)
+        })?,
+    )
+    .max(1);
+
+    Ok(TwoHopProfitGuard {
+        live_send_min_profit_pct,
+        gas_cost_usdc,
+        jito_tip_usdc,
+        safety_buffer_usdc,
+        required_profit_usdc,
+        min_profit_raw,
+    })
+}
+
+fn log_two_hop_profit_guard(
+    path_label: &str,
+    token_mint: &str,
+    trade_size_usdc: f64,
+    spot_net_profit_pct: f64,
+    exact_net_profit_pct: f64,
+    direct_exact_net_profit_pct: f64,
+    gate_profit_pct: f64,
+    quote_before_raw: u64,
+    expected_quote_after_raw: u64,
+    guard: &TwoHopProfitGuard,
+) {
+    let min_quote_after_raw = quote_before_raw.saturating_add(guard.min_profit_raw);
+    let expected_shortfall_raw = min_quote_after_raw.saturating_sub(expected_quote_after_raw);
+    tracing::debug!(
+        "Two-hop guard: 路径={} 币种={} size=${:.2} spot={:.2}% exact={:.2}% direct_exact={:.2}% gate={:.2}% live_min={:.2}% gas=${:.4} jito=${:.4} safety=${:.4} required=${:.4} quote_before_raw={} expected_quote_after_raw={} min_quote_after_raw={} min_profit_raw={} expected_shortfall_raw={}",
+        path_label,
+        token_mint,
+        trade_size_usdc,
+        spot_net_profit_pct,
+        exact_net_profit_pct,
+        direct_exact_net_profit_pct,
+        gate_profit_pct,
+        guard.live_send_min_profit_pct,
+        guard.gas_cost_usdc,
+        guard.jito_tip_usdc,
+        guard.safety_buffer_usdc,
+        guard.required_profit_usdc,
+        quote_before_raw,
+        expected_quote_after_raw,
+        min_quote_after_raw,
+        guard.min_profit_raw,
+        expected_shortfall_raw
+    );
+}
+
+fn maybe_wrap_plan_with_two_hop_executor(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    path_label: &str,
+    trade_size_usdc: f64,
+    plan: &SimulationInstructionPlan,
+) -> Result<Vec<Instruction>> {
+    maybe_wrap_plan_with_two_hop_executor_with_min_profit_raw(
+        execution_manager,
+        config,
+        path_label,
+        trade_size_usdc,
+        plan,
+        None,
+    )
+}
+
+fn maybe_wrap_plan_with_two_hop_executor_with_min_profit_raw(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    path_label: &str,
+    trade_size_usdc: f64,
+    plan: &SimulationInstructionPlan,
+    min_profit_raw_override: Option<u64>,
+) -> Result<Vec<Instruction>> {
+    if is_pumpswap_raydium_clmm_plan(plan) {
+        tracing::debug!(
+            "{} 使用客户端构造 amount，跳过 两跳 executor 封装",
+            path_label
+        );
+        return Ok(plan.atomic_instructions.clone());
+    }
+
+    let onchain_instruction = build_two_hop_executor_instruction(
+        execution_manager,
+        config,
+        path_label,
+        trade_size_usdc,
+        plan,
+        min_profit_raw_override,
+    )?;
+
+    let mut wrapped_instructions = plan.setup_instructions.clone();
+    wrapped_instructions.push(onchain_instruction);
+    Ok(wrapped_instructions)
+}
+
+fn wrap_plan_with_two_hop_executor_atomic_only(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    path_label: &str,
+    trade_size_usdc: f64,
+    plan: &SimulationInstructionPlan,
+    min_profit_raw_override: Option<u64>,
+) -> Result<Vec<Instruction>> {
+    Ok(vec![build_two_hop_executor_instruction(
+        execution_manager,
+        config,
+        path_label,
+        trade_size_usdc,
+        plan,
+        min_profit_raw_override,
+    )?])
+}
+
+fn build_two_hop_executor_instruction(
+    execution_manager: &ExecutionManager,
+    config: &Config,
+    path_label: &str,
+    trade_size_usdc: f64,
+    plan: &SimulationInstructionPlan,
+    min_profit_raw_override: Option<u64>,
+) -> Result<Instruction> {
+    let Some(program_id) = execution_manager.two_hop_executor_program_id() else {
+        anyhow::bail!(
+            "executor-first mode requires TWO_HOP_EXECUTOR_PROGRAM_ID for {}",
+            path_label
+        );
+    };
+
+    let setup_len = plan.setup_instructions.len();
+    if plan.atomic_instructions.len() < setup_len + 2 {
+        anyhow::bail!(
+            "两跳 executor wrapping requires exactly two executable legs after setup; got total={} setup={}",
+            plan.atomic_instructions.len(),
+            setup_len
+        );
+    }
+
+    let first_instruction = &plan.atomic_instructions[setup_len];
+    let second_instruction = &plan.atomic_instructions[setup_len + 1];
+    let guard = compute_two_hop_profit_guard(
+        execution_manager,
+        config,
+        trade_size_usdc,
+        &plan.net_quote_mint,
+    )?;
+    let min_profit_raw = min_profit_raw_override.unwrap_or(guard.min_profit_raw);
+    let onchain_instruction = executor::onchain::build_execute_two_hop_instruction(
+        &program_id,
+        &plan.net_quote_token_account,
+        &plan.intermediate_token_account,
+        first_instruction,
+        second_instruction,
+        min_profit_raw,
+        executor::onchain::DEFAULT_SECOND_LEG_AMOUNT_IN_OFFSET,
+    )?;
+    Ok(onchain_instruction)
+}
+
+fn quote_pump_buy_exact_base_out(
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    target_token_out: u64,
+) -> Result<u64> {
+    let quote_in = quote_constant_product_in_for_exact_out(
+        pumpswap_pool.quote_reserve as f64,
+        pumpswap_pool.token_reserve as f64,
+        target_token_out as f64,
+        pumpswap_pool.fee_bps,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "Pump buy exact base quote failed: target_token_out={} quote_reserve={} token_reserve={} fee_bps={}",
+            target_token_out,
+            pumpswap_pool.quote_reserve,
+            pumpswap_pool.token_reserve,
+            pumpswap_pool.fee_bps
+        )
+    })?;
+    Ok(ceil_u64(quote_in).max(1))
+}
+
+fn pumpswap_raydium_min_profitable_wsol_out(config: &Config, pump_max_quote_in: u64) -> u64 {
+    let gas_lamports =
+        ceil_u64((config.strategy.preflight_gas_cost_sol.max(0.0)) * 1_000_000_000.0);
+    pump_max_quote_in
+        .saturating_add(gas_lamports)
+        .saturating_add(configured_jito_tip_lamports(config))
+        .saturating_add(1)
+}
+
+fn ensure_pumpswap_raydium_profit_guard(
+    config: &Config,
+    raydium_token: &str,
+    pump_quote_in: u64,
+    expected_raydium_wsol_out: u64,
+) -> Result<u64> {
+    let pump_max_quote_in = pump_buy_max_quote_amount_in(pump_quote_in);
+    let min_raydium_wsol_out = pumpswap_raydium_min_profitable_wsol_out(config, pump_max_quote_in);
+    if expected_raydium_wsol_out < min_raydium_wsol_out {
+        anyhow::bail!(
+            "Pump->Raydium 利润检查失败: 币种={} Pump预估付款={} Pump最大付款={} Raydium最小回款={} Raydium预计回款={} 差额lamports={}",
+            raydium_token,
+            pump_quote_in,
+            pump_max_quote_in,
+            min_raydium_wsol_out,
+            expected_raydium_wsol_out,
+            min_raydium_wsol_out.saturating_sub(expected_raydium_wsol_out)
+        );
+    }
+    Ok(min_raydium_wsol_out)
+}
+
+fn execution_cost_raw_for_quote_mint(config: &Config, quote_mint: &str) -> Result<u64> {
+    let gas_sol = config.strategy.preflight_gas_cost_sol.max(0.0);
+    let tip_sol = (configured_jito_tip_lamports(config) as f64) / 1_000_000_000.0;
+    let total_sol = gas_sol + tip_sol;
+    if quote_mint == config.tokens.sol_mint {
+        Ok(ceil_u64(total_sol * 1_000_000_000.0))
+    } else if quote_mint == config.tokens.usdc_mint {
+        Ok(ceil_u64(
+            total_sol * config.strategy.sol_usdc_price * 1_000_000.0,
+        ))
+    } else {
+        anyhow::bail!(
+            "unsupported quote mint for PumpSwap/Raydium profit guard: {}",
+            quote_mint
+        );
+    }
+}
+
+fn min_profitable_quote_out(
+    config: &Config,
+    quote_mint: &str,
+    quote_amount_in: u64,
+) -> Result<u64> {
+    Ok(quote_amount_in
+        .saturating_add(execution_cost_raw_for_quote_mint(config, quote_mint)?)
+        .saturating_add(1))
+}
+
+fn ensure_raydium_pumpswap_profit_guard(
+    config: &Config,
+    raydium_token: &str,
+    quote_mint: &str,
+    raydium_quote_in: u64,
+    expected_pumpswap_quote_out: u64,
+) -> Result<u64> {
+    let min_pumpswap_quote_out = min_profitable_quote_out(config, quote_mint, raydium_quote_in)?;
+    if expected_pumpswap_quote_out < min_pumpswap_quote_out {
+        anyhow::bail!(
+            "Raydium->Pump 利润检查失败: 币种={} Raydium付款={} Pump最小回款={} Pump预计回款={} 差额raw={}",
+            raydium_token,
+            raydium_quote_in,
+            min_pumpswap_quote_out,
+            expected_pumpswap_quote_out,
+            min_pumpswap_quote_out.saturating_sub(expected_pumpswap_quote_out)
+        );
+    }
+    Ok(min_pumpswap_quote_out)
+}
+
+fn raydium_clmm_tick_array_refs_for_pool<'a>(
+    raydium: &RaydiumState,
+    tick_arrays: &'a HashMap<String, raydium_clmm::ClmmTickArrayState>,
+) -> Vec<&'a raydium_clmm::ClmmTickArrayState> {
+    let mut pool_tick_arrays: Vec<_> = tick_arrays
+        .values()
+        .filter(|tick_array| tick_array.pool_id == raydium.pool_address)
+        .collect();
+    pool_tick_arrays.sort_by_key(|tick_array| tick_array.start_tick_index);
+    pool_tick_arrays
+}
+
+fn find_max_raydium_token_in(
+    raydium_pool: &RaydiumState,
+    tick_arrays: &[&raydium_clmm::ClmmTickArrayState],
+    input_mint: &str,
+    upper_bound: u64,
+) -> Result<u64> {
+    if upper_bound == 0 {
+        anyhow::bail!("Raydium CLMM max input search skipped: zero upper bound");
+    }
+    if tick_arrays.is_empty() {
+        anyhow::bail!(
+            "Raydium CLMM max input search skipped: no hydrated tick arrays for pool {}",
+            raydium_pool.pool_address
+        );
+    }
+
+    let quote_ok = |amount: u64| -> bool {
+        amount > 0
+            && strategy::clmm::quote_exact_input(
+                raydium_pool,
+                tick_arrays,
+                input_mint,
+                amount as f64,
+            )
+            .is_ok()
+    };
+
+    if quote_ok(upper_bound) {
+        return Ok(upper_bound);
+    }
+
+    let mut low = 0_u64;
+    let mut high = upper_bound;
+    while low + 1 < high {
+        let mid = low + (high - low) / 2;
+        if quote_ok(mid) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+
+    if low == 0 {
+        anyhow::bail!(
+            "Raydium CLMM max input search failed: no quoteable token input up to {} for pool {}",
+            upper_bound,
+            raydium_pool.pool_address
+        );
+    }
+    Ok(low)
+}
+
+fn calculate_best_pump_to_raydium_input(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium_pool: &RaydiumState,
+    raydium_token: &str,
+    tick_arrays: &[&raydium_clmm::ClmmTickArrayState],
+    max_sol_in: u64,
+) -> Result<BestPumpToClmmInput> {
+    if pumpswap_pool.quote_mint != config.tokens.sol_mint {
+        anyhow::bail!(
+            "best PumpSwap->Raydium CLMM input currently requires WSOL Pump quote mint; got {}",
+            pumpswap_pool.quote_mint
+        );
+    }
+    if max_sol_in == 0 {
+        anyhow::bail!("best PumpSwap->Raydium CLMM input skipped: zero max_sol_in");
+    }
+
+    let pump_quote_cap_before_slippage = floor_mul_div_u64(
+        max_sol_in,
+        BPS_DENOMINATOR_U64,
+        PUMPSWAP_RAYDIUM_PUMP_BUY_MAX_QUOTE_BPS,
+    )
+    .max(1);
+    let pump_upper_token_out = quote_constant_product_out(
+        pumpswap_pool.quote_reserve as f64,
+        pumpswap_pool.token_reserve as f64,
+        pump_quote_cap_before_slippage as f64,
+        pumpswap_pool.fee_bps,
+    )
+    .map(floor_u64)
+    .unwrap_or(0);
+    let pump_upper_token_out =
+        token_2022_post_fee_amount(config, raydium_token, pump_upper_token_out, 1)
+            .unwrap_or(pump_upper_token_out)
+            .max(1);
+
+    let raydium_max_token_in = find_max_raydium_token_in(
+        raydium_pool,
+        tick_arrays,
+        raydium_token,
+        pump_upper_token_out,
+    )?;
+    let mut target_token_out = floor_mul_div_u64(
+        raydium_max_token_in,
+        PUMPSWAP_RAYDIUM_CLMM_TARGET_BPS,
+        BPS_DENOMINATOR_U64,
+    )
+    .max(1);
+    let mut pump_quote_in = quote_pump_buy_exact_base_out(pumpswap_pool, target_token_out)?;
+
+    if pump_buy_max_quote_amount_in(pump_quote_in) > max_sol_in {
+        let mut low = 0_u64;
+        let mut high = target_token_out;
+        while low + 1 < high {
+            let mid = low + (high - low) / 2;
+            let fits = quote_pump_buy_exact_base_out(pumpswap_pool, mid)
+                .map(|quote_in| pump_buy_max_quote_amount_in(quote_in) <= max_sol_in)
+                .unwrap_or(false);
+            if fits {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        if low == 0 {
+            anyhow::bail!(
+                "best PumpSwap->Raydium CLMM input skipped: no Pump exact-base size fits max_sol_in={}",
+                max_sol_in
+            );
+        }
+        target_token_out = low;
+        pump_quote_in = quote_pump_buy_exact_base_out(pumpswap_pool, target_token_out)?;
+    }
+
+    let raydium_quote = strategy::clmm::quote_exact_input(
+        raydium_pool,
+        tick_arrays,
+        raydium_token,
+        target_token_out as f64,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "Raydium CLMM final best-input quote failed 池={} 币种={} amount={}: {:?}",
+            raydium_pool.pool_address,
+            raydium_token,
+            target_token_out,
+            error
+        )
+    })?;
+
+    let expected_raydium_wsol_out = floor_u64(raydium_quote.amount_out).max(1);
+    let pump_max_quote_in = pump_buy_max_quote_amount_in(pump_quote_in);
+    let min_raydium_wsol_out = ensure_pumpswap_raydium_profit_guard(
+        config,
+        raydium_token,
+        pump_quote_in,
+        expected_raydium_wsol_out,
+    )?;
+
+    tracing::debug!(
+        "Pump 到 Raydium 最优输入：币种={}，最大SOL输入={}，Pump报价上限={}，Pump最大产出={}，Raydium最大输入={}，目标bps={}，目标产出={}，Pump付款={}，Pump最大付款={}，Raydium最小回款={}，Raydium预计回款={}，预计利润lamports={}",
+        raydium_token,
+        max_sol_in,
+        pump_quote_cap_before_slippage,
+        pump_upper_token_out,
+        raydium_max_token_in,
+        PUMPSWAP_RAYDIUM_CLMM_TARGET_BPS,
+        target_token_out,
+        pump_quote_in,
+        pump_max_quote_in,
+        min_raydium_wsol_out,
+        expected_raydium_wsol_out,
+        expected_raydium_wsol_out.saturating_sub(min_raydium_wsol_out)
+    );
+
+    Ok(BestPumpToClmmInput {
+        pump_quote_in_lamports: pump_quote_in,
+        expected_pump_token_out: target_token_out,
+        raydium_token_in: target_token_out,
+        expected_raydium_wsol_out,
+        min_raydium_wsol_out,
+    })
+}
+
+fn preflight_pumpswap_buy_clmm_sell(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+    tick_arrays: &[&raydium_clmm::ClmmTickArrayState],
+    trade_size_usdc: f64,
+) -> Result<ClmmPreflightQuote, strategy::clmm::ClmmQuoteError> {
+    let max_sol_in = usdc_to_raw_for_mint(
+        &config.tokens.sol_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )
+    .ok_or(strategy::clmm::ClmmQuoteError::UnsupportedMint)?;
+    let best = calculate_best_pump_to_raydium_input(
+        config,
+        pumpswap_pool,
+        raydium,
+        raydium_token,
+        tick_arrays,
+        ceil_u64(max_sol_in),
+    )
+    .map_err(|_| strategy::clmm::ClmmQuoteError::InvalidAmount)?;
+    let clmm_quote = strategy::clmm::quote_exact_input(
+        raydium,
+        tick_arrays,
+        raydium_token,
+        best.raydium_token_in as f64,
+    )?;
+    let clmm_output_mint = raydium_counter_mint(raydium, raydium_token)
+        .ok_or(strategy::clmm::ClmmQuoteError::UnsupportedMint)?;
+    let pump_max_quote_in = pump_buy_max_quote_amount_in(best.pump_quote_in_lamports);
+    let actual_input_usdc = raw_to_usdc_for_mint(
+        &pumpswap_pool.quote_mint,
+        pump_max_quote_in as f64,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )
+    .ok_or(strategy::clmm::ClmmQuoteError::UnsupportedMint)?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        clmm_output_mint,
+        best.expected_raydium_wsol_out as f64,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )
+    .ok_or(strategy::clmm::ClmmQuoteError::UnsupportedMint)?;
+
+    Ok(build_clmm_preflight_quote(
+        "PumpSwap->Raydium CLMM",
+        actual_input_usdc,
+        final_amount_usdc,
+        config.strategy.sol_usdc_price,
+        config.strategy.preflight_gas_cost_sol,
+        &clmm_quote,
+        pump_max_quote_in as f64,
+        best.expected_pump_token_out as f64,
+        best.raydium_token_in as f64,
+        best.expected_raydium_wsol_out as f64,
+        best.min_raydium_wsol_out as f64,
+    ))
+}
+
+fn preflight_clmm_buy_pumpswap_sell(
+    config: &Config,
+    pumpswap_pool: &strategy::quote::ConstantProductPool,
+    raydium: &RaydiumState,
+    raydium_token: &str,
+    tick_arrays: &[&raydium_clmm::ClmmTickArrayState],
+    trade_size_usdc: f64,
+) -> Result<ClmmPreflightQuote, strategy::clmm::ClmmQuoteError> {
+    let clmm_input_mint = raydium_counter_mint(raydium, raydium_token)
+        .ok_or(strategy::clmm::ClmmQuoteError::UnsupportedMint)?;
+    let clmm_amount_in = usdc_to_raw_for_mint(
+        clmm_input_mint,
+        trade_size_usdc,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )
+    .ok_or(strategy::clmm::ClmmQuoteError::UnsupportedMint)?;
+    let clmm_quote =
+        strategy::clmm::quote_exact_input(raydium, tick_arrays, clmm_input_mint, clmm_amount_in)?;
+    let conservative_token_amount =
+        clmm_quote.amount_out * (1.0 - config.strategy.raydium_clmm_output_buffer_bps / 10_000.0);
+    let conservative_final_quote_amount = quote_constant_product_out(
+        pumpswap_pool.token_reserve as f64,
+        pumpswap_pool.quote_reserve as f64,
+        conservative_token_amount,
+        pumpswap_pool.fee_bps,
+    )
+    .ok_or(strategy::clmm::ClmmQuoteError::InvalidAmount)?;
+    let final_amount_usdc = raw_to_usdc_for_mint(
+        &pumpswap_pool.quote_mint,
+        conservative_final_quote_amount,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        config.strategy.sol_usdc_price,
+    )
+    .ok_or(strategy::clmm::ClmmQuoteError::UnsupportedMint)?;
+
+    Ok(build_clmm_preflight_quote(
+        "Raydium CLMM->PumpSwap",
+        trade_size_usdc,
+        final_amount_usdc,
+        config.strategy.sol_usdc_price,
+        config.strategy.preflight_gas_cost_sol,
+        &clmm_quote,
+        clmm_amount_in,
+        conservative_token_amount,
+        clmm_amount_in,
+        conservative_token_amount,
+        conservative_final_quote_amount,
+    ))
+}
+
+fn build_clmm_preflight_quote(
+    path_label: &'static str,
+    trade_size_usdc: f64,
+    final_amount_usdc: f64,
+    sol_usdc_price: f64,
+    preflight_gas_cost_sol: f64,
+    clmm_quote: &strategy::clmm::ClmmExactInQuote,
+    quote_amount_in: f64,
+    token_amount: f64,
+    clmm_amount_in: f64,
+    min_clmm_amount_out: f64,
+    min_pumpswap_quote_out: f64,
+) -> ClmmPreflightQuote {
+    let gross_profit_usdc = final_amount_usdc - trade_size_usdc;
+    let slippage_buffer_usdc =
+        final_amount_usdc * (strategy::quote::SLIPPAGE_BUFFER_BPS / 10_000.0);
+    let gas_cost_usdc = atomic_execution_gas_cost_usdc(preflight_gas_cost_sol, sol_usdc_price);
+    let net_profit_usdc = gross_profit_usdc - slippage_buffer_usdc - gas_cost_usdc;
+
+    ClmmPreflightQuote {
+        path_label,
+        final_amount_usdc,
+        net_profit_usdc,
+        clmm_fee_amount: clmm_quote.fee_amount,
+        clmm_sqrt_price_next_x64: clmm_quote.sqrt_price_next_x64,
+        quote_amount_in: ceil_u64(quote_amount_in),
+        token_amount: slippage_floor_u64(token_amount),
+        clmm_amount_in: slippage_floor_u64(clmm_amount_in),
+        min_clmm_amount_out: slippage_floor_u64(min_clmm_amount_out),
+        min_pumpswap_quote_out: slippage_floor_u64(min_pumpswap_quote_out),
+    }
+}
+
+fn ceil_u64(value: f64) -> u64 {
+    if value <= 0.0 || !value.is_finite() {
+        0
+    } else {
+        value.ceil().min(u64::MAX as f64) as u64
+    }
+}
+
+fn floor_u64(value: f64) -> u64 {
+    if value <= 0.0 || !value.is_finite() {
+        0
+    } else {
+        value.floor().min(u64::MAX as f64) as u64
+    }
+}
+
+fn slippage_floor_u64(value: f64) -> u64 {
+    floor_u64(value * (1.0 - strategy::quote::SLIPPAGE_BUFFER_BPS / 10_000.0))
+}
+
+fn raydium_counter_mint<'a>(raydium: &'a RaydiumState, token_mint: &str) -> Option<&'a str> {
+    if raydium.base_mint == token_mint {
+        Some(&raydium.quote_mint)
+    } else if raydium.quote_mint == token_mint {
+        Some(&raydium.base_mint)
+    } else {
+        None
+    }
+}
+
+fn meteora_raydium_quote_mints_match(
+    config: &Config,
+    meteora: &MeteoraState,
+    raydium: &RaydiumState,
+    token_mint: &str,
+) -> bool {
+    let Some(meteora_quote_mint) =
+        meteora.quote_mint(&config.tokens.usdc_mint, &config.tokens.sol_mint)
+    else {
+        return false;
+    };
+    let Some(raydium_quote_mint) = raydium_counter_mint(raydium, token_mint) else {
+        return false;
+    };
+    meteora_quote_mint == raydium_quote_mint
+}
+
+fn cp_pool_from_pumpswap(
+    config: &Config,
+    state: &PumpSwapState,
+) -> Option<strategy::quote::ConstantProductPool> {
+    cp_pool_from_parts(
+        strategy::quote::Venue::PumpSwap,
+        &state.base_mint,
+        &state.quote_mint,
+        state.base_reserve,
+        state.quote_reserve,
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        PUMPSWAP_FEE_BPS,
+    )
+}
+
+fn cp_pool_from_raydium(
+    config: &Config,
+    state: &RaydiumState,
+) -> Option<strategy::quote::ConstantProductPool> {
+    cp_pool_from_parts(
+        strategy::quote::Venue::Raydium,
+        &state.base_mint,
+        &state.quote_mint,
+        state.effective_base_reserve(),
+        state.effective_quote_reserve(),
+        &config.tokens.usdc_mint,
+        &config.tokens.sol_mint,
+        state.fee_bps,
+    )
+}
+
+fn cp_pool_spot_price_usdc(
+    pool: &strategy::quote::ConstantProductPool,
+    usdc_mint: &str,
+    sol_mint: &str,
+    sol_usdc_price: f64,
+) -> Option<f64> {
+    if pool.token_reserve == 0 || pool.quote_reserve == 0 {
+        return None;
+    }
+
+    let token_amount = pool.token_reserve as f64 / 10_f64.powi(default_decimals(&pool.token_mint));
+    let quote_amount = pool.quote_reserve as f64 / 10_f64.powi(default_decimals(&pool.quote_mint));
+    if token_amount <= 0.0 {
+        return None;
+    }
+
+    let quote_price_usdc = if pool.quote_mint == usdc_mint {
+        1.0
+    } else if pool.quote_mint == sol_mint {
+        sol_usdc_price
+    } else {
+        return None;
+    };
+
+    Some((quote_amount / token_amount) * quote_price_usdc)
+}
+
+fn raydium_token_price_usdc_for_spot(
+    config: &Config,
+    state: &RaydiumState,
+    token_mint: &str,
+) -> Option<f64> {
+    if state.venue == RaydiumVenue::Clmm {
+        clmm_token_price_usdc(
+            state,
+            token_mint,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+        )
+    } else {
+        let pool = cp_pool_from_raydium(config, state)?;
+        cp_pool_spot_price_usdc(
+            &pool,
+            &config.tokens.usdc_mint,
+            &config.tokens.sol_mint,
+            config.strategy.sol_usdc_price,
+        )
+    }
+}
+
+fn meteora_token_price_usdc(
+    state: &MeteoraState,
+    usdc_mint: &str,
+    sol_mint: &str,
+    sol_usdc_price: f64,
+) -> Option<f64> {
+    let token_mint = state.traded_token(usdc_mint, sol_mint)?;
+    let quote_mint = state.quote_mint(usdc_mint, sol_mint)?;
+    let raw_price_in_quote = state.token_price_in_quote(usdc_mint, sol_mint)?;
+    let decimal_adjustment =
+        10_f64.powi(default_decimals(&token_mint) - default_decimals(&quote_mint));
+    let quote_price_usdc = if quote_mint == usdc_mint {
+        1.0
+    } else if quote_mint == sol_mint {
+        sol_usdc_price
+    } else {
+        return None;
+    };
+    let price_usdc = raw_price_in_quote * decimal_adjustment * quote_price_usdc;
+    (price_usdc.is_finite() && price_usdc > 0.0).then_some(price_usdc)
+}
+
+fn clmm_token_price_usdc(
+    state: &RaydiumState,
+    token_mint: &str,
+    usdc_mint: &str,
+    sol_mint: &str,
+    sol_usdc_price: f64,
+) -> Option<f64> {
+    let price_quote_per_base = state.calculate_price();
+    if price_quote_per_base <= 0.0 || !price_quote_per_base.is_finite() {
+        return None;
+    }
+
+    if state.base_mint == token_mint
+        && (state.quote_mint == usdc_mint || state.quote_mint == sol_mint)
+    {
+        let quote_price_usdc = if state.quote_mint == usdc_mint {
+            1.0
+        } else {
+            sol_usdc_price
+        };
+        Some(price_quote_per_base * quote_price_usdc)
+    } else if state.quote_mint == token_mint
+        && (state.base_mint == usdc_mint || state.base_mint == sol_mint)
+    {
+        let quote_price_usdc = if state.base_mint == usdc_mint {
+            1.0
+        } else {
+            sol_usdc_price
+        };
+        Some((1.0 / price_quote_per_base) * quote_price_usdc)
+    } else {
+        None
+    }
+}
+
+fn quote_constant_product_out(
+    input_reserve: f64,
+    output_reserve: f64,
+    amount_in: f64,
+    fee_bps: f64,
+) -> Option<f64> {
+    if input_reserve <= 0.0 || output_reserve <= 0.0 || amount_in <= 0.0 {
+        return None;
+    }
+
+    let amount_in_less_fee = amount_in * (1.0 - fee_bps / 10_000.0);
+    Some((amount_in_less_fee * output_reserve) / (input_reserve + amount_in_less_fee))
+}
+
+fn usdc_to_raw_for_mint(
+    mint: &str,
+    amount_usdc: f64,
+    usdc_mint: &str,
+    sol_mint: &str,
+    sol_usdc_price: f64,
+) -> Option<f64> {
+    if mint == usdc_mint {
+        Some(amount_usdc * 1e6)
+    } else if mint == sol_mint {
+        Some((amount_usdc / sol_usdc_price) * 1e9)
+    } else {
+        None
+    }
+}
+
+fn raw_to_usdc_for_mint(
+    mint: &str,
+    amount_raw: f64,
+    usdc_mint: &str,
+    sol_mint: &str,
+    sol_usdc_price: f64,
+) -> Option<f64> {
+    if mint == usdc_mint {
+        Some(amount_raw / 1e6)
+    } else if mint == sol_mint {
+        Some((amount_raw / 1e9) * sol_usdc_price)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const SOL: &str = "So11111111111111111111111111111111111111112";
+    const TOKEN: &str = "Token111111111111111111111111111111111111111";
+    const Q64_U128: u128 = 18_446_744_073_709_551_616;
+
+    fn test_config(min_profit_threshold: f64) -> Config {
+        Config {
+            grpc: config::GrpcConfig {
+                endpoint: "127.0.0.1:10000".to_string(),
+                token: None,
+            },
+            rpc: config::RpcConfig {
+                http_url: "http://localhost:8899".to_string(),
+            },
+            subscription: config::SubscriptionConfig::default(),
+            strategy: config::StrategyConfig {
+                min_profit_threshold,
+                sol_usdc_price: 100.0,
+                trade_sizes: vec![1.0],
+                program_pair_trade_sizes_sol: vec![0.25, 0.5, 1.0],
+                program_pair_best_size_search_samples: 4,
+                program_pair_max_send_candidates_per_scan: 1,
+                program_pair_send_min_gross_profit_pct: 0.02,
+                program_pair_near_profit_margin_pct: 0.5,
+                program_pair_dynamic_gate_max_adjustment_pct: 0.35,
+                preflight_gas_cost_sol: 0.00025,
+                pumpswap_buy_output_buffer_bps: 50.0,
+                raydium_clmm_output_buffer_bps: 50.0,
+                pumpswap_meteora_small_pool_liquidity_usdc: 2_500.0,
+                pumpswap_meteora_max_trade_depth_bps: 600.0,
+                pumpswap_meteora_buy_slippage_bps: 125.0,
+                pumpswap_meteora_buy_slippage_bps_small_pool: 275.0,
+                pumpswap_meteora_sell_slippage_bps: 90.0,
+                pumpswap_meteora_sell_slippage_bps_small_pool: 225.0,
+                pumpswap_meteora_max_touched_bin_arrays: 5,
+                pumpswap_meteora_max_meteora_fee_bps: 180.0,
+                pumpswap_meteora_failure_buffer_usdc: 0.03,
+                pumpswap_meteora_wrap_unwrap_cost_sol: 0.0,
+                pumpswap_meteora_ata_cost_sol: 0.0,
+                pumpswap_fee_lp_share_bps: 8_000,
+                pumpswap_fee_protocol_share_bps: 1_250,
+                pumpswap_fee_coin_creator_share_bps: 750,
+                pumpswap_meteora_class_a_min_profit_usdc: 0.08,
+                pumpswap_meteora_class_b_min_profit_usdc: 0.03,
+                pumpswap_meteora_class_a_min_confidence: 0.72,
+                pumpswap_meteora_class_b_min_confidence: 0.45,
+                pumpswap_meteora_min_hit_rate: 0.25,
+                pumpswap_meteora_min_hit_rate_samples: 4,
+                max_direct_tokens_per_scan: 4,
+                max_meteora_pools_per_token_for_direct_scan: 2,
+            },
+            discovery: config::DiscoveryConfig::default(),
+            execution: config::ExecutionConfig::default(),
+            programs: config::Config::default().programs,
+            tokens: config::TokenConfig {
+                usdc_mint: USDC.to_string(),
+                sol_mint: SOL.to_string(),
+            },
+            pump_accounts: Vec::new(),
+            meteora_pools: Vec::new(),
+            raydium_pools: Vec::new(),
+            whirlpool_pools: Vec::new(),
+            logging: config::LoggingConfig {
+                level: "info".to_string(),
+                heartbeat_interval: 50,
+                idle_status_interval_secs: 15,
+            },
+        }
+    }
+
+    fn clmm_pool() -> RaydiumState {
+        RaydiumState {
+            pool_address: "pool".to_string(),
+            venue: RaydiumVenue::Clmm,
+            amm_config: Some("amm_config".to_string()),
+            base_mint: TOKEN.to_string(),
+            quote_mint: SOL.to_string(),
+            base_vault: None,
+            quote_vault: None,
+            observation_key: Some("observation".to_string()),
+            base_reserve: 0,
+            quote_reserve: 0,
+            base_decimals: 6,
+            quote_decimals: 9,
+            sqrt_price_x64: Some(Q64_U128),
+            liquidity: 1_000_000_000_000_000,
+            tick_current: Some(0),
+            tick_spacing: Some(60),
+            base_fee_owed: 0,
+            quote_fee_owed: 0,
+            fee_bps: 25.0,
+            price_history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn raydium_pumpswap_second_leg_uses_token_to_wsol_directional_limits_and_ticks() {
+        let mut raydium = clmm_pool();
+        raydium.pool_address = Pubkey::new_from_array([77; 32]).to_string();
+        raydium.base_mint = SOL.to_string();
+        raydium.quote_mint = TOKEN.to_string();
+        raydium.tick_current = Some(12_345);
+        raydium.tick_spacing = Some(60);
+
+        let zero_for_one = raydium_clmm_exact_input_zero_for_one(&raydium, TOKEN, SOL).unwrap();
+        assert!(!zero_for_one);
+        assert_eq!(
+            raydium_clmm_sqrt_price_limit_x64(zero_for_one),
+            RAYDIUM_CLMM_MAX_SQRT_PRICE_X64_MINUS_ONE
+        );
+
+        let arrays =
+            raydium_swap_remaining_tick_arrays_for_direction(&raydium, zero_for_one, 2).unwrap();
+        let current_start = raydium_clmm::tick_array_start_index(12_345, 60);
+        let expected_0 = Pubkey::from_str(
+            &raydium_clmm::derive_tick_array_address(&raydium.pool_address, current_start).unwrap(),
+        )
+        .unwrap();
+        let expected_1 = Pubkey::from_str(
+            &raydium_clmm::derive_tick_array_address(&raydium.pool_address, current_start + 3_600)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(arrays, vec![expected_0, expected_1]);
+
+        raydium.base_mint = TOKEN.to_string();
+        raydium.quote_mint = SOL.to_string();
+        let zero_for_one = raydium_clmm_exact_input_zero_for_one(&raydium, TOKEN, SOL).unwrap();
+        assert!(zero_for_one);
+        assert_eq!(
+            raydium_clmm_sqrt_price_limit_x64(zero_for_one),
+            RAYDIUM_CLMM_MIN_SQRT_PRICE_X64_PLUS_ONE
+        );
+        let arrays =
+            raydium_swap_remaining_tick_arrays_for_direction(&raydium, zero_for_one, 2).unwrap();
+        let expected_1 = Pubkey::from_str(
+            &raydium_clmm::derive_tick_array_address(&raydium.pool_address, current_start - 3_600)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(arrays, vec![expected_0, expected_1]);
+    }
+
+    #[test]
+    fn pumpswap_raydium_second_leg_uses_quote_returned_tick_arrays() {
+        let mut raydium = clmm_pool();
+        raydium.pool_address = Pubkey::new_from_array([78; 32]).to_string();
+        raydium.base_mint = SOL.to_string();
+        raydium.quote_mint = TOKEN.to_string();
+        raydium.tick_current = Some(12_345);
+        raydium.tick_spacing = Some(60);
+
+        let current_start = raydium_clmm::tick_array_start_index(12_345, 60);
+        let next_start = current_start + 3_600;
+        let current_address =
+            raydium_clmm::derive_tick_array_address(&raydium.pool_address, current_start).unwrap();
+        let next_address =
+            raydium_clmm::derive_tick_array_address(&raydium.pool_address, next_start).unwrap();
+        let mut tick_arrays = HashMap::new();
+        tick_arrays.insert(
+            current_address.clone(),
+            raydium_clmm::ClmmTickArrayState {
+                pool_id: raydium.pool_address.clone(),
+                start_tick_index: current_start,
+                initialized_tick_count: 0,
+                initialized_ticks: Vec::new(),
+            },
+        );
+        tick_arrays.insert(
+            next_address.clone(),
+            raydium_clmm::ClmmTickArrayState {
+                pool_id: raydium.pool_address.clone(),
+                start_tick_index: next_start,
+                initialized_tick_count: 1,
+                initialized_ticks: vec![raydium_clmm::ClmmTickState {
+                    tick: next_start,
+                    liquidity_net: 0,
+                    liquidity_gross: 1,
+                }],
+            },
+        );
+
+        let route =
+            raydium_clmm_quote_swap_v2_route_for_mints(&raydium, &tick_arrays, TOKEN, SOL, 1_000)
+                .unwrap();
+
+        assert_eq!(
+            route.remaining_tick_arrays,
+            vec![Pubkey::from_str(&next_address).unwrap()]
+        );
+        assert!(route.expected_output > 0);
+    }
+
+    fn tick_array() -> raydium_clmm::ClmmTickArrayState {
+        raydium_clmm::ClmmTickArrayState {
+            pool_id: "pool".to_string(),
+            start_tick_index: -3600,
+            initialized_tick_count: 2,
+            initialized_ticks: vec![
+                raydium_clmm::ClmmTickState {
+                    tick: -60,
+                    liquidity_net: 0,
+                    liquidity_gross: 1,
+                },
+                raydium_clmm::ClmmTickState {
+                    tick: 60,
+                    liquidity_net: 0,
+                    liquidity_gross: 1,
+                },
+            ],
+        }
+    }
+
+    fn pumpswap_pool(
+        token_reserve: u64,
+        quote_reserve: u64,
+    ) -> strategy::quote::ConstantProductPool {
+        strategy::quote::ConstantProductPool {
+            venue: strategy::quote::Venue::PumpSwap,
+            token_mint: TOKEN.to_string(),
+            quote_mint: SOL.to_string(),
+            token_reserve,
+            quote_reserve,
+            fee_bps: PUMPSWAP_FEE_BPS,
+        }
+    }
+
+    fn pumpswap_state(token_reserve: u64, quote_reserve: u64) -> PumpSwapState {
+        PumpSwapState {
+            pool_address: "pumpswap_pool".to_string(),
+            base_mint: TOKEN.to_string(),
+            quote_mint: SOL.to_string(),
+            base_vault: "base_vault".to_string(),
+            quote_vault: "quote_vault".to_string(),
+            coin_creator: None,
+            is_mayhem_mode: false,
+            is_cashback_coin: false,
+            base_reserve: token_reserve,
+            quote_reserve,
+            price_history: Vec::new(),
+        }
+    }
+
+    fn meteora_pool() -> MeteoraState {
+        MeteoraState {
+            pool_address: Pubkey::new_from_array([9; 32]).to_string(),
+            active_id: 0,
+            bin_step: 25,
+            base_factor: 12000,
+            variable_fee_control: 0,
+            protocol_share: 0,
+            base_fee_power_factor: 0,
+            volatility_accumulator: 0,
+            token_x_mint: SOL.to_string(),
+            token_y_mint: TOKEN.to_string(),
+            reserve_x: Pubkey::new_from_array([10; 32]).to_string(),
+            reserve_y: Pubkey::new_from_array([11; 32]).to_string(),
+            bin_array_bitmap: [0u64; 16],
+            token_x_amount: 0,
+            token_y_amount: 0,
+            fee_bps: 30.0,
+            damm_v2_pool_data: None,
+            price_history: Vec::new(),
+        }
+    }
+
+    fn meteora_bin_array(pool: &MeteoraState) -> meteora::MeteoraBinArrayState {
+        meteora::MeteoraBinArrayState {
+            lb_pair: pool.pool_address.clone(),
+            index: 0,
+            bins: vec![meteora::MeteoraBinState {
+                bin_id: 0,
+                amount_x: 10_000_000_000,
+                amount_y: 10_000_000_000,
+                price: Q64_U128,
+                liquidity_supply: 1,
+            }],
+        }
+    }
+
+    #[test]
+    fn recognizes_anchor_and_rpc_custom_error_codes() {
+        assert!(contains_anchor_or_custom_error_code(
+            "Program log: AnchorError occurred. Error Number: 6037.",
+            6037
+        ));
+        assert!(contains_anchor_or_custom_error_code(
+            "transaction confirmed failed on-chain: error=Object {\"InstructionError\": Array [Number(4), Object {\"Custom\": Number(6037)}]}",
+            6037
+        ));
+        assert!(contains_anchor_or_custom_error_code(
+            "custom program error: 0x1795",
+            6037
+        ));
+        assert!(contains_anchor_or_custom_error_code(
+            "Program Error: \"Instruction #5 Failed - custom program error: 6037 | Cannot find non-zero liquidity binArrayId\"",
+            6037
+        ));
+    }
+
+    #[test]
+    fn classifies_onchain_profit_below_threshold_errors() {
+        let chinese_error = "发送前 CU estimation simulation failed: 链上利润不足: 起始报价余额=1411080530 结束报价余额=1411043133 最低要求=1411080530 差额=37397";
+        let hex_error = "Program Error: \"Instruction #2 Failed - custom program error: 0x7\"";
+        let rpc_error = "transaction confirmed failed on-chain: error=Object {\"InstructionError\": Array [Number(2), Object {\"Custom\": Number(7)}]}";
+
+        for error in [chinese_error, hex_error, rpc_error] {
+            let classified = classify_unsimulated_send_failure(error);
+            assert!(classified.is_some(), "unclassified error: {error}");
+            assert_eq!(classified.unwrap().0, "onchain_profit_below_threshold");
+        }
+    }
+
+    #[test]
+    fn classifies_pumpswap_and_meteora_slippage_errors() {
+        let pumpswap_error = "transaction confirmed failed on-chain: error=Object {\"InstructionError\": Array [Number(5), Object {\"Custom\": Number(6040)}]} logs=[\"Program log: AnchorError thrown. Error Code: BuySlippageBelowMinBaseAmountOut. Error Number: 6040.\", \"Program log: Left: 6840606086\", \"Program log: Right: 7790389484\"]";
+        let meteora_error = "transaction confirmed failed on-chain: error=Object {\"InstructionError\": Array [Number(5), Object {\"Custom\": Number(6003)}]} logs=[\"Program log: AnchorError thrown. Error Code: ExceededAmountSlippageTolerance. Error Number: 6003.\"]";
+
+        let pumpswap_classified = classify_unsimulated_send_failure(pumpswap_error);
+        assert_eq!(pumpswap_classified.unwrap().0, "pumpswap_buy_slippage");
+        assert_eq!(
+            summarize_simulation_error(pumpswap_error),
+            "PumpSwap 买入滑点超限: 实际买到=6840606086 最低要求=7790389484 差额=1219.2bps"
+        );
+
+        let meteora_classified = classify_unsimulated_send_failure(meteora_error);
+        assert_eq!(meteora_classified.unwrap().0, "meteora_swap_slippage");
+        assert_eq!(
+            summarize_simulation_error(meteora_error),
+            "Meteora 兑换滑点超限: 链上实际输出低于最低要求"
+        );
+    }
+
+    #[test]
+    fn recognizes_meteora_non_zero_liquidity_bin_array_error_from_rpc_confirmation() {
+        let error = "transaction confirmed failed on-chain: signature=abc slot=Some(1) error=Object {\"InstructionError\": Array [Number(4), Object {\"Custom\": Number(6037)}]} logs=[]";
+        assert!(is_meteora_non_zero_liquidity_bin_array_error(error));
+        assert!(should_expand_meteora_execution_bin_arrays(error));
+        assert_eq!(
+            summarize_simulation_error(error),
+            "Meteora bin array 窗口不足: 当前 remaining bin arrays 没覆盖到非零流动性区间"
+        );
+    }
+
+    #[test]
+    fn recognizes_meteora_non_zero_liquidity_bin_array_error_from_program_error_string() {
+        let error =
+            "Program Error: \"Instruction #5 Failed - custom program error: 6037 | Cannot find non-zero liquidity binArrayId\"";
+        assert!(is_meteora_non_zero_liquidity_bin_array_error(error));
+        assert!(should_expand_meteora_execution_bin_arrays(error));
+    }
+
+    #[test]
+    fn recognizes_raw_account_not_enough_keys_as_meteora_bin_array_shortage() {
+        let error = "Error processing Instruction 4: custom program error: 0xbbd";
+        assert!(is_meteora_bin_array_account_not_enough_keys_error(error));
+        assert!(should_expand_meteora_execution_bin_arrays(error));
+        assert_eq!(
+            summarize_simulation_error(error),
+            "Meteora bin array 账户不足: 当前 Swap2 需要更多 remaining bin arrays"
+        );
+    }
+
+    #[test]
+    fn meteora_execution_bin_array_retry_search_converges_between_liquidity_and_lock_bounds() {
+        let pool = "retry_search_pool";
+        METEORA_EXECUTION_BIN_ARRAY_COUNT_OVERRIDES
+            .write()
+            .unwrap()
+            .remove(pool);
+        METEORA_EXECUTION_BIN_ARRAY_SEARCH_STATE
+            .write()
+            .unwrap()
+            .remove(pool);
+
+        let base = direct_meteora_remaining_bin_array_count();
+        let expanded = bump_meteora_execution_bin_array_count_for_error(pool, "Error Number: 6037");
+        assert_eq!(expanded, base.saturating_add(8));
+
+        let reduced = reduce_meteora_execution_bin_array_count(pool).unwrap();
+        assert_eq!(reduced, (expanded, base + 4));
+
+        let refined = bump_meteora_execution_bin_array_count_for_error(pool, "Error Number: 6037");
+        assert_eq!(refined, base + 6);
+
+        METEORA_EXECUTION_BIN_ARRAY_COUNT_OVERRIDES
+            .write()
+            .unwrap()
+            .remove(pool);
+        METEORA_EXECUTION_BIN_ARRAY_SEARCH_STATE
+            .write()
+            .unwrap()
+            .remove(pool);
+    }
+
+    #[test]
+    fn meteora_quote_detail_arrays_include_directional_safety_buffer() {
+        let pool = meteora_pool();
+        let detail = MeteoraQuoteDetail {
+            amount_out: 1.0,
+            amount_out_without_fee: 1.0,
+            touched_bin_array_indices: vec![-5, -6],
+            touched_bins: 2,
+        };
+
+        let arrays = meteora_bin_arrays_for_quote_detail(&pool, &detail, SOL, TOKEN).unwrap();
+        let indices = arrays
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        assert!(indices.contains(&4));
+        assert!(indices.contains(&-10));
+        assert!(indices.contains(&meteora::bin_array_index(pool.active_id)));
+        assert_eq!(indices.first().copied(), Some(4));
+    }
+
+    #[test]
+    fn direct_send_retry_can_bypass_token_rate_limit() {
+        let mut stats = RuntimeStats::default();
+
+        assert!(allow_direct_send_attempt(
+            &mut stats,
+            "pumpswap_meteora",
+            TOKEN,
+            1.0,
+            false
+        ));
+        assert!(!allow_direct_send_attempt(
+            &mut stats,
+            "pumpswap_meteora",
+            TOKEN,
+            1.0,
+            false
+        ));
+        assert!(allow_direct_send_attempt(
+            &mut stats,
+            "pumpswap_meteora",
+            TOKEN,
+            1.0,
+            true
+        ));
+    }
+
+    fn meteora_bin_array_with_price(
+        pool: &MeteoraState,
+        price_y_per_x: f64,
+    ) -> meteora::MeteoraBinArrayState {
+        meteora::MeteoraBinArrayState {
+            lb_pair: pool.pool_address.clone(),
+            index: 0,
+            bins: vec![meteora::MeteoraBinState {
+                bin_id: 0,
+                amount_x: 10_000_000_000,
+                amount_y: 10_000_000_000,
+                price: floor_u64(price_y_per_x * Q64_U128 as f64) as u128,
+                liquidity_supply: 1,
+            }],
+        }
+    }
+
+    #[test]
+    fn meteora_execution_arrays_prefer_pool_bitmap_over_hydrated_guesswork() {
+        let mut pool = meteora_pool();
+        // active bin array index is 0; mark 0, -2 and -4 as initialized with liquidity
+        pool.bin_array_bitmap[8] |= 1u64 << 0;
+        pool.bin_array_bitmap[7] |= 1u64 << 63;
+        pool.bin_array_bitmap[7] |= 1u64 << 61;
+
+        let arrays =
+            meteora_swap_remaining_bin_arrays_for_execution(&pool, &HashMap::new(), SOL, TOKEN)
+                .unwrap();
+        let indices = arrays
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        assert!(indices.contains(&0));
+        assert!(indices.contains(&-1));
+        assert!(indices.contains(&-3));
+        assert_eq!(indices.first().copied(), Some(0));
+    }
+
+    fn token_account_data(amount: u64) -> Vec<u8> {
+        let mut data = vec![0u8; 165];
+        data[64..72].copy_from_slice(&amount.to_le_bytes());
+        data
+    }
+
+    fn program_pair_candidate_for_test(
+        quote_mint: &str,
+        trade_size_quote: f64,
+    ) -> strategy::program_pairs::ProgramPairCandidate {
+        strategy::program_pairs::ProgramPairCandidate {
+            token_mint: TOKEN.to_string(),
+            quote_mint: quote_mint.to_string(),
+            pricing_mode: strategy::program_pairs::ProgramPairPricingMode::ExactQuote,
+            buy_market: strategy::program_pairs::ProgramMarket {
+                address: "buy_pool".to_string(),
+                token_mint: TOKEN.to_string(),
+                quote_mint: quote_mint.to_string(),
+                kind: config::ProgramKind::MeteoraDlmm,
+                label: "Buy".to_string(),
+                price_quote: 1.0,
+                price_usdc: 1.0,
+                liquidity_usd: Some(10_000.0),
+                source: strategy::program_pairs::MarketSource::LiveState,
+            },
+            sell_market: strategy::program_pairs::ProgramMarket {
+                address: "sell_pool".to_string(),
+                token_mint: TOKEN.to_string(),
+                quote_mint: quote_mint.to_string(),
+                kind: config::ProgramKind::Whirlpool,
+                label: "Sell".to_string(),
+                price_quote: 1.01,
+                price_usdc: 1.01,
+                liquidity_usd: Some(10_000.0),
+                source: strategy::program_pairs::MarketSource::LiveState,
+            },
+            trade_size_quote,
+            gross_profit_quote: 0.01,
+            gas_cost_quote: 0.00025,
+            net_profit_quote: 0.00975,
+            gross_profit_pct: 1.0,
+            net_profit_pct: 0.975,
+            selected_pnl_usdc: Some(strategy::program_pairs::ProgramPairPnlBreakdown {
+                gross_profit_usdc: 0.01,
+                slippage_buffer_usdc: 0.0001,
+                gas_cost_usdc: 0.00025,
+                net_profit_usdc: 0.00965,
+            }),
+            exact_search: None,
+            gate: None,
+        }
+    }
+
+    #[test]
+    fn meteora_spot_price_accounts_for_decimal_difference() {
+        let pool = meteora_pool();
+        let price = meteora_token_price_usdc(&pool, USDC, SOL, 100.0).unwrap();
+
+        assert!((price - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn raydium_spot_price_uses_clmm_price_for_clmm_pools() {
+        let config = test_config(0.0);
+        let price = raydium_token_price_usdc_for_spot(&config, &clmm_pool(), TOKEN).unwrap();
+
+        assert!((price - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn program_pair_monitoring_keeps_non_sol_quote_candidates() {
+        let config = test_config(0.0);
+        let candidate = program_pair_candidate_for_test(USDC, 500.0);
+
+        assert!(program_pair_monitoring_candidate_allowed(
+            &config,
+            &candidate,
+            Some(0.01)
+        ));
+    }
+
+    #[test]
+    fn program_pair_monitoring_applies_balance_limit_to_sol_quote_candidates() {
+        let config = test_config(0.0);
+        let candidate = program_pair_candidate_for_test(SOL, 0.5);
+
+        assert!(program_pair_monitoring_candidate_allowed(
+            &config,
+            &candidate,
+            Some(1.0)
+        ));
+        assert!(!program_pair_monitoring_candidate_allowed(
+            &config,
+            &candidate,
+            Some(0.25)
+        ));
+    }
+
+    #[test]
+    fn pumpswap_meteora_direct_candidate_requires_sol_quote_meteora_pool() {
+        let config = test_config(0.0);
+        let pumpswap = pumpswap_state(1_000_000_000, 2_000_000_000);
+        let meteora = MeteoraState {
+            token_x_mint: USDC.to_string(),
+            token_y_mint: TOKEN.to_string(),
+            ..meteora_pool()
+        };
+
+        assert!(pumpswap_meteora_spot_candidate(&config, &pumpswap, &meteora).is_none());
+    }
+
+    #[test]
+    fn preflight_pumpswap_buy_clmm_sell_returns_profitable_quote() {
+        let config = test_config(1.0);
+        let raydium = clmm_pool();
+        let ticks = tick_array();
+        let pumpswap = pumpswap_pool(1_200_000_000, 800_000_000);
+
+        let quote =
+            preflight_pumpswap_buy_clmm_sell(&config, &pumpswap, &raydium, TOKEN, &[&ticks], 1.0)
+                .unwrap();
+
+        assert_eq!(quote.path_label, "PumpSwap->Raydium CLMM");
+        assert!(quote.final_amount_usdc > 1.0);
+        assert!(quote.net_profit_usdc > 0.0);
+    }
+
+    #[test]
+    fn preflight_clmm_buy_pumpswap_sell_returns_profitable_quote() {
+        let config = test_config(1.0);
+        let raydium = clmm_pool();
+        let ticks = tick_array();
+        let pumpswap = pumpswap_pool(1_000_000_000, 2_000_000_000);
+
+        let quote =
+            preflight_clmm_buy_pumpswap_sell(&config, &pumpswap, &raydium, TOKEN, &[&ticks], 1.0)
+                .unwrap();
+
+        assert_eq!(quote.path_label, "Raydium CLMM->PumpSwap");
+        assert!(quote.final_amount_usdc > 1.0);
+        assert!(quote.net_profit_usdc > 0.0);
+    }
+
+    #[test]
+    fn quote_pumpswap_buy_meteora_sell_returns_profitable_quote() {
+        let config = test_config(1.0);
+        let meteora = meteora_pool();
+        let bin_array = meteora_bin_array(&meteora);
+        let pumpswap = pumpswap_pool(2_000_000_000, 1_000_000_000);
+
+        let quote = quote_pumpswap_buy_meteora_sell(
+            &config,
+            &pumpswap,
+            &meteora,
+            TOKEN,
+            &[&bin_array],
+            1.0,
+        )
+        .unwrap();
+
+        assert!(quote.final_amount_usdc > 1.0);
+        assert!(quote.net_profit_usdc > 0.0);
+    }
+
+    #[test]
+    fn quote_meteora_buy_pumpswap_sell_returns_profitable_quote() {
+        let config = test_config(1.0);
+        let meteora = meteora_pool();
+        let bin_array = meteora_bin_array(&meteora);
+        let pumpswap = pumpswap_pool(1_000_000_000, 2_000_000_000);
+
+        let quote = quote_meteora_buy_pumpswap_sell(
+            &config,
+            &pumpswap,
+            &meteora,
+            TOKEN,
+            &[&bin_array],
+            1.0,
+        )
+        .unwrap();
+
+        assert!(quote.final_amount_usdc > 1.0);
+        assert!(quote.net_profit_usdc > 0.0);
+    }
+
+    #[test]
+    fn meteora_damm_v2_quote_precheck_rejects_zero_core_state() {
+        let mut pool = MeteoraDammV2Pool::default();
+        pool.sqrt_price = Q64_U128;
+
+        assert!(!meteora_damm_v2_pool_is_quoteable("pool", &pool));
+
+        pool.liquidity = 1;
+        pool.sqrt_price = 0;
+        assert!(!meteora_damm_v2_pool_is_quoteable("pool", &pool));
+
+        pool.sqrt_price = Q64_U128;
+        assert!(meteora_damm_v2_pool_is_quoteable("pool", &pool));
+    }
+
+    #[test]
+    fn quote_min_out_above_input_enforces_profit_range() {
+        assert_eq!(quote_min_out_above_input(1_000_000, 0.1), 1_001_000);
+        assert_eq!(quote_min_out_above_input(1_000_000, 0.5), 1_005_000);
+        assert_eq!(quote_min_out_above_input(1_000_000, 0.0), 1);
+        assert_eq!(quote_min_out_above_input(1_000_000, 1.0), 1_005_000);
+    }
+
+    #[test]
+    fn pumpswap_meteora_pair_ranking_prefers_better_exact_pair() {
+        let mut config = test_config(0.0);
+        config.strategy.max_meteora_pools_per_token_for_direct_scan = 1;
+
+        let pumpswap = pumpswap_pool(1_000_000_000, 2_000_000_000);
+        let good_meteora = meteora_pool();
+        let bad_meteora = MeteoraState {
+            pool_address: Pubkey::new_from_array([12; 32]).to_string(),
+            ..meteora_pool()
+        };
+
+        let mut meteora_by_token = HashMap::new();
+        meteora_by_token.insert(
+            TOKEN.to_string(),
+            vec![
+                bad_meteora.pool_address.clone(),
+                good_meteora.pool_address.clone(),
+            ],
+        );
+
+        let mut meteora_state = HashMap::new();
+        meteora_state.insert(good_meteora.pool_address.clone(), good_meteora.clone());
+        meteora_state.insert(bad_meteora.pool_address.clone(), bad_meteora.clone());
+
+        let mut meteora_bin_arrays = HashMap::new();
+        meteora_bin_arrays.insert(
+            "good_bin".to_string(),
+            meteora_bin_array_with_price(&good_meteora, 1.0),
+        );
+        meteora_bin_arrays.insert(
+            "bad_bin".to_string(),
+            meteora_bin_array_with_price(&bad_meteora, 0.55),
+        );
+
+        let ranked = ranked_meteora_pool_addresses_for_pumpswap_pair_scan(
+            &config,
+            TOKEN,
+            "pumpswap_pool",
+            &pumpswap,
+            &meteora_by_token,
+            &meteora_state,
+            &meteora_bin_arrays,
+            &RuntimeStats::default(),
+        );
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].as_str(), good_meteora.pool_address.as_str());
+    }
+
+    #[tokio::test]
+    async fn preflight_pumpswap_clmm_skips_reverse_direction() {
+        let config = test_config(1.0);
+        let raydium = clmm_pool();
+        let pumpswap = pumpswap_pool(1_000_000_000, 2_000_000_000);
+        let mut ticks = HashMap::new();
+        ticks.insert("tick_array".to_string(), tick_array());
+        let mut stats = RuntimeStats::default();
+
+        preflight_pumpswap_clmm(
+            None,
+            &config,
+            None,
+            &pumpswap,
+            &raydium,
+            TOKEN,
+            ClmmSpotDirection::ClmmToPumpSwap,
+            &ticks,
+            None,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.clmm_preflight_passed, 0);
+        assert_eq!(stats.clmm_preflight_missing_tick_arrays, 0);
+        assert_eq!(stats.clmm_preflight_tick_crossing_required, 0);
+    }
+
+    #[tokio::test]
+    async fn preflight_pumpswap_meteora_counts_exact_quote_passes() {
+        let config = test_config(1.0);
+        let meteora = meteora_pool();
+        let bin_array = meteora_bin_array(&meteora);
+        let mut bin_arrays = HashMap::new();
+        bin_arrays.insert("meteora_bin".to_string(), bin_array);
+        let pumpswap = pumpswap_pool(1_000_000_000, 2_000_000_000);
+        let mut stats = RuntimeStats::default();
+
+        preflight_pumpswap_meteora(
+            None,
+            &config,
+            None,
+            &pumpswap,
+            &meteora,
+            TOKEN,
+            MeteoraPumpSwapDirection::MeteoraToPumpSwap,
+            &bin_arrays,
+            None,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.exact_quote_passed, 1);
+    }
+
+    #[tokio::test]
+    async fn meteora_raydium_capability_check_allows_token_2022_intermediate_mint() {
+        let config = test_config(0.0);
+        let token_mint = Pubkey::new_from_array([42; 32]).to_string();
+        let token_mint_pubkey = Pubkey::from_str(&token_mint).unwrap();
+
+        {
+            let mut cache = MINT_TOKEN_PROGRAM_CACHE.write().await;
+            cache.entries.insert(
+                token_mint_pubkey,
+                Pubkey::from_str(executor::swap::TOKEN_2022_PROGRAM_ID).unwrap(),
+            );
+        }
+
+        let meteora = MeteoraState {
+            token_y_mint: token_mint.clone(),
+            ..meteora_pool()
+        };
+        let raydium = RaydiumState {
+            base_mint: token_mint.clone(),
+            ..clmm_pool()
+        };
+
+        assert!(
+            meteora_raydium_executable_block_reason(&config, &meteora, &raydium, &token_mint)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pumpswap_meteora_capability_check_allows_token_2022_intermediate_mint() {
+        let config = test_config(0.0);
+        let token_mint = Pubkey::new_from_array([43; 32]).to_string();
+        let token_mint_pubkey = Pubkey::from_str(&token_mint).unwrap();
+
+        {
+            let mut cache = MINT_TOKEN_PROGRAM_CACHE.write().await;
+            cache.entries.insert(
+                token_mint_pubkey,
+                Pubkey::from_str(executor::swap::TOKEN_2022_PROGRAM_ID).unwrap(),
+            );
+        }
+
+        let meteora = MeteoraState {
+            token_y_mint: token_mint.clone(),
+            ..meteora_pool()
+        };
+        let pumpswap = strategy::quote::ConstantProductPool {
+            venue: strategy::quote::Venue::PumpSwap,
+            token_mint: token_mint.clone(),
+            quote_mint: SOL.to_string(),
+            token_reserve: 1_000_000_000,
+            quote_reserve: 2_000_000_000,
+            fee_bps: PUMPSWAP_FEE_BPS,
+        };
+
+        assert!(pumpswap_meteora_executable_block_reason(
+            &config,
+            &pumpswap,
+            &meteora,
+            &token_mint,
+            MeteoraPumpSwapDirection::PumpSwapToMeteora,
+        )
+        .await
+        .is_none());
+    }
+
+    #[test]
+    fn finite_profit_allows_send_after_simulation() {
+        assert!(should_attempt_live_send_after_simulation(0.0, 0.0));
+        assert!(should_attempt_live_send_after_simulation(0.25, 0.0));
+        assert!(should_attempt_live_send_after_simulation(-0.25, -0.5));
+    }
+
+    #[test]
+    fn negative_or_non_finite_profit_blocks_send_after_simulation() {
+        assert!(!should_attempt_live_send_after_simulation(-0.25, 0.0));
+        assert!(!should_attempt_live_send_after_simulation(f64::NAN, 0.0));
+        assert!(!should_attempt_live_send_after_simulation(
+            f64::INFINITY,
+            0.0
+        ));
+        assert!(!should_attempt_live_send_after_simulation(
+            f64::NEG_INFINITY,
+            0.0
+        ));
+    }
+
+    #[test]
+    fn preflight_threshold_only_controls_whether_to_simulate() {
+        assert!(should_attempt_simulation_after_preflight(0.30, 0.30));
+        assert!(should_attempt_simulation_after_preflight(1.50, 0.30));
+        assert!(!should_attempt_simulation_after_preflight(0.29, 0.30));
+        assert!(!should_attempt_simulation_after_preflight(f64::NAN, 0.30));
+    }
+
+    #[test]
+    fn route_hit_rate_success_requires_sent_event() {
+        let discovered = RouteExecutionEvent {
+            event_kind: "discovered",
+            token: TOKEN.to_string(),
+            dex_route: "PumpSwap->Meteora".to_string(),
+            forward_pool: "forward".to_string(),
+            backward_pool: "backward".to_string(),
+            opportunity_class: Some("B"),
+            expected_forward_out: 1,
+            expected_backward_out: 2,
+            expected_profit_usdc: 0.1,
+            real_profit_usdc: 0.1,
+            sent: false,
+            landed: false,
+            success: true,
+            fail_reason: None,
+            cu_used: None,
+            priority_fee_raw: 0,
+            jito_tip_raw: 0,
+            timestamp: 0,
+        };
+        assert!(!route_event_counts_as_send_success(&discovered));
+
+        let mut sent = discovered.clone();
+        sent.event_kind = "confirmed";
+        sent.sent = true;
+        assert!(route_event_counts_as_send_success(&sent));
+    }
+
+    #[test]
+    fn monitor_mode_trade_sizes_expand_below_configured_sizes() {
+        let mut config = test_config(0.0);
+        config.strategy.trade_sizes = vec![80.0, 100.0];
+
+        let trade_sizes = effective_trade_sizes_usdc(None, &config);
+
+        assert_eq!(
+            trade_sizes,
+            vec![2.0, 4.0, 8.0, 16.0, 28.0, 40.0, 60.0, 80.0, 100.0]
+        );
+    }
+
+    #[test]
+    fn live_probe_trade_sizes_cover_two_value_interval() {
+        let mut config = test_config(0.0);
+        config.strategy.trade_sizes = vec![0.25, 1.0];
+
+        assert_eq!(
+            live_probe_trade_sizes_usdc(&config),
+            vec![0.25, 0.44, 0.63, 0.81, 1.0]
+        );
+    }
+
+    #[test]
+    fn direct_execution_trade_size_prefers_smallest_live_size() {
+        let mut config = test_config(0.0);
+        config.strategy.trade_sizes = vec![1.0, 0.25];
+
+        assert_eq!(direct_execution_trade_size_usdc(&config), Some(0.25));
+    }
+
+    #[test]
+    fn live_mode_trade_sizes_prefer_configured_usdc_sizes() {
+        let mut config = test_config(0.0);
+        config.strategy.trade_sizes = vec![100.0, 80.0, 100.0];
+
+        let trade_sizes = configured_live_trade_sizes_usdc(&config);
+
+        assert_eq!(trade_sizes, vec![80.0, 100.0]);
+    }
+
+    #[test]
+    fn two_value_live_trade_sizes_sample_within_interval() {
+        let mut config = test_config(0.0);
+        config.strategy.trade_sizes = vec![80.0, 100.0];
+
+        for _ in 0..32 {
+            let sampled = sample_configured_live_trade_size_usdc(&config).unwrap();
+            assert!((80.0..=100.0).contains(&sampled));
+        }
+    }
+
+    #[test]
+    fn single_value_live_trade_size_is_fixed() {
+        let mut config = test_config(0.0);
+        config.strategy.trade_sizes = vec![80.0];
+
+        assert_eq!(sample_configured_live_trade_size_usdc(&config), Some(80.0));
+    }
+
+    #[test]
+    fn multi_value_live_trade_sizes_sample_from_list() {
+        let mut config = test_config(0.0);
+        config.strategy.trade_sizes = vec![10.0, 50.0, 100.0];
+
+        for _ in 0..32 {
+            let sampled = sample_configured_live_trade_size_usdc(&config).unwrap();
+            assert!(matches!(sampled, 10.0 | 50.0 | 100.0));
+        }
+    }
+
+    #[test]
+    fn invalid_two_hop_profit_guard_min_usdc_env_falls_back_to_default() {
+        let key = "TWO_HOP_PROFIT_GUARD_MIN_USDC";
+        let original = std::env::var(key).ok();
+        std::env::set_var(key, "invalid");
+
+        assert_eq!(
+            two_hop_profit_guard_min_usdc(),
+            DEFAULT_TWO_HOP_PROFIT_GUARD_MIN_USDC
+        );
+
+        if let Some(value) = original {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn valid_two_hop_profit_guard_min_usdc_env_overrides_default() {
+        let key = "TWO_HOP_PROFIT_GUARD_MIN_USDC";
+        let original = std::env::var(key).ok();
+        std::env::set_var(key, "0.05");
+
+        assert!((two_hop_profit_guard_min_usdc() - 0.05).abs() < f64::EPSILON);
+
+        if let Some(value) = original {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn direct_send_extra_edge_uses_larger_of_pct_and_usdc_floor() {
+        let pct_key = "DIRECT_SEND_EXTRA_EDGE_PCT";
+        let usdc_key = "DIRECT_SEND_EXTRA_EDGE_USDC";
+        let original_pct = std::env::var(pct_key).ok();
+        let original_usdc = std::env::var(usdc_key).ok();
+        std::env::set_var(pct_key, "0.2");
+        std::env::set_var(usdc_key, "0.02");
+
+        assert!((direct_send_extra_edge_required_profit_usdc(0.5) - 0.02).abs() < f64::EPSILON);
+        assert!((direct_send_extra_edge_required_profit_usdc(20.0) - 0.04).abs() < f64::EPSILON);
+
+        if let Some(value) = original_pct {
+            std::env::set_var(pct_key, value);
+        } else {
+            std::env::remove_var(pct_key);
+        }
+        if let Some(value) = original_usdc {
+            std::env::set_var(usdc_key, value);
+        } else {
+            std::env::remove_var(usdc_key);
+        }
+    }
+
+    #[test]
+    fn simulated_token_account_positive_delta_uses_increment_not_total_balance() {
+        let account = Pubkey::new_unique();
+        let mut accounts = HashMap::new();
+        accounts.insert(account.to_string(), token_account_data(1_250));
+
+        assert_eq!(
+            simulated_token_account_positive_delta(&accounts, &account, 1_000),
+            Some(250)
+        );
+    }
+
+    #[test]
+    fn simulated_token_account_net_change_can_be_negative() {
+        let account = Pubkey::new_unique();
+        let mut accounts = HashMap::new();
+        accounts.insert(account.to_string(), token_account_data(900));
+
+        assert_eq!(
+            simulated_token_account_net_change(&accounts, &account, 1_000),
+            Some(-100)
+        );
+    }
+
+    #[test]
+    fn simulated_second_leg_quote_output_recovers_output_from_atomic_net_delta() {
+        let account = Pubkey::new_unique();
+        let mut accounts = HashMap::new();
+        accounts.insert(account.to_string(), token_account_data(1_122));
+
+        assert_eq!(
+            simulated_second_leg_quote_output_from_atomic_delta(&accounts, &account, 1_000, 100),
+            Some(222)
+        );
+    }
+
+    #[test]
+    fn direct_token_feedback_score_expires_after_ttl() {
+        let now = Instant::now();
+        let mut stats = RuntimeStats::default();
+        stats.direct_token_feedback.insert(
+            TOKEN.to_string(),
+            CandidateLogState {
+                last_seen: now
+                    .checked_sub(DIRECT_TOKEN_FEEDBACK_TTL + Duration::from_secs(1))
+                    .unwrap(),
+                last_net_profit_pct: 1.5,
+            },
+        );
+
+        assert_eq!(direct_token_feedback_score(&stats, TOKEN), 0.0);
+    }
+
+    #[test]
+    fn prune_runtime_state_removes_only_stale_entries() {
+        let now = Instant::now();
+        let fresh = CandidateLogState {
+            last_seen: now,
+            last_net_profit_pct: 1.0,
+        };
+        let stale_candidate = CandidateLogState {
+            last_seen: now
+                .checked_sub(CANDIDATE_LOG_TTL + Duration::from_secs(1))
+                .unwrap(),
+            last_net_profit_pct: 1.0,
+        };
+        let stale_attempt = CandidateLogState {
+            last_seen: now
+                .checked_sub(EXECUTION_ATTEMPT_TTL + Duration::from_secs(1))
+                .unwrap(),
+            last_net_profit_pct: 1.0,
+        };
+        let stale_token_feedback = CandidateLogState {
+            last_seen: now
+                .checked_sub(DIRECT_TOKEN_FEEDBACK_TTL + Duration::from_secs(1))
+                .unwrap(),
+            last_net_profit_pct: 1.0,
+        };
+        let stale_pair_feedback = CandidateLogState {
+            last_seen: now
+                .checked_sub(DIRECT_PAIR_FEEDBACK_TTL + Duration::from_secs(1))
+                .unwrap(),
+            last_net_profit_pct: 1.0,
+        };
+        let fresh_program_pair_feedback = ProgramPairPathFeedbackState {
+            last_seen: now,
+            evaluation_count: 1,
+            exact_successful_quote_count: 1,
+            exact_missing_quote_count: 0,
+            near_profit_count: 0,
+            profitable_selection_count: 1,
+            last_gate_profit_pct: 0.5,
+            best_gate_profit_pct: 0.5,
+            last_trade_size_usdc: 1.0,
+        };
+        let stale_program_pair_feedback = ProgramPairPathFeedbackState {
+            last_seen: now
+                .checked_sub(PROGRAM_PAIR_PATH_FEEDBACK_TTL + Duration::from_secs(1))
+                .unwrap(),
+            evaluation_count: 1,
+            exact_successful_quote_count: 0,
+            exact_missing_quote_count: 1,
+            near_profit_count: 1,
+            profitable_selection_count: 0,
+            last_gate_profit_pct: -0.5,
+            best_gate_profit_pct: -0.5,
+            last_trade_size_usdc: 1.0,
+        };
+        let mut stats = RuntimeStats::default();
+        stats
+            .candidate_logs
+            .insert("fresh".to_string(), fresh.clone());
+        stats
+            .candidate_logs
+            .insert("stale".to_string(), stale_candidate);
+        stats
+            .execution_attempts
+            .insert("fresh".to_string(), fresh.clone());
+        stats
+            .execution_attempts
+            .insert("stale".to_string(), stale_attempt);
+        stats
+            .direct_token_feedback
+            .insert("fresh".to_string(), fresh.clone());
+        stats
+            .direct_token_feedback
+            .insert("stale".to_string(), stale_token_feedback);
+        stats
+            .direct_pair_feedback
+            .insert("fresh".to_string(), fresh);
+        stats
+            .direct_pair_feedback
+            .insert("stale".to_string(), stale_pair_feedback);
+        stats
+            .program_pair_path_feedback
+            .insert("fresh".to_string(), fresh_program_pair_feedback);
+        stats
+            .program_pair_path_feedback
+            .insert("stale".to_string(), stale_program_pair_feedback);
+
+        prune_runtime_state(&mut stats, now);
+
+        assert_eq!(stats.candidate_logs.len(), 1);
+        assert!(stats.candidate_logs.contains_key("fresh"));
+        assert_eq!(stats.execution_attempts.len(), 1);
+        assert!(stats.execution_attempts.contains_key("fresh"));
+        assert_eq!(stats.direct_token_feedback.len(), 1);
+        assert!(stats.direct_token_feedback.contains_key("fresh"));
+        assert_eq!(stats.direct_pair_feedback.len(), 1);
+        assert!(stats.direct_pair_feedback.contains_key("fresh"));
+        assert_eq!(stats.program_pair_path_feedback.len(), 1);
+        assert!(stats.program_pair_path_feedback.contains_key("fresh"));
+    }
+}
+
+fn default_decimals(mint: &str) -> i32 {
+    match mint {
+        "So11111111111111111111111111111111111111112" => 9,
+        _ => 6,
+    }
+}
+
+fn cp_pool_from_parts(
+    venue: strategy::quote::Venue,
+    base_mint: &str,
+    quote_mint: &str,
+    base_reserve: u64,
+    quote_reserve: u64,
+    usdc_mint: &str,
+    sol_mint: &str,
+    fee_bps: f64,
+) -> Option<strategy::quote::ConstantProductPool> {
+    if base_reserve == 0 || quote_reserve == 0 {
+        return None;
+    }
+
+    if base_mint == usdc_mint || base_mint == sol_mint {
+        Some(strategy::quote::ConstantProductPool {
+            venue,
+            token_mint: quote_mint.to_string(),
+            quote_mint: base_mint.to_string(),
+            token_reserve: quote_reserve,
+            quote_reserve: base_reserve,
+            fee_bps,
+        })
+    } else if quote_mint == usdc_mint || quote_mint == sol_mint {
+        Some(strategy::quote::ConstantProductPool {
+            venue,
+            token_mint: base_mint.to_string(),
+            quote_mint: quote_mint.to_string(),
+            token_reserve: base_reserve,
+            quote_reserve,
+            fee_bps,
+        })
+    } else {
+        None
+    }
+}

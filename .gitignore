@@ -1,0 +1,7 @@
+/target
+programs/*/target
+.env
+!.env.example
+*-keypair.json
+dynamic_market_addresses.txt
+dynamic_market_addresses.state.json

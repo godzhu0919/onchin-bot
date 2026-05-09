@@ -1,0 +1,322 @@
+# Solana 套利机器人配置文件
+
+[grpc]
+endpoint = "127.0.0.1:10000"
+# token = "your_token_here"  # 可选
+
+[rpc]
+# 启动时用于 getMultipleAccounts 拉初始账户快照。
+http_url = "http://127.0.0.1:8899"
+
+[subscription]
+# 监听通道容量。单条更新会携带账户数据，过大很容易直接把内存顶爆。
+channel_capacity = 4096
+
+# gRPC 断线/空闲后的重连退避。
+reconnect_initial_ms = 500
+reconnect_max_ms = 30000
+
+# 超过该时间没有任何 Yellowstone 消息就主动重连。
+stream_idle_timeout_secs = 60
+
+[execution]
+enabled = true
+dry_run_only = false
+max_slippage_bps = 100
+send_transport = "jito"
+jito_tip_lamports = 0
+live_send_min_profit_pct = 0.0
+require_pre_send_simulation = false
+two_hop_profit_guard_min_usdc = 0.0
+program_pair_min_profit_lamports = 0
+direct_send_extra_edge_pct = 0.0
+direct_send_extra_edge_usdc = 0.0
+direct_send_min_gate_pct = 0.0
+direct_send_max_state_age_ms = 1500
+send_on_positive_spot = true
+skip_monitor_only_routes_when_live = true
+execution_min_interval_ms = 500
+compute_unit_limit = 250000
+compute_unit_limit_margin_bps = 0
+compute_unit_limit_min_buffer = 0
+compute_unit_price_micro_lamports = 0
+fast_path_direct_send = true
+disable_direct_send_skip = true
+disable_local_profit_checks = true
+disable_fast_path_spot_profit_filter = true
+enable_meteora_clmm_live_send = true
+enable_meteora_meteora_live_send = false
+address_lookup_tables = [
+    "EbMDbHsAs9MLgZMN9qyxdHSzvFvM1eBadyNMbc5D1zGH",
+    "2qHaPZVbnAMepsfrCzr3dPzq9KJ8t1AW7GV8YjMcQYwc",
+]
+two_hop_executor_program_id = "3NerRj5cGM4n7Jx9bTzpF5nc4LHUZZo3NoqGN2eTqSBj"
+
+[strategy]
+# 最小利润阈值 (百分比) - 只在本地预估收益大于 0 时继续进入 exact/send 流程。
+min_profit_threshold = 0.0
+
+# SOL/USDC 价格 (如果没有预言机)
+sol_usdc_price = 85.44
+
+# 精确预检里使用的单腿 gas 估算（SOL）；两腿交易会乘 2。
+preflight_gas_cost_sol = 0.00005
+
+# PumpSwap->Raydium CLMM 精确预检时，对第一腿买到的 token 数量使用的保守缓冲。
+pumpswap_buy_output_buffer_bps = 50.0
+
+# Raydium CLMM 输出在精确预检时使用的保守缓冲。
+raydium_clmm_output_buffer_bps = 50.0
+
+# PumpSwap->Meteora 真实成交风控
+pumpswap_meteora_small_pool_liquidity_usdc = 2500.0
+pumpswap_meteora_max_trade_depth_bps = 1000000.0
+pumpswap_meteora_buy_slippage_bps = 125.0
+pumpswap_meteora_buy_slippage_bps_small_pool = 275.0
+pumpswap_meteora_sell_slippage_bps = 90.0
+pumpswap_meteora_sell_slippage_bps_small_pool = 225.0
+pumpswap_meteora_max_touched_bin_arrays = 64
+pumpswap_meteora_max_meteora_fee_bps = 180.0
+pumpswap_meteora_failure_buffer_usdc = 0.03
+pumpswap_meteora_wrap_unwrap_cost_sol = 0.0
+pumpswap_meteora_ata_cost_sol = 0.0
+pumpswap_fee_lp_share_bps = 8000
+pumpswap_fee_protocol_share_bps = 1250
+pumpswap_fee_coin_creator_share_bps = 750
+pumpswap_meteora_class_a_min_profit_usdc = 0.08
+pumpswap_meteora_class_b_min_profit_usdc = 0.03
+pumpswap_meteora_class_a_min_confidence = 0.72
+pumpswap_meteora_class_b_min_confidence = 0.45
+pumpswap_meteora_min_hit_rate = 0.25
+pumpswap_meteora_min_hit_rate_samples = 1000000
+
+# 交易金额配置 (USDC)
+# 寻路阶段先用小额确认是不是滑点把利润吃掉；看到稳定 exact 正收益后再放大。
+trade_sizes = [1.0, 2.0, 3.0, 5.0, 8.0]
+
+# program-pair 粗筛专用，单位 SOL。你现在只套 WSOL，这里才是当前
+# PumpSwap/Meteora/Raydium 两程序路径的粗筛金额。
+program_pair_trade_sizes_sol = [0.005, 0.01, 0.02]
+program_pair_best_size_search_samples = 4
+program_pair_max_send_candidates_per_scan = 1
+program_pair_send_min_gross_profit_pct = 0.0
+
+# 每轮 exact direct 扫描最多处理多少个 token。
+# 放开 PumpSwap/Meteora/Raydium 路径后，一轮允许多扫几个 routeable token。
+max_direct_tokens_per_scan = 8
+
+# 同一个 token 最多保留多少个 Meteora 池进入 direct scan。
+max_meteora_pools_per_token_for_direct_scan = 3
+
+[discovery]
+# 静态市场宇宙：统一在本文件维护池子地址。
+# 程序会通过 RPC 自动识别每个地址属于 PumpSwap、Raydium、Meteora 或 Whirlpool。
+token_selection_enabled = false
+token_selection_min_score = 45.0
+token_selection_min_total_liquidity_usdc = 3000.0
+token_selection_log_top_n = 12
+
+max_pairs_per_token = 1
+min_liquidity_usdc = 500.0
+min_volume_h24 = 1000.0
+dynamic_market_addresses_path = "dynamic_market_addresses.txt"
+
+# 手工市场地址。要加新币，就把这个币在不同 DEX 上的池子地址加到这里。
+manual_market_addresses = [
+    # ANDV
+    "jHmCrrLMPtE1qvYpwe1yjtjzM2k44EorPDUcJ6j8pWC",
+    "5fubAFJUpqASTuMtmDdfRq5SYVZZvMqyMF4Ey8FaR3Eq",
+
+    # BULL
+    "HNGjLLZkWx2mNwhWdKFYcMowz8FTh2bXxdpJ1vBVkjNB",
+    "BrdkY6XrdWLMMwTUdXTfebtK3fZNUT8QudohNHhzCofK",
+
+    # HANTA SOL
+    "4qryQZJ1UK8ekpSvjTr4rMjdBQsUFTU8XeD6tw73Xb8z",
+    "DQiGxibDKXMSL8uTjMzVE5HK4w1CcUe2tLJvEVGVw8N2",
+
+    # ID 小额
+    "73nMgXPbhuKs7yhk7Spw66bAoL7NBB9GMAPLwn2NHVJz",
+    "9aHEJF213SwGULoEywtc1XWnWRmDGVZDG4Jk7r9ic8FT",
+
+    # mask
+    "eKShgykXZxNrJ9yRQRP8RhcLRs7TeM2LpjPdPN8pE1e",
+    "2CLjUeA8eDkEWLmU1dJte3v2FXfYipNvNFwnx29fK5qX",
+
+    # IDB
+    "9d2D6o6GQsmAA3Yta5XxryMceoM4RW5qcDMvs72FB4Gr",
+    "SzueYgrhqMa8FPa7o9jK3bz5xg8Eyb1HTH1ZjLpWjvi",
+
+    # SELLOR
+    "HDui6KTfJ3FTkfTie3VhwPDPDaFmZNkQwXoUYcHWd2DW",
+    "3eFCedF1G9Xu2SSrgpgCTK68sV2ycfTAmMbBC4eM3Bi3",
+
+    # HANTA 备用 Meteora 池，PumpSwap 已在上面的 HANTA SOL
+    "2rQNksYaAdqcZTynnUvTih5xkQKa3Dvgz4TSNc9GoPZq",
+
+    # SH
+    "xLyaTohEaiqbPtySXejZC1M4Z4WSHHwPD39LvuFaoa4",
+    "91ijFnpBoH1saKn6xZXbyUXzDZPfshtQkKL2aYsbepkB",
+
+    # UFO，JD6 近期跑过，当前 PumpSwap 和多个 Meteora SOL 池都有量
+    "6E5j2ezf4qXish7kdvvYQXaJaEZUhsQjfsaEdvKJu9TR",
+    "61DkLcdzaoUjyjKQSo84agMBdsB8TzK7CTmVuca88zQs",
+    "Ebv3tCDU3mS7emhNByUxuZsih1LL7TXNWiWQdfpN7LJs",
+    "FQkufLwYahGWXafcHcUM42tD1spjdQbhz6g15ZNHkL3C",
+
+    # Aliens，优先加入 SOL 报价池；USDC 报价 Meteora 池暂不加
+    "7nVP4qykvMpEuhobyrzCn1TQiz7K8PMK5UXQeeBrZyh",
+    "Cy4ZW25mnXpwD1XUUio8V6bPjpVBDCXJ58fkcZaAKuoS",
+    "9XFEGSeugDxQ6L31DLH6VfTMUezSkENJS3sBAzFnijkm",
+
+    # BURNIE，高流动性 SOL 报价池，先只放主池
+    "5tYFviFWQRKV9BJSTHGitbdqEYC1BGUgRUDnSADUXqJP",
+    "6Q3k9uLd3kbEPZV37P4uKjXUHrhZPEK85P62QTNAj49e",
+    "EgGACLzNtvTWfjWopkMbbcRsUPAaSCcgPjbNqUCcLUCJ",
+
+    # HANTA 补充几个 SOL 报价 Meteora 池
+    "4d4XPuZ5392FMYGMoPfTdoSDXfBV9nByAcVbbT7ZQ4Ho",
+    "3myCH5uoBixL3Cb24Rr5mPPRPsgBu5uZ7ufQvbndQJ5m",
+    "J7zt7HuLwmiU399ZNgE1TeP9YpL5Wm2gLs3auzLspc5k",
+    "CyQ6ydGRnSPK1cG5q5nKdekDhkw4UaBdr36XHUPWitx8",
+
+    # SYRA，小池子，只用于观察
+    "Ha56U92pMwNh9ksQf7wWhi2Xh9aqDeDQSAZo6m6Jdbqf",
+    "4yJEy79G8sSQghe3frG7M4tCFKSSxZaDgqhUdNSqA1qf",
+  ]
+
+# 这些 token 不进入 exact direct 主扫描宇宙。
+# meme-only: 排除稳定币目标，避免继续把精力浪费在 USD1/USDT 这类低利润路径上。
+excluded_target_token_mints = [
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+    "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",
+    "2pFFgMtw7GkE6Kr6Xpg81mqDvEihhoafg64HdheKpump",
+]
+
+# 临时拉黑已确认不适合套利、会持续打出 6037 的具体池子。
+excluded_market_addresses = [
+    "bE136FFSUny3MTiKhKm3TfkjWcjE745gFenhzq7tfdq",
+]
+
+require_routeable_pairs = true
+routeable_dexes = ["pumpswap", "meteora", "raydium", "whirlpool"]
+min_routeable_dex_count = 2
+
+# 你只需要改这里的 program id。新的执行前逻辑会基于启用的 program 自动
+# 组合任意两个 program，统一寻找有利润的 token 和池子。
+[[programs]]
+kind = "pumpfun"
+label = "Pump.fun"
+program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+enabled = true
+
+[[programs]]
+kind = "pumpswap"
+label = "PumpSwap"
+program_id = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+enabled = true
+
+[[programs]]
+kind = "meteora_dlmm"
+label = "Meteora DLMM"
+program_id = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+enabled = true
+
+[[programs]]
+kind = "raydium_clmm"
+label = "Raydium Concentrated Liquidity"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+enabled = true
+
+[[programs]]
+kind = "raydium_amm_v4"
+label = "Raydium Liquidity Pool V4"
+program_id = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+enabled = true
+
+[[programs]]
+kind = "raydium_cpmm"
+label = "Raydium CPMM"
+program_id = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+enabled = true
+
+[[programs]]
+kind = "whirlpool"
+label = "Whirlpools Program"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+enabled = true
+
+[[programs]]
+kind = "humendfi"
+label = "HumendiFi"
+program_id = "9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp"
+enabled = false
+discovery_dex_ids = ["humendfi"]
+
+[[programs]]
+kind = "pancakeswap"
+label = "PancakeSwap"
+program_id = ""
+enabled = false
+discovery_dex_ids = ["pancakeswap"]
+
+[tokens]
+# USDC mint 地址
+usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+# Wrapped SOL mint 地址
+sol_mint = "So11111111111111111111111111111111111111112"
+
+# Pump.fun 账户配置
+[[pump_accounts]]
+address = "DVFHCm9z7o9tC7SVzKyK5orAjjJL1auP8GtYGkT1maUW"
+name = "EASTER Token Bonding Curve"
+enabled = true
+
+# 添加更多 Pump 账户
+# [[pump_accounts]]
+# address = "9Kt1KGYQLux6a5tg9ZBF16H28wLPygNu4hUmLugYvk2x"
+# name = "Another Token"
+# enabled = true
+
+# Meteora DLMM 池子配置
+[[meteora_pools]]
+address = "4ArWkekbQ2HHmZUiP613eqJhJ8Xqc6tnrSx9UjT5nxVN"
+name = "ALLAH/WSOL DLMM"
+enabled = true
+
+# 添加更多 Meteora 池子
+# [[meteora_pools]]
+# address = "YOUR_METEORA_ADDRESS_HERE"
+# name = "Another Pool"
+# enabled = true
+
+# Raydium AMM V4 池子配置
+[[raydium_pools]]
+address = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+name = "SOL/USDC (Raydium V4)"
+enabled = true
+
+# 添加更多 Raydium 池子
+# [[raydium_pools]]
+# address = "7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX"
+# name = "SOL/USDT (Raydium V4)"
+# enabled = true
+
+# Orca Whirlpool 池子配置
+# [[whirlpool_pools]]
+# address = "YOUR_WHIRLPOOL_ADDRESS_HERE"
+# name = "TOKEN/SOL (Orca Whirlpool)"
+# enabled = true
+
+[logging]
+# 日志级别: trace, debug, info, warn, error
+level = "info"
+
+# 每 N 次更新显示心跳
+heartbeat_interval = 50
+
+# 没有新的订阅账户更新时，每 N 秒输出一次运行状态；设为 0 可关闭。
+idle_status_interval_secs = 15
