@@ -12,7 +12,11 @@ use solana_sdk::{
     signer::Signer,
 };
 use solana_system_interface::instruction::transfer;
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 use tokio::time::{sleep, Duration};
 
 const DEFAULT_JITO_MIN_TIP_LAMPORTS: u64 = 1_000;
@@ -20,6 +24,7 @@ const DEFAULT_JITO_MIN_TIP_LAMPORTS: u64 = 1_000;
 pub struct ArbitrageExecutor {
     config: ExecutorConfig,
     jito_client: Option<JitoClient>,
+    lookup_table_capacity_exhausted: AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +66,18 @@ fn minimum_jito_tip_lamports() -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_JITO_MIN_TIP_LAMPORTS)
+}
+
+fn log_verbose_enabled() -> bool {
+    std::env::var("LOG_VERBOSE")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -405,9 +422,30 @@ impl ArbitrageExecutor {
         } else {
             None
         };
+
+        if !config.address_lookup_tables.is_empty() {
+            let started = Instant::now();
+            match transaction::fetch_address_lookup_table_accounts_blocking(
+                &config.rpc_url,
+                &config.address_lookup_tables,
+            ) {
+                Ok(tables) => tracing::info!(
+                    "地址表缓存预热完成：数量={}，耗时={}毫秒",
+                    tables.len(),
+                    started.elapsed().as_millis()
+                ),
+                Err(error) => tracing::warn!(
+                    "地址表缓存预热失败，首次大交易可能变慢：数量={}，原因={}",
+                    config.address_lookup_tables.len(),
+                    error
+                ),
+            }
+        }
+
         Ok(Self {
             config,
             jito_client,
+            lookup_table_capacity_exhausted: AtomicBool::new(false),
         })
     }
 
@@ -417,6 +455,10 @@ impl ArbitrageExecutor {
 
     pub fn live_send_enabled(&self) -> bool {
         self.config.enabled && !self.config.dry_run_only
+    }
+
+    pub fn has_jito_bundle_transport(&self) -> bool {
+        self.jito_client.is_some()
     }
 
     pub fn live_send_min_profit_pct(&self) -> f64 {
@@ -443,6 +485,12 @@ impl ArbitrageExecutor {
         if self.config.address_lookup_tables.is_empty() {
             return Ok(0);
         }
+        if self
+            .lookup_table_capacity_exhausted
+            .load(Ordering::Relaxed)
+        {
+            return Ok(0);
+        }
 
         let lookup_tables = transaction::fetch_address_lookup_table_accounts_blocking(
             &self.config.rpc_url,
@@ -454,11 +502,14 @@ impl ArbitrageExecutor {
             if remaining_missing.is_empty() {
                 return Ok(0);
             }
-            anyhow::bail!(
-                "地址表容量已满：已配置={}，还缺={}，请再配置一个 ADDRESS_LOOKUP_TABLES",
+            self.lookup_table_capacity_exhausted
+                .store(true, Ordering::Relaxed);
+            tracing::warn!(
+                "地址表容量已满：已配置={}，还缺={}，本进程后续不再继续自动补充",
                 lookup_tables.len(),
                 remaining_missing.len()
             );
+            return Ok(0);
         }
 
         let authority = self.config.keypair.pubkey();
@@ -507,8 +558,10 @@ impl ArbitrageExecutor {
         }
 
         if !remaining_missing.is_empty() {
+            self.lookup_table_capacity_exhausted
+                .store(true, Ordering::Relaxed);
             tracing::warn!(
-                "地址表容量不足：表数={}，已新增={}，还缺={}，请再配置一个地址表",
+                "地址表容量不足：表数={}，已新增={}，还缺={}，本进程后续不再继续自动补充",
                 lookup_tables.len(),
                 added_total,
                 remaining_missing.len()
@@ -562,7 +615,7 @@ impl ArbitrageExecutor {
         let disable_local_profit_checks = std::env::var("DISABLE_LOCAL_PROFIT_CHECKS")
             .ok()
             .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(false);
+            .unwrap_or(true);
         if !self.config.enabled {
             return SendReadiness::Blocked("ENABLE_EXECUTION=false".to_string());
         }
@@ -584,7 +637,7 @@ impl ArbitrageExecutor {
             ));
         }
 
-        SendReadiness::Blocked("Pump/Raydium 执行账户和模拟流程还不完整".to_string())
+        SendReadiness::Blocked("Pump/Raydium account list 和 simulation 流程还不完整".to_string())
     }
 
     pub async fn require_simulation_passed(
@@ -807,12 +860,7 @@ impl ArbitrageExecutor {
         Ok((transaction_base64, transaction_signature))
     }
 
-    fn build_standalone_jito_tip_transaction(
-        &self,
-        recent_blockhash: Hash,
-        context_label: &str,
-        tip_lamports: u64,
-    ) -> Result<Option<(String, String)>> {
+    fn build_jito_tip_instruction(&self, tip_lamports: u64) -> Result<Option<(Instruction, u64)>> {
         let tip_lamports = if tip_lamports == 0 {
             minimum_jito_tip_lamports()
         } else {
@@ -824,20 +872,7 @@ impl ArbitrageExecutor {
 
         let tip_account = JitoClient::random_tip_account()?;
         let tip_instruction = transfer(&self.config.keypair.pubkey(), &tip_account, tip_lamports);
-        let transaction_base64 = transaction::build_and_sign_plain_transaction(
-            vec![tip_instruction],
-            &self.config.keypair,
-            recent_blockhash,
-        )?;
-        let transaction_signature =
-            transaction::extract_transaction_signature(&transaction_base64)?;
-        tracing::debug!(
-            "已添加 Jito 小费交易：场景={}，lamports={}，签名={}",
-            context_label,
-            tip_lamports,
-            transaction_signature
-        );
-        Ok(Some((transaction_base64, transaction_signature)))
+        Ok(Some((tip_instruction, tip_lamports)))
     }
 
     pub async fn send_instruction_bundle_with_simulated_units(
@@ -859,16 +894,29 @@ impl ArbitrageExecutor {
         simulated_units_consumed: Vec<Option<u64>>,
         jito_tip_lamports: u64,
     ) -> Result<String> {
+        self.send_instruction_bundle_with_simulated_units_and_tip_context(
+            instruction_groups,
+            simulated_units_consumed,
+            jito_tip_lamports,
+            None,
+        )
+        .await
+    }
+
+    pub async fn send_instruction_bundle_with_simulated_units_and_tip_context(
+        &self,
+        instruction_groups: Vec<Vec<Instruction>>,
+        simulated_units_consumed: Vec<Option<u64>>,
+        jito_tip_lamports: u64,
+        log_context: Option<&str>,
+    ) -> Result<String> {
         if instruction_groups.is_empty() {
             anyhow::bail!("cannot send an empty instruction bundle");
         }
-        let tip_transaction_count = (jito_tip_lamports > 0) as usize;
-        let total_transaction_count = instruction_groups.len() + tip_transaction_count;
-        if total_transaction_count > 5 {
+        if instruction_groups.len() > 5 {
             anyhow::bail!(
-                "Jito bundle supports at most 5 transactions; got {} instruction groups plus {} tip transaction",
-                instruction_groups.len(),
-                tip_transaction_count
+                "Jito bundle supports at most 5 transactions; got {} instruction groups",
+                instruction_groups.len()
             );
         }
         if !self.live_send_enabled() {
@@ -878,19 +926,45 @@ impl ArbitrageExecutor {
             anyhow::bail!("multi-transaction setup split requires Jito bundle transport");
         };
 
+        let total_started = Instant::now();
+        let blockhash_started = Instant::now();
         let recent_blockhash = transaction::get_recent_blockhash(&self.config.rpc_url).await?;
+        let blockhash_elapsed_ms = blockhash_started.elapsed().as_millis();
         let last_group_index = instruction_groups.len() - 1;
-        let mut transaction_base64s = Vec::with_capacity(total_transaction_count);
-        let mut transaction_signatures = Vec::with_capacity(total_transaction_count);
+        let tip_instruction = self.build_jito_tip_instruction(jito_tip_lamports)?;
+        let log_context = log_context.unwrap_or("-");
+        let mut transaction_base64s = Vec::with_capacity(instruction_groups.len());
+        let mut transaction_signatures = Vec::with_capacity(instruction_groups.len());
 
+        let build_started = Instant::now();
         for (index, instructions) in instruction_groups.into_iter().enumerate() {
             if instructions.is_empty() {
                 anyhow::bail!("cannot send empty instruction group {}", index);
             }
+            let mut instructions = instructions;
+            if index == last_group_index {
+                if let Some((tip_instruction, tip_lamports)) = &tip_instruction {
+                    instructions.push(tip_instruction.clone());
+                    tracing::debug!(
+                        "Jito 小费已并入最后一笔交易：场景=Jito bundle split send，上下文={}，lamports={}",
+                        log_context,
+                        tip_lamports
+                    );
+                }
+            }
             let units_hint = simulated_units_consumed.get(index).copied().flatten();
             let allow_estimation_failure =
                 units_hint.is_none() && (!self.config.require_pre_send_simulation || index > 0);
-            let context_label = format!("Jito bundle group {}/{}", index + 1, last_group_index + 1);
+            let context_label = if log_context == "-" {
+                format!("Jito bundle group {}/{}", index + 1, last_group_index + 1)
+            } else {
+                format!(
+                    "Jito bundle group {}/{} {}",
+                    index + 1,
+                    last_group_index + 1,
+                    log_context
+                )
+            };
             let (transaction_base64, transaction_signature) = self
                 .build_signed_transaction_for_send(
                     instructions,
@@ -904,27 +978,35 @@ impl ArbitrageExecutor {
             transaction_base64s.push(transaction_base64);
             transaction_signatures.push(transaction_signature);
         }
+        let build_elapsed_ms = build_started.elapsed().as_millis();
 
         let primary_signature = transaction_signatures
             .last()
             .cloned()
             .context("Jito bundle missing primary signature")?;
-        if let Some((tip_base64, tip_signature)) = self.build_standalone_jito_tip_transaction(
-            recent_blockhash,
-            "Jito bundle split send",
-            jito_tip_lamports,
-        )? {
-            transaction_base64s.push(tip_base64);
-            transaction_signatures.push(tip_signature);
-        }
 
+        let submitted_base64 = transaction_base64s.join(",");
+        let submit_started = Instant::now();
         let bundle_id = jito_client.send_bundle(transaction_base64s).await?;
+        let submit_elapsed_ms = submit_started.elapsed().as_millis();
         tracing::debug!(
             "Jito 拆分包已提交：bundle={}，主交易={}",
             bundle_id,
             primary_signature
         );
-        Ok(bundle_id)
+        for signature in &transaction_signatures {
+            self.spawn_async_confirmation(signature.clone(), "Jito bundle split");
+        }
+        tracing::info!(
+            "发送耗时明细：方式=Jito bundle split send，上下文={}，blockhash={}毫秒，构建签名={}毫秒，提交={}毫秒，总计={}毫秒，交易base64s={}",
+            log_context,
+            blockhash_elapsed_ms,
+            build_elapsed_ms,
+            submit_elapsed_ms,
+            total_started.elapsed().as_millis(),
+            submitted_base64
+        );
+        Ok(format!("{bundle_id}，base64={submitted_base64}"))
     }
 
     pub async fn send_instructions_with_simulated_units(
@@ -946,6 +1028,22 @@ impl ArbitrageExecutor {
         simulated_units_consumed: Option<u64>,
         jito_tip_lamports: u64,
     ) -> Result<String> {
+        self.send_instructions_with_simulated_units_and_tip_context(
+            instructions,
+            simulated_units_consumed,
+            jito_tip_lamports,
+            None,
+        )
+        .await
+    }
+
+    pub async fn send_instructions_with_simulated_units_and_tip_context(
+        &self,
+        instructions: Vec<Instruction>,
+        simulated_units_consumed: Option<u64>,
+        jito_tip_lamports: u64,
+        log_context: Option<&str>,
+    ) -> Result<String> {
         if instructions.is_empty() {
             anyhow::bail!("cannot send an empty instruction list");
         }
@@ -953,11 +1051,35 @@ impl ArbitrageExecutor {
             anyhow::bail!("live sending disabled by executor config");
         }
 
+        let total_started = Instant::now();
+        let blockhash_started = Instant::now();
         let recent_blockhash = transaction::get_recent_blockhash(&self.config.rpc_url).await?;
+        let blockhash_elapsed_ms = blockhash_started.elapsed().as_millis();
         let transport_label = if self.jito_client.is_some() {
             "Jito bundle send"
         } else {
             "RPC send"
+        };
+        let log_context = log_context.unwrap_or("-");
+        let mut instructions = instructions;
+        let tip_instruction = if self.jito_client.is_some() {
+            self.build_jito_tip_instruction(jito_tip_lamports)?
+        } else {
+            None
+        };
+        if let Some((tip_instruction, tip_lamports)) = &tip_instruction {
+            instructions.push(tip_instruction.clone());
+            tracing::debug!(
+                "Jito 小费已并入主交易：场景={}，上下文={}，lamports={}",
+                transport_label,
+                log_context,
+                tip_lamports
+            );
+        }
+        let context_label = if log_context == "-" {
+            transport_label.to_string()
+        } else {
+            format!("{} {}", transport_label, log_context)
         };
         let (transaction_base64, transaction_signature) = self
             .build_signed_transaction_for_send(
@@ -965,34 +1087,52 @@ impl ArbitrageExecutor {
                 recent_blockhash,
                 simulated_units_consumed,
                 !self.config.require_pre_send_simulation,
-                transport_label,
+                &context_label,
                 transport_label,
             )
             .await?;
+        let build_elapsed_ms = total_started
+            .elapsed()
+            .as_millis()
+            .saturating_sub(blockhash_elapsed_ms);
         if let Some(jito_client) = &self.jito_client {
             tracing::debug!("Jito 交易已签名：{}", transaction_signature);
-            let mut transaction_base64s = vec![transaction_base64];
-            let mut transaction_signatures = vec![transaction_signature.clone()];
-            if let Some((tip_base64, tip_signature)) = self.build_standalone_jito_tip_transaction(
-                recent_blockhash,
-                transport_label,
-                jito_tip_lamports,
-            )? {
-                transaction_base64s.push(tip_base64);
-                transaction_signatures.push(tip_signature);
-            }
-            let bundle_id = jito_client.send_bundle(transaction_base64s).await?;
+            let submitted_base64 = transaction_base64.clone();
+            let submit_started = Instant::now();
+            let bundle_id = jito_client.send_bundle(vec![transaction_base64]).await?;
+            let submit_elapsed_ms = submit_started.elapsed().as_millis();
             tracing::debug!(
                 "Jito 交易包已提交：bundle={}，交易={}",
                 bundle_id,
                 transaction_signature
             );
-            Ok(bundle_id)
+            self.spawn_async_confirmation(transaction_signature.clone(), "Jito bundle");
+            tracing::info!(
+                "发送耗时明细：方式=Jito bundle send，上下文={}，blockhash={}毫秒，构建签名={}毫秒，提交={}毫秒，总计={}毫秒，交易base64={}",
+                log_context,
+                blockhash_elapsed_ms,
+                build_elapsed_ms,
+                submit_elapsed_ms,
+                total_started.elapsed().as_millis(),
+                submitted_base64
+            );
+            Ok(format!("{bundle_id}，base64={submitted_base64}"))
         } else {
             tracing::debug!("RPC 交易已签名：{}", transaction_signature);
+            let submit_started = Instant::now();
             let signature =
                 transaction::send_transaction(&self.config.rpc_url, &transaction_base64).await?;
+            let submit_elapsed_ms = submit_started.elapsed().as_millis();
             tracing::debug!("交易已提交：{}", signature);
+            tracing::info!(
+                "发送耗时明细：方式=RPC send，上下文={}，blockhash={}毫秒，构建签名={}毫秒，提交={}毫秒，总计={}毫秒，交易={}",
+                log_context,
+                blockhash_elapsed_ms,
+                build_elapsed_ms,
+                submit_elapsed_ms,
+                total_started.elapsed().as_millis(),
+                transaction_signature
+            );
             self.confirm_submitted_signature(signature, "RPC transaction")
                 .await
         }
@@ -1064,12 +1204,14 @@ impl ArbitrageExecutor {
                     );
                 }
                 Err(error) => {
-                    tracing::warn!(
+                    let message = format!(
                         "交易链上执行失败：方式={}，签名={}，原因={}",
-                        transport_label,
-                        signature,
-                        error
+                        transport_label, signature, error
                     );
+                    if !log_verbose_enabled() {
+                        println!("{message}");
+                    }
+                    tracing::warn!("{message}");
                 }
             }
         });

@@ -1302,9 +1302,19 @@ fn build_raydium_swap_v2_account_metas(accounts: &[Pubkey; 13]) -> Vec<AccountMe
 }
 
 fn build_meteora_swap_v2_account_metas(accounts: &[Pubkey; 16]) -> Vec<AccountMeta> {
+    let bitmap_extension_meta = if accounts[1] == accounts[15] {
+        AccountMeta::new_readonly(accounts[1], false)
+    } else {
+        AccountMeta::new(accounts[1], false)
+    };
+    let host_fee_meta = if accounts[9] == accounts[15] {
+        AccountMeta::new_readonly(accounts[9], false)
+    } else {
+        AccountMeta::new(accounts[9], false)
+    };
     vec![
         AccountMeta::new(accounts[0], false),
-        AccountMeta::new_readonly(accounts[1], false),
+        bitmap_extension_meta,
         AccountMeta::new(accounts[2], false),
         AccountMeta::new(accounts[3], false),
         AccountMeta::new(accounts[4], false),
@@ -1312,7 +1322,7 @@ fn build_meteora_swap_v2_account_metas(accounts: &[Pubkey; 16]) -> Vec<AccountMe
         AccountMeta::new_readonly(accounts[6], false),
         AccountMeta::new_readonly(accounts[7], false),
         AccountMeta::new(accounts[8], false),
-        AccountMeta::new(accounts[9], false),
+        host_fee_meta,
         AccountMeta::new_readonly(accounts[10], true),
         AccountMeta::new_readonly(accounts[11], false),
         AccountMeta::new_readonly(accounts[12], false),
@@ -1676,9 +1686,21 @@ mod tests {
             METEORA_DLMM_SWAP_V2_ACCOUNTS.len() + remaining.len()
         );
         assert!(ix.accounts[0].is_writable);
+        assert!(ix.accounts[1].is_writable);
         assert!(ix.accounts[9].is_writable);
         assert!(ix.accounts[10].is_signer);
         assert!(ix.accounts.last().unwrap().is_writable);
+    }
+
+    #[test]
+    fn builds_meteora_dlmm_swap_v2_with_optional_placeholders_readonly() {
+        let mut accounts = keys::<16>();
+        accounts[1] = accounts[15];
+        accounts[9] = accounts[15];
+        let ix = build_meteora_dlmm_swap_v2(&accounts, &[], 1234, 567).unwrap();
+
+        assert!(!ix.accounts[1].is_writable);
+        assert!(!ix.accounts[9].is_writable);
     }
 
     #[test]

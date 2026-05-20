@@ -39,6 +39,12 @@ struct RpcAccount {
     data: (String, String),
 }
 
+#[derive(Debug, Clone)]
+pub struct AccountOwnerData {
+    pub owner: String,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Deserialize)]
 struct BalanceResponse {
     result: Option<BalanceResult>,
@@ -223,6 +229,72 @@ pub async fn get_multiple_accounts_owners(
                 continue;
             };
             out.insert(account.clone(), value.owner);
+        }
+    }
+
+    Ok(out)
+}
+
+pub async fn get_multiple_accounts_owner_data(
+    rpc_url: &str,
+    accounts: &[String],
+) -> Result<HashMap<String, AccountOwnerData>> {
+    let client = reqwest::Client::new();
+    let mut out = HashMap::new();
+
+    for chunk in accounts.chunks(100) {
+        let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        let request = RpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getMultipleAccounts",
+            params: (
+                &refs,
+                RpcConfig {
+                    encoding: "base64",
+                    commitment: "processed",
+                },
+            ),
+        };
+
+        let response: RpcResponse = post_rpc_json_with_retries(
+            &client,
+            rpc_url,
+            &request,
+            &format!("request getMultipleAccounts chunk size {}", refs.len()),
+            "getMultipleAccounts HTTP status",
+            "parse getMultipleAccounts response",
+        )
+        .await?;
+
+        if let Some(error) = response.error {
+            anyhow::bail!("getMultipleAccounts RPC error: {}", error);
+        }
+
+        let values = response
+            .result
+            .context("getMultipleAccounts missing result")?
+            .value;
+
+        for (account, value) in chunk.iter().zip(values.into_iter()) {
+            let Some(value) = value else {
+                continue;
+            };
+
+            if value.data.1 != "base64" {
+                anyhow::bail!("unexpected account data encoding for {}", account);
+            }
+
+            let data = general_purpose::STANDARD
+                .decode(value.data.0)
+                .with_context(|| format!("decode account data for {}", account))?;
+            out.insert(
+                account.clone(),
+                AccountOwnerData {
+                    owner: value.owner,
+                    data,
+                },
+            );
         }
     }
 

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
@@ -115,6 +115,8 @@ pub struct ExecutionConfig {
     pub send_transport: Option<String>,
     #[serde(default)]
     pub jito_tip_lamports: Option<u64>,
+    #[serde(default)]
+    pub jito_endpoints: Option<Vec<String>>,
     #[serde(default)]
     pub direct_send_extra_edge_pct: Option<f64>,
     #[serde(default)]
@@ -239,6 +241,10 @@ pub struct DiscoveryConfig {
     pub token_selection_min_score: f64,
     #[serde(default = "default_token_selection_min_total_liquidity_usdc")]
     pub token_selection_min_total_liquidity_usdc: f64,
+    #[serde(default = "default_token_selection_min_recent_trades_15m")]
+    pub token_selection_min_recent_trades_15m: u64,
+    #[serde(default = "default_token_selection_min_per_dex_liquidity_usdc")]
+    pub token_selection_min_per_dex_liquidity_usdc: f64,
     #[serde(default = "default_token_selection_log_top_n")]
     pub token_selection_log_top_n: usize,
     #[serde(default = "default_max_pairs_per_token")]
@@ -251,6 +257,12 @@ pub struct DiscoveryConfig {
     pub manual_market_addresses: Vec<String>,
     #[serde(default = "default_dynamic_market_addresses_path")]
     pub dynamic_market_addresses_path: String,
+    #[serde(default = "default_validated_pools_snapshot_path")]
+    pub validated_pools_snapshot_path: String,
+    #[serde(default)]
+    pub validated_pools_snapshot_url: String,
+    #[serde(default = "default_validated_pools_reload_interval_secs")]
+    pub validated_pools_reload_interval_secs: u64,
     #[serde(default = "default_excluded_target_token_mints")]
     pub excluded_target_token_mints: Vec<String>,
     #[serde(default)]
@@ -275,6 +287,14 @@ fn default_token_selection_min_total_liquidity_usdc() -> f64 {
     3_000.0
 }
 
+fn default_token_selection_min_recent_trades_15m() -> u64 {
+    10
+}
+
+fn default_token_selection_min_per_dex_liquidity_usdc() -> f64 {
+    5_000.0
+}
+
 fn default_token_selection_log_top_n() -> usize {
     12
 }
@@ -293,6 +313,14 @@ fn default_min_volume_h24() -> f64 {
 
 fn default_dynamic_market_addresses_path() -> String {
     "dynamic_market_addresses.txt".to_string()
+}
+
+fn default_validated_pools_snapshot_path() -> String {
+    "validated_pools.snapshot".to_string()
+}
+
+fn default_validated_pools_reload_interval_secs() -> u64 {
+    5
 }
 
 fn default_excluded_target_token_mints() -> Vec<String> {
@@ -322,12 +350,18 @@ impl Default for DiscoveryConfig {
             token_selection_min_score: default_token_selection_min_score(),
             token_selection_min_total_liquidity_usdc:
                 default_token_selection_min_total_liquidity_usdc(),
+            token_selection_min_recent_trades_15m: default_token_selection_min_recent_trades_15m(),
+            token_selection_min_per_dex_liquidity_usdc:
+                default_token_selection_min_per_dex_liquidity_usdc(),
             token_selection_log_top_n: default_token_selection_log_top_n(),
             max_pairs_per_token: default_max_pairs_per_token(),
             min_liquidity_usdc: default_min_liquidity_usdc(),
             min_volume_h24: default_min_volume_h24(),
             manual_market_addresses: Vec::new(),
             dynamic_market_addresses_path: default_dynamic_market_addresses_path(),
+            validated_pools_snapshot_path: default_validated_pools_snapshot_path(),
+            validated_pools_snapshot_url: String::new(),
+            validated_pools_reload_interval_secs: default_validated_pools_reload_interval_secs(),
             excluded_target_token_mints: default_excluded_target_token_mints(),
             excluded_market_addresses: Vec::new(),
             require_routeable_pairs: false,
@@ -465,7 +499,7 @@ fn default_max_meteora_pools_per_token_for_direct_scan() -> usize {
     2
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgramKind {
     Pumpfun,
@@ -755,6 +789,13 @@ impl Config {
         );
         apply_env_override("SEND_TRANSPORT", self.execution.send_transport.as_deref());
         apply_env_override("JITO_TIP_LAMPORTS", self.execution.jito_tip_lamports);
+        apply_env_override(
+            "JITO_ENDPOINTS",
+            self.execution
+                .jito_endpoints
+                .as_ref()
+                .map(|values| values.join(",")),
+        );
         apply_env_override(
             "DIRECT_SEND_EXTRA_EDGE_PCT",
             self.execution.direct_send_extra_edge_pct,

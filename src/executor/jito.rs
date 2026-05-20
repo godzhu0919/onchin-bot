@@ -3,7 +3,13 @@ use rand::Rng;
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
+};
+use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 pub const JITO_MAINNET_HTTP_ENDPOINTS: [&str; 8] = [
     "https://amsterdam.mainnet.block-engine.jito.wtf",
@@ -78,28 +84,66 @@ struct ErrorDetail {
 pub struct JitoClient {
     client: Client,
     uuid: Option<String>,
-    endpoint_index: std::sync::atomic::AtomicUsize,
+    endpoints: Vec<String>,
+    endpoint_index: AtomicUsize,
+    min_txn_request_interval: Duration,
+    last_txn_request: Mutex<Instant>,
 }
 
 impl JitoClient {
     pub fn new(uuid: Option<String>) -> Result<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_nodelay(true)
             .build()
             .context("Failed to create HTTP client")?;
+        let endpoints = configured_jito_endpoints();
+        let min_txn_request_interval = configured_jito_txn_request_min_interval();
+        let now = Instant::now();
+        let last_txn_request = now.checked_sub(min_txn_request_interval).unwrap_or(now);
+        tracing::info!("Jito 节点：{}", endpoints.join(","));
+        tracing::info!(
+            "Jito 请求限速：最小间隔={}毫秒",
+            min_txn_request_interval.as_millis()
+        );
+        warm_jito_connections(client.clone(), uuid.clone(), endpoints.clone());
 
         Ok(Self {
             client,
             uuid,
-            endpoint_index: std::sync::atomic::AtomicUsize::new(0),
+            endpoints,
+            endpoint_index: AtomicUsize::new(0),
+            min_txn_request_interval,
+            last_txn_request: Mutex::new(last_txn_request),
         })
     }
 
-    fn get_next_endpoint(&self) -> &'static str {
-        let index = self
-            .endpoint_index
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        JITO_MAINNET_HTTP_ENDPOINTS[index % JITO_MAINNET_HTTP_ENDPOINTS.len()]
+    async fn wait_for_txn_request_slot(&self) {
+        if self.min_txn_request_interval.is_zero() {
+            return;
+        }
+        loop {
+            let wait_for = {
+                let mut last_request = self.last_txn_request.lock().await;
+                let elapsed = last_request.elapsed();
+                if elapsed >= self.min_txn_request_interval {
+                    *last_request = Instant::now();
+                    return;
+                }
+                self.min_txn_request_interval - elapsed
+            };
+            tracing::debug!(
+                "Jito request throttle: waiting {}ms before next request",
+                wait_for.as_millis()
+            );
+            sleep(wait_for).await;
+        }
+    }
+
+    fn get_next_endpoint(&self) -> &str {
+        let index = self.endpoint_index.fetch_add(1, Ordering::Relaxed);
+        self.endpoints[index % self.endpoints.len()].as_str()
     }
 
     pub fn random_tip_account() -> Result<Pubkey> {
@@ -141,6 +185,7 @@ impl JitoClient {
 
         let url = format!("{}/api/v1/bundles", endpoint);
 
+        self.wait_for_txn_request_slot().await;
         let response = self
             .post_json(&url)
             .json(&request)
@@ -190,6 +235,7 @@ impl JitoClient {
         };
 
         let url = format!("{}/api/v1/transactions?bundleOnly=true", endpoint);
+        self.wait_for_txn_request_slot().await;
         let response = self
             .post_json(&url)
             .json(&request)
@@ -220,4 +266,79 @@ impl JitoClient {
 
         anyhow::bail!("Unexpected Jito transaction response: {}", body);
     }
+}
+
+fn configured_jito_endpoints() -> Vec<String> {
+    let configured = std::env::var("JITO_ENDPOINTS")
+        .ok()
+        .or_else(|| std::env::var("JITO_ENDPOINT").ok())
+        .map(|value| {
+            value
+                .split(|ch| matches!(ch, ',' | ';' | ' '))
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|endpoints| !endpoints.is_empty());
+
+    configured.unwrap_or_else(|| {
+        JITO_MAINNET_HTTP_ENDPOINTS
+            .iter()
+            .map(|endpoint| (*endpoint).to_string())
+            .collect()
+    })
+}
+
+fn configured_jito_txn_request_min_interval() -> Duration {
+    Duration::from_millis(
+        std::env::var("JITO_TXN_REQUEST_MIN_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(550),
+    )
+}
+
+fn warm_jito_connections(client: Client, uuid: Option<String>, endpoints: Vec<String>) {
+    if std::env::var("JITO_DISABLE_WARMUP")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+
+    handle.spawn(async move {
+        for endpoint in endpoints {
+            let started = Instant::now();
+            let url = format!("{}/api/v1/bundles", endpoint);
+            let mut request = client.get(&url);
+            if let Some(uuid) = &uuid {
+                request = request.header("x-jito-auth", uuid);
+            }
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let _ = response.bytes().await;
+                    tracing::debug!(
+                        "Jito 连接预热完成：节点={}，状态={}，耗时={}毫秒",
+                        endpoint,
+                        status,
+                        started.elapsed().as_millis()
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "Jito 连接预热失败：节点={}，耗时={}毫秒，原因={}",
+                        endpoint,
+                        started.elapsed().as_millis(),
+                        error
+                    );
+                }
+            }
+        }
+    });
 }

@@ -119,12 +119,12 @@ async fn run_subscription_loop(
 
     loop {
         if tx.is_closed() {
-            tracing::warn!("账户更新处理通道已关闭，停止 Yellowstone 订阅任务");
+            tracing::info!("账户更新处理通道已关闭，停止 Yellowstone 订阅任务");
             break;
         }
 
         let received_before_attempt = stats.received;
-        match subscribe_once(
+        let result = subscribe_once(
             &config,
             request.clone(),
             &account_kind_by_pubkey,
@@ -132,14 +132,16 @@ async fn run_subscription_loop(
             idle_timeout,
             &mut stats,
         )
-        .await
-        {
-            Ok(()) => {
-                tracing::warn!("Yellowstone 账户流已结束，准备重连");
-            }
-            Err(e) => {
-                tracing::error!("Yellowstone 订阅失败：{}", e);
-            }
+        .await;
+
+        if tx.is_closed() {
+            tracing::info!("账户更新处理通道已关闭，停止 Yellowstone 订阅任务");
+            break;
+        }
+
+        match result {
+            Ok(()) => tracing::warn!("Yellowstone 账户流已结束，准备重连"),
+            Err(e) => tracing::error!("Yellowstone 订阅失败：{}", e),
         }
 
         stats.reconnects += 1;
@@ -180,7 +182,13 @@ async fn subscribe_once(
 
     loop {
         let had_overflow = !overflow_updates.is_empty();
-        flush_overflow_updates(tx, &mut overflow_updates, stats)?;
+        if let Err(error) = flush_overflow_updates(tx, &mut overflow_updates, stats) {
+            if tx.is_closed() {
+                tracing::info!("账户更新接收端已关闭，结束当前 Yellowstone 订阅");
+                return Ok(());
+            }
+            return Err(error);
+        }
         if had_overflow && overflow_updates.is_empty() {
             if let Some(started_at) = overflow_started_at.take() {
                 let dropped_before_start =
@@ -241,7 +249,7 @@ async fn subscribe_once(
                     overflow_updates.insert(update.pubkey.clone(), update);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::warn!("账户更新接收端已关闭");
+                    tracing::info!("账户更新接收端已关闭，结束当前 Yellowstone 订阅");
                     return Ok(());
                 }
             }

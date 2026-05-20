@@ -3,13 +3,10 @@ use crate::{
     executor::config::ExecutionScope,
     parser::{meteora, meteora_damm_v2, pump, pumpswap, raydium, whirlpool},
     rpc, strategy,
+    validated_snapshot::{ValidatedPoolRecord, ValidatedPoolSnapshot},
 };
 use anyhow::{Context, Result};
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    io::ErrorKind,
-};
+use std::collections::{HashMap, HashSet};
 
 const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMP_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -42,6 +39,15 @@ pub struct AccountMetadata {
     pub price_usd: Option<f64>,
     pub liquidity_usd: Option<f64>,
     pub volume_h24: Option<f64>,
+    pub quote_liquidity_usdc: Option<f64>,
+    pub recent_trades_5m: Option<u64>,
+    pub recent_trades_15m: Option<u64>,
+    pub recent_volume_5m_usd: Option<f64>,
+    pub recent_volume_15m_usd: Option<f64>,
+    pub first_seen_unix: Option<u64>,
+    pub last_seen_unix: Option<u64>,
+    pub last_seen_slot: Option<u64>,
+    pub verified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,76 +87,161 @@ pub async fn build_subscription_accounts(
     config: &Config,
     _execution_scope: &ExecutionScope,
 ) -> Result<SubscriptionAccounts> {
-    let addresses = collect_static_market_addresses(config);
-    if addresses.is_empty() {
-        tracing::warn!("静态市场为空，请在 config.toml 里配置 manual_market_addresses");
+    let snapshot = ValidatedPoolSnapshot::load_from_config(config)
+        .await
+        .context("load validated pool snapshot")?;
+    if snapshot.pools.is_empty() {
+        let snapshot_path = if config
+            .discovery
+            .validated_pools_snapshot_path
+            .trim()
+            .is_empty()
+        {
+            crate::validated_snapshot::DEFAULT_VALIDATED_POOLS_PATH
+        } else {
+            config.discovery.validated_pools_snapshot_path.as_str()
+        };
+        eprintln!(
+            "启动停止：验证后的池子快照为空，请先让索引器写入 {} 或配置 validated_pools_snapshot_url",
+            snapshot_path
+        );
+        tracing::warn!(
+            "验证后的池子快照为空，请先让索引器写入 {} 或配置 validated_pools_snapshot_url",
+            snapshot_path
+        );
         return Ok(SubscriptionAccounts::default());
     }
 
-    tracing::info!("加载静态市场：账户数={}", addresses.len());
-    build_manual_market_subscription_accounts_for_addresses(config, &addresses).await
+    tracing::info!(
+        "加载验证后的市场快照：源={}，账户数={}",
+        snapshot.source,
+        snapshot.pools.len()
+    );
+    build_validated_market_subscription_accounts(config, snapshot).await
 }
 
-fn collect_static_market_addresses(config: &Config) -> Vec<String> {
-    let mut addresses = Vec::new();
-    addresses.extend(config.discovery.manual_market_addresses.clone());
-    addresses.extend(read_dynamic_market_addresses(
-        &config.discovery.dynamic_market_addresses_path,
-    ));
-    addresses.extend(config.get_enabled_pump_accounts());
-    addresses.extend(config.get_enabled_raydium_pools());
-    addresses.extend(config.get_enabled_meteora_pools());
-    addresses.extend(config.get_enabled_whirlpool_pools());
-
-    if !config.discovery.excluded_market_addresses.is_empty() {
-        let excluded = config
-            .discovery
-            .excluded_market_addresses
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        addresses.retain(|address| !excluded.contains(address));
-    }
-
-    dedup_strings(&mut addresses);
-    addresses
-}
-
-fn read_dynamic_market_addresses(path: &str) -> Vec<String> {
-    let path = path.trim();
-    if path.is_empty() {
-        return Vec::new();
-    }
-
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            tracing::warn!("读取动态池子失败：文件={}，原因={}", path, error);
-            return Vec::new();
-        }
-    };
-
-    let addresses = content
-        .lines()
-        .filter_map(|line| {
-            let value = line
-                .split('#')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .trim_matches(',')
-                .trim_matches('"')
-                .trim();
-            (!value.is_empty()).then(|| value.to_string())
-        })
+async fn build_validated_market_subscription_accounts(
+    config: &Config,
+    snapshot: ValidatedPoolSnapshot,
+) -> Result<SubscriptionAccounts> {
+    let addresses = snapshot
+        .pools
+        .iter()
+        .filter_map(validated_pool_address)
         .collect::<Vec<_>>();
-
-    if !addresses.is_empty() {
-        tracing::info!("加载动态市场：文件={}，账户数={}", path, addresses.len());
+    if addresses.is_empty() {
+        return Ok(SubscriptionAccounts::default());
     }
 
-    addresses
+    let owners = rpc::get_multiple_accounts_owners(&config.rpc.http_url, &addresses)
+        .await
+        .context("fetch owners for validated markets")?;
+    let account_data = rpc::get_multiple_accounts_data(&config.rpc.http_url, &addresses)
+        .await
+        .context("fetch account data for validated markets")?;
+
+    let mut out = SubscriptionAccounts::default();
+    for pool in snapshot.pools {
+        let Some(address) = validated_pool_address(&pool) else {
+            tracing::warn!("跳过验证池：dex={}，原因=缺少地址", pool.dex_id);
+            continue;
+        };
+        let Some(owner) = owners.get(&address) else {
+            tracing::warn!("跳过验证池：{}，原因=缺少 owner", address);
+            continue;
+        };
+        let Some(data) = account_data.get(&address) else {
+            tracing::warn!("跳过验证池：{}，原因=缺少账户数据", address);
+            continue;
+        };
+        let Some(record) = classify_validated_pool_account(config, &pool, &address, owner, data)?
+        else {
+            tracing::warn!("跳过验证池：{}，原因=无法解析池类型 {}", address, owner);
+            continue;
+        };
+        push_validated_record(&mut out, &pool, record);
+    }
+
+    dedup_strings(&mut out.pump_accounts);
+    dedup_strings(&mut out.pumpswap_pools);
+    dedup_strings(&mut out.raydium_accounts);
+    dedup_strings(&mut out.meteora_accounts);
+    dedup_strings(&mut out.whirlpool_accounts);
+    Ok(out)
+}
+
+fn validated_pool_address(pool: &ValidatedPoolRecord) -> Option<String> {
+    (!pool.address.trim().is_empty()).then(|| pool.address.clone())
+}
+
+fn push_validated_record(
+    out: &mut SubscriptionAccounts,
+    pool: &ValidatedPoolRecord,
+    record: ManualMarketRecord,
+) {
+    out.metadata.insert(
+        record.address.clone(),
+        AccountMetadata {
+            address: record.address.clone(),
+            source: "validated_snapshot".to_string(),
+            dex_id: Some(record.dex_id.clone()),
+            program_kind_hint: record.program_kind_hint,
+            token_mint: record.token_mint.clone(),
+            base_mint: record.base_mint.clone(),
+            quote_mint: record.quote_mint.clone(),
+            label: pool.label.clone().unwrap_or_else(|| record.label.clone()),
+            price_usd: None,
+            liquidity_usd: pool.quote_liquidity_usdc,
+            volume_h24: pool.recent_volume_15m_usd,
+            quote_liquidity_usdc: pool.quote_liquidity_usdc,
+            recent_trades_5m: pool.recent_trades_5m,
+            recent_trades_15m: pool.recent_trades_15m,
+            recent_volume_5m_usd: pool.recent_volume_5m_usd,
+            recent_volume_15m_usd: pool.recent_volume_15m_usd,
+            first_seen_unix: pool.first_seen_unix,
+            last_seen_unix: pool.last_seen_unix,
+            last_seen_slot: pool.last_seen_slot,
+            verified: pool.verified,
+        },
+    );
+
+    match record.kind {
+        ManualMarketKind::Pump => out.pump_accounts.push(record.address),
+        ManualMarketKind::PumpSwap => out.pumpswap_pools.push(record.address),
+        ManualMarketKind::Raydium => out.raydium_accounts.push(record.address),
+        ManualMarketKind::Meteora => out.meteora_accounts.push(record.address),
+        ManualMarketKind::Whirlpool => out.whirlpool_accounts.push(record.address),
+    }
+}
+
+fn classify_validated_pool_account(
+    config: &Config,
+    _pool: &ValidatedPoolRecord,
+    address: &str,
+    owner: &str,
+    data: &[u8],
+) -> Result<Option<ManualMarketRecord>> {
+    let short = &address[..address.len().min(8)];
+    let record = match owner {
+        PUMP_PROGRAM_ID => classify_pump(config, address, data, ProgramKind::Pumpfun, short)?,
+        PUMP_AMM_PROGRAM_ID => {
+            classify_pumpswap(config, address, data, ProgramKind::Pumpswap, short)?
+        }
+        RAYDIUM_AMM_V4_PROGRAM_ID | RAYDIUM_CPMM_PROGRAM_ID | RAYDIUM_CLMM_PROGRAM_ID => {
+            classify_raydium(config, address, data, None, short)?
+        }
+        WHIRLPOOL_PROGRAM_ID => {
+            classify_whirlpool(config, address, data, Some(ProgramKind::Whirlpool), short)?
+        }
+        METEORA_DLMM_PROGRAM_ID => {
+            classify_meteora(config, address, data, Some(ProgramKind::MeteoraDlmm), short)?
+        }
+        meteora_damm_v2::METEORA_DAMM_V2_PROGRAM_ID => {
+            classify_meteora(config, address, data, None, short)?
+        }
+        _ => None,
+    };
+    Ok(record)
 }
 
 async fn build_manual_market_subscription_accounts_for_addresses(
@@ -217,6 +308,15 @@ async fn build_manual_market_subscription_accounts_for_addresses(
                 price_usd: None,
                 liquidity_usd: None,
                 volume_h24: None,
+                quote_liquidity_usdc: None,
+                recent_trades_5m: None,
+                recent_trades_15m: None,
+                recent_volume_5m_usd: None,
+                recent_volume_15m_usd: None,
+                first_seen_unix: None,
+                last_seen_unix: None,
+                last_seen_slot: None,
+                verified: false,
             },
         );
 

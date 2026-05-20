@@ -14,8 +14,8 @@ use tokio::time::sleep;
 
 const DEFAULT_WALLET: &str = "JD6rVaerbyz6wjQ433nrw6bFTgFrp46MiYmi8EtUAfsG";
 const DEFAULT_RPC_URL: &str = "http://127.0.0.1:8899";
-const DEFAULT_OUTPUT_PATH: &str = "dynamic_market_addresses.txt";
-const DEFAULT_STATE_PATH: &str = "dynamic_market_addresses.state.json";
+const DEFAULT_OUTPUT_PATH: &str = "validated_pools.jsonl";
+const DEFAULT_STATE_PATH: &str = "validated_pools.snapshot";
 const DEFAULT_POLL_SECS: u64 = 300;
 const DEFAULT_SIGNATURE_LIMIT: usize = 60;
 const DEFAULT_MAX_MISSES: u32 = 2;
@@ -92,6 +92,10 @@ struct StatePool {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct WatcherState {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    source: String,
     wallet: String,
     updated_unix: u64,
     pools: Vec<StatePool>,
@@ -154,7 +158,7 @@ async fn main() -> Result<()> {
     let run_once = env::args().any(|arg| arg == "--once");
 
     tracing::info!(
-        "JD6 池子更新器启动：钱包={}，间隔={}秒，输出={}",
+        "JD6 验证快照更新器启动：钱包={}，间隔={}秒，输出={}",
         config.wallet,
         config.poll_secs,
         config.output_path
@@ -171,7 +175,9 @@ async fn main() -> Result<()> {
                     report.fresh_pools,
                     report.active_pools
                 );
-                tracing::info!("提示：这个进程只更新池子列表，不扫描利润；套利扫描看主程序 cargo run --release 的日志");
+                tracing::info!(
+                    "提示：这个进程只更新验证快照，不扫描利润；交易端只热加载 validated snapshot"
+                );
             }
             Err(error) => tracing::warn!("JD6 池子更新失败：{}", error),
         }
@@ -573,6 +579,8 @@ fn update_state(
     });
 
     state = WatcherState {
+        schema_version: default_schema_version(),
+        source: "jd6_pool_watcher".to_string(),
         wallet: config.wallet.clone(),
         updated_unix: now,
         pools,
@@ -595,26 +603,23 @@ fn write_state(path: &str, state: &WatcherState) -> Result<()> {
 
 fn write_active_addresses(path: &str, state: &WatcherState) -> Result<()> {
     let mut content = String::new();
-    content.push_str("# 自动生成：JD6 动态池子列表\n");
-    content.push_str("# 主程序启动时会把这里的地址合并进静态市场\n");
-    content.push_str("# 同一个池子连续两轮没在 JD6 成功交易里出现会被移除\n");
-    content.push_str(&format!(
-        "# wallet={} updated_unix={} active_pools={}\n",
-        state.wallet,
-        state.updated_unix,
-        state.pools.len()
-    ));
-
-    let mut current_token = "";
     for pool in &state.pools {
-        if current_token != pool.token_mint {
-            current_token = &pool.token_mint;
-            content.push_str(&format!("\n# token={}\n", current_token));
-        }
-        content.push_str(&format!(
-            "{} # {} quote={} hits={} misses={} slot={}\n",
-            pool.address, pool.venue, pool.quote_mint, pool.hits, pool.misses, pool.last_seen_slot
-        ));
+        let record = serde_json::json!({
+            "address": pool.address,
+            "dex_id": pool.venue,
+            "token_mint": pool.token_mint,
+            "quote_mint": pool.quote_mint,
+            "first_seen_unix": pool.first_seen_unix,
+            "last_seen_unix": pool.last_seen_unix,
+            "last_seen_slot": pool.last_seen_slot,
+            "hits": pool.hits,
+            "misses": pool.misses,
+            "recent_trades_5m": pool.hits,
+            "recent_trades_15m": pool.hits,
+            "verified": true,
+        });
+        content.push_str(&serde_json::to_string(&record)?);
+        content.push('\n');
     }
 
     write_atomic(path, &content)
@@ -654,7 +659,7 @@ fn log_routeable_pool_summary(state: &WatcherState) {
     for (token, (pumpswap_count, meteora_count)) in by_token {
         if pumpswap_count > 0 && meteora_count > 0 {
             tracing::info!(
-                "动态池子：币种={}，PumpSwap={}，Meteora={}",
+                "验证池子：币种={}，PumpSwap={}，Meteora={}",
                 token,
                 pumpswap_count,
                 meteora_count
@@ -668,6 +673,10 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn default_schema_version() -> u32 {
+    1
 }
 
 fn env_string(key: &str, default: &str) -> String {

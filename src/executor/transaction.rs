@@ -54,7 +54,11 @@ static LOOKUP_TABLE_CACHE: once_cell::sync::Lazy<Arc<std::sync::RwLock<LookupTab
             entries: std::collections::HashMap::new(),
         }))
     });
-const LOOKUP_TABLE_CACHE_DURATION: Duration = Duration::from_secs(60);
+static RPC_HTTP_CLIENT: once_cell::sync::Lazy<reqwest::Client> =
+    once_cell::sync::Lazy::new(reqwest::Client::new);
+static BLOCKING_RPC_HTTP_CLIENT: once_cell::sync::Lazy<reqwest::blocking::Client> =
+    once_cell::sync::Lazy::new(reqwest::blocking::Client::new);
+const LOOKUP_TABLE_CACHE_DURATION: Duration = Duration::from_secs(600);
 
 pub async fn get_recent_blockhash(rpc_url: &str) -> Result<Hash> {
     // Check cache first
@@ -70,7 +74,6 @@ pub async fn get_recent_blockhash(rpc_url: &str) -> Result<Hash> {
 
     // Cache miss, fetch from RPC
     tracing::debug!("Fetching new blockhash from RPC");
-    let client = reqwest::Client::new();
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -79,7 +82,7 @@ pub async fn get_recent_blockhash(rpc_url: &str) -> Result<Hash> {
         "params": [{"commitment": "processed"}]
     });
 
-    let response = client.post(rpc_url).json(&request).send().await?;
+    let response = RPC_HTTP_CLIENT.post(rpc_url).json(&request).send().await?;
     let body: serde_json::Value = response.json().await?;
 
     // Check for RPC errors
@@ -215,7 +218,7 @@ pub fn build_and_sign_transaction(
                 None,
                 true,
             )?;
-            tracing::warn!("交易过大，去掉账户数据上限后重试：原因={}", error);
+            tracing::debug!("交易尺寸贴近上限，去掉账户数据上限后重试：原因={}", error);
             match build_and_encode_signed_transaction(
                 &retry_instructions,
                 payer,
@@ -232,7 +235,10 @@ pub fn build_and_sign_transaction(
                         None,
                         false,
                     )?;
-                    tracing::warn!("交易仍然过大，去掉计算预算后重试：原因={}", retry_error);
+                    tracing::debug!(
+                        "交易尺寸仍贴近上限，去掉计算预算后重试：原因={}",
+                        retry_error
+                    );
                     build_and_encode_signed_transaction(
                         &minimal_instructions,
                         payer,
@@ -377,7 +383,6 @@ pub fn fetch_address_lookup_table_accounts_blocking(
     rpc_url: &str,
     table_addresses: &[Pubkey],
 ) -> Result<Vec<AddressLookupTableAccount>> {
-    let client = reqwest::blocking::Client::new();
     let now = Instant::now();
     let mut out = Vec::new();
 
@@ -407,7 +412,7 @@ pub fn fetch_address_lookup_table_accounts_blocking(
                 }
             ]
         });
-        let response = client
+        let response = BLOCKING_RPC_HTTP_CLIENT
             .post(rpc_url)
             .json(&request)
             .send()

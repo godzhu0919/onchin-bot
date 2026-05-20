@@ -3,8 +3,9 @@ use crate::model::state::{PumpState, RaydiumState};
 use crate::strategy::execution::ValidatedArbitrage;
 use anyhow::Result;
 use solana_sdk::{instruction::Instruction, pubkey::Pubkey};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 pub struct ExecutionManager {
     executor: Option<Arc<ArbitrageExecutor>>,
@@ -14,7 +15,7 @@ pub struct ExecutionManager {
 
 impl ExecutionManager {
     pub fn new(default_rpc_url: &str) -> Result<Self> {
-        let min_execution_interval_ms = std::env::var("EXECUTION_MIN_INTERVAL_MS")
+        let configured_min_execution_interval_ms = std::env::var("EXECUTION_MIN_INTERVAL_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(250);
@@ -24,7 +25,7 @@ impl ExecutionManager {
                     "执行配置：发送={}，只演练={}，最小间隔={}毫秒，发送前模拟={}",
                     if config.enabled { "开" } else { "关" },
                     if config.dry_run_only { "是" } else { "否" },
-                    min_execution_interval_ms,
+                    configured_min_execution_interval_ms,
                     if config.require_pre_send_simulation {
                         "开"
                     } else {
@@ -40,7 +41,10 @@ impl ExecutionManager {
                     }
                 }
 
-                Some(Arc::new(ArbitrageExecutor::new(config)?))
+                Some((
+                    Arc::new(ArbitrageExecutor::new(config)?),
+                    configured_min_execution_interval_ms,
+                ))
             }
             Err(e) => {
                 tracing::warn!("执行器未配置，只运行监控模式：{}", e);
@@ -48,11 +52,41 @@ impl ExecutionManager {
             }
         };
 
+        let (executor, min_execution_interval_ms) = executor
+            .map(|(executor, min_interval)| (Some(executor), min_interval))
+            .unwrap_or((None, configured_min_execution_interval_ms));
+
+        let min_execution_interval = Duration::from_millis(min_execution_interval_ms);
+        let now = std::time::Instant::now();
+        let last_execution = now.checked_sub(min_execution_interval).unwrap_or(now);
+
         Ok(Self {
             executor,
-            last_execution: Arc::new(Mutex::new(std::time::Instant::now())),
-            min_execution_interval: std::time::Duration::from_millis(min_execution_interval_ms),
+            last_execution: Arc::new(Mutex::new(last_execution)),
+            min_execution_interval,
         })
+    }
+
+    async fn reserve_send_slot(&self) {
+        if self.min_execution_interval.is_zero() {
+            return;
+        }
+        loop {
+            let wait_for = {
+                let mut last_exec = self.last_execution.lock().await;
+                let elapsed = last_exec.elapsed();
+                if elapsed >= self.min_execution_interval {
+                    *last_exec = std::time::Instant::now();
+                    return;
+                }
+                self.min_execution_interval - elapsed
+            };
+            tracing::debug!(
+                "Live send throttle: waiting {}ms before next submission",
+                wait_for.as_millis()
+            );
+            sleep(wait_for).await;
+        }
     }
 
     pub async fn execute_arbitrage(
@@ -69,18 +103,11 @@ impl ExecutionManager {
             }
         };
 
-        let mut last_exec = self.last_execution.lock().await;
-        let elapsed = last_exec.elapsed();
-
-        if elapsed < self.min_execution_interval {
-            tracing::debug!("Rate limit: {}s since last execution", elapsed.as_secs());
-            return Ok("RATE_LIMITED".to_string());
-        }
+        self.reserve_send_slot().await;
 
         let result = executor
             .execute_arbitrage(opportunity, pump_state, raydium_state, sol_price)
             .await?;
-        *last_exec = std::time::Instant::now();
         Ok(result)
     }
 
@@ -94,6 +121,13 @@ impl ExecutionManager {
         self.executor
             .as_ref()
             .map(|executor| executor.live_send_enabled())
+            .unwrap_or(false)
+    }
+
+    pub fn has_jito_bundle_transport(&self) -> bool {
+        self.executor
+            .as_ref()
+            .map(|executor| executor.has_jito_bundle_transport())
             .unwrap_or(false)
     }
 
@@ -182,13 +216,13 @@ impl ExecutionManager {
         &self,
         instructions: Vec<Instruction>,
     ) -> Result<String> {
-        let executor = self
-            .executor
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("executor not configured"))?;
-        executor
-            .send_instructions_with_simulated_units(instructions, None)
-            .await
+        self.send_instructions_with_simulated_units_and_tip_context_unmetered(
+            instructions,
+            None,
+            self.jito_tip_lamports(),
+            None,
+        )
+        .await
     }
 
     pub async fn send_instructions_with_simulated_units(
@@ -210,29 +244,82 @@ impl ExecutionManager {
         simulated_units_consumed: Option<u64>,
         jito_tip_lamports: u64,
     ) -> Result<String> {
+        self.send_instructions_with_simulated_units_and_tip_context(
+            instructions,
+            simulated_units_consumed,
+            jito_tip_lamports,
+            None,
+        )
+        .await
+    }
+
+    pub async fn send_instructions_with_simulated_units_and_tip_context(
+        &self,
+        instructions: Vec<Instruction>,
+        simulated_units_consumed: Option<u64>,
+        jito_tip_lamports: u64,
+        log_context: Option<&str>,
+    ) -> Result<String> {
         let executor = self
             .executor
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("executor not configured"))?;
 
-        let mut last_exec = self.last_execution.lock().await;
-        let elapsed = last_exec.elapsed();
-        if elapsed < self.min_execution_interval {
-            anyhow::bail!(
-                "live send rate-limited: {}s since last execution",
-                elapsed.as_secs()
-            );
-        }
+        self.reserve_send_slot().await;
 
         let bundle_id = executor
-            .send_instructions_with_simulated_units_and_tip(
+            .send_instructions_with_simulated_units_and_tip_context(
                 instructions,
                 simulated_units_consumed,
                 jito_tip_lamports,
+                log_context,
             )
             .await?;
-        *last_exec = std::time::Instant::now();
         Ok(bundle_id)
+    }
+
+    pub async fn send_instructions_with_simulated_units_and_tip_context_unmetered(
+        &self,
+        instructions: Vec<Instruction>,
+        simulated_units_consumed: Option<u64>,
+        jito_tip_lamports: u64,
+        log_context: Option<&str>,
+    ) -> Result<String> {
+        let executor = self
+            .executor
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("executor not configured"))?;
+        self.reserve_send_slot().await;
+        executor
+            .send_instructions_with_simulated_units_and_tip_context(
+                instructions,
+                simulated_units_consumed,
+                jito_tip_lamports,
+                log_context,
+            )
+            .await
+    }
+
+    pub async fn send_instruction_bundle_with_simulated_units_and_tip_context_unmetered(
+        &self,
+        instruction_groups: Vec<Vec<Instruction>>,
+        simulated_units_consumed: Vec<Option<u64>>,
+        jito_tip_lamports: u64,
+        log_context: Option<&str>,
+    ) -> Result<String> {
+        let executor = self
+            .executor
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("executor not configured"))?;
+        self.reserve_send_slot().await;
+        executor
+            .send_instruction_bundle_with_simulated_units_and_tip_context(
+                instruction_groups,
+                simulated_units_consumed,
+                jito_tip_lamports,
+                log_context,
+            )
+            .await
     }
 
     pub async fn send_instruction_bundle_with_simulated_units(
@@ -254,28 +341,37 @@ impl ExecutionManager {
         simulated_units_consumed: Vec<Option<u64>>,
         jito_tip_lamports: u64,
     ) -> Result<String> {
+        self.send_instruction_bundle_with_simulated_units_and_tip_context(
+            instruction_groups,
+            simulated_units_consumed,
+            jito_tip_lamports,
+            None,
+        )
+        .await
+    }
+
+    pub async fn send_instruction_bundle_with_simulated_units_and_tip_context(
+        &self,
+        instruction_groups: Vec<Vec<Instruction>>,
+        simulated_units_consumed: Vec<Option<u64>>,
+        jito_tip_lamports: u64,
+        log_context: Option<&str>,
+    ) -> Result<String> {
         let executor = self
             .executor
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("executor not configured"))?;
 
-        let mut last_exec = self.last_execution.lock().await;
-        let elapsed = last_exec.elapsed();
-        if elapsed < self.min_execution_interval {
-            anyhow::bail!(
-                "live send rate-limited: {}s since last execution",
-                elapsed.as_secs()
-            );
-        }
+        self.reserve_send_slot().await;
 
         let signature = executor
-            .send_instruction_bundle_with_simulated_units_and_tip(
+            .send_instruction_bundle_with_simulated_units_and_tip_context(
                 instruction_groups,
                 simulated_units_consumed,
                 jito_tip_lamports,
+                log_context,
             )
             .await?;
-        *last_exec = std::time::Instant::now();
         Ok(signature)
     }
 }

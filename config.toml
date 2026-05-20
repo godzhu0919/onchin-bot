@@ -24,7 +24,8 @@ enabled = true
 dry_run_only = false
 max_slippage_bps = 100
 send_transport = "jito"
-jito_tip_lamports = 0
+jito_tip_lamports = 1000
+jito_endpoints = ["https://amsterdam.mainnet.block-engine.jito.wtf"]
 live_send_min_profit_pct = 0.0
 require_pre_send_simulation = false
 two_hop_profit_guard_min_usdc = 0.0
@@ -32,10 +33,10 @@ program_pair_min_profit_lamports = 0
 direct_send_extra_edge_pct = 0.0
 direct_send_extra_edge_usdc = 0.0
 direct_send_min_gate_pct = 0.0
-direct_send_max_state_age_ms = 1500
+direct_send_max_state_age_ms = 0
 send_on_positive_spot = true
 skip_monitor_only_routes_when_live = true
-execution_min_interval_ms = 500
+execution_min_interval_ms = 0
 compute_unit_limit = 250000
 compute_unit_limit_margin_bps = 0
 compute_unit_limit_min_buffer = 0
@@ -49,6 +50,7 @@ enable_meteora_meteora_live_send = false
 address_lookup_tables = [
     "EbMDbHsAs9MLgZMN9qyxdHSzvFvM1eBadyNMbc5D1zGH",
     "2qHaPZVbnAMepsfrCzr3dPzq9KJ8t1AW7GV8YjMcQYwc",
+    "BDdREJfyy1NNcgwe4AA7iZgfLFKW4XBz6Y2o6nw5uyst",
 ]
 two_hop_executor_program_id = "3NerRj5cGM4n7Jx9bTzpF5nc4LHUZZo3NoqGN2eTqSBj"
 
@@ -60,7 +62,7 @@ min_profit_threshold = 0.0
 sol_usdc_price = 85.44
 
 # 精确预检里使用的单腿 gas 估算（SOL）；两腿交易会乘 2。
-preflight_gas_cost_sol = 0.00005
+preflight_gas_cost_sol = 0.00002
 
 # PumpSwap->Raydium CLMM 精确预检时，对第一腿买到的 token 数量使用的保守缓冲。
 pumpswap_buy_output_buffer_bps = 50.0
@@ -69,12 +71,12 @@ pumpswap_buy_output_buffer_bps = 50.0
 raydium_clmm_output_buffer_bps = 50.0
 
 # PumpSwap->Meteora 真实成交风控
-pumpswap_meteora_small_pool_liquidity_usdc = 2500.0
+pumpswap_meteora_small_pool_liquidity_usdc = 10000.0
 pumpswap_meteora_max_trade_depth_bps = 1000000.0
 pumpswap_meteora_buy_slippage_bps = 125.0
-pumpswap_meteora_buy_slippage_bps_small_pool = 275.0
+pumpswap_meteora_buy_slippage_bps_small_pool = 50.0
 pumpswap_meteora_sell_slippage_bps = 90.0
-pumpswap_meteora_sell_slippage_bps_small_pool = 225.0
+pumpswap_meteora_sell_slippage_bps_small_pool = 40.0
 pumpswap_meteora_max_touched_bin_arrays = 64
 pumpswap_meteora_max_meteora_fee_bps = 180.0
 pumpswap_meteora_failure_buffer_usdc = 0.03
@@ -96,32 +98,37 @@ trade_sizes = [1.0, 2.0, 3.0, 5.0, 8.0]
 
 # program-pair 粗筛专用，单位 SOL。你现在只套 WSOL，这里才是当前
 # PumpSwap/Meteora/Raydium 两程序路径的粗筛金额。
-program_pair_trade_sizes_sol = [0.005, 0.01, 0.02]
+program_pair_trade_sizes_sol = [0.05, 0.1, 0.25, 0.5]
 program_pair_best_size_search_samples = 4
-program_pair_max_send_candidates_per_scan = 1
+program_pair_max_send_candidates_per_scan = 0
 program_pair_send_min_gross_profit_pct = 0.0
 
 # 每轮 exact direct 扫描最多处理多少个 token。
 # 放开 PumpSwap/Meteora/Raydium 路径后，一轮允许多扫几个 routeable token。
-max_direct_tokens_per_scan = 8
+max_direct_tokens_per_scan = 0
 
 # 同一个 token 最多保留多少个 Meteora 池进入 direct scan。
-max_meteora_pools_per_token_for_direct_scan = 3
+max_meteora_pools_per_token_for_direct_scan = 2
 
 [discovery]
-# 静态市场宇宙：统一在本文件维护池子地址。
-# 程序会通过 RPC 自动识别每个地址属于 PumpSwap、Raydium、Meteora 或 Whirlpool。
+# 市场宇宙由索引器输出的已验证快照决定。
+# 交易端不再把 dynamic_market_addresses.txt 或手工地址当成真源。
 token_selection_enabled = false
-token_selection_min_score = 45.0
-token_selection_min_total_liquidity_usdc = 3000.0
+token_selection_min_score = 55.0
+token_selection_min_total_liquidity_usdc = 100000.0
+token_selection_min_recent_trades_15m = 20
+token_selection_min_per_dex_liquidity_usdc = 100000.0
 token_selection_log_top_n = 12
 
 max_pairs_per_token = 1
-min_liquidity_usdc = 500.0
+min_liquidity_usdc = 100000.0
 min_volume_h24 = 1000.0
-dynamic_market_addresses_path = "dynamic_market_addresses.txt"
+dynamic_market_addresses_path = "dynamic_market_addresses.txt" # legacy; bot no longer reads this
+validated_pools_snapshot_path = "validated_pools.snapshot"
+validated_pools_snapshot_url = ""
+validated_pools_reload_interval_secs = 5
 
-# 手工市场地址。要加新币，就把这个币在不同 DEX 上的池子地址加到这里。
+# 旧字段保留做人工参考，交易端主流程不再读取这里。
 manual_market_addresses = [
     # ANDV
     "jHmCrrLMPtE1qvYpwe1yjtjzM2k44EorPDUcJ6j8pWC",

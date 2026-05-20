@@ -1,0 +1,3 @@
+2026-05-12T11:30:34.959341Z  INFO 池子扫描器启动：来源=grpc，间隔=60秒，输出=validated_pools.jsonl，最低流动性=$1000，近期窗口=300秒
+2026-05-12T11:30:34.959407Z  INFO 启动 gRPC 池子索引：endpoint=127.0.0.1:10000，flush=5秒，programs=[PumpSwap=pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA, Meteora=LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo]
+2026-05-12T11:30:34.960049Z  INFO gRPC 池子流已建立：只接收带交易签名的 PumpSwap/Meteora 账户更新

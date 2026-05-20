@@ -6,7 +6,10 @@ use crate::{
     },
     strategy::quote,
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketSource {
@@ -143,14 +146,26 @@ pub fn routeable_tokens(
         meteora_state,
         whirlpool_state,
     );
-    let mut tokens = markets
+    let mut ranked = markets
         .into_iter()
         .filter_map(|(token_mint, token_markets)| {
-            has_routeable_program_pair(&token_markets).then_some(token_mint)
+            token_route_profile(config, metadata, &token_mint, &token_markets)
+                .map(|profile| (profile.score, profile.token_mint, profile.blocked_reason))
         })
+        .filter(|(_, _, blocked_reason)| blocked_reason.is_none())
+        .map(|(score, token_mint, _)| (score, token_mint))
         .collect::<Vec<_>>();
-    tokens.sort();
-    tokens
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    ranked
+        .into_iter()
+        .map(|(_, token_mint)| token_mint)
+        .collect()
 }
 
 pub fn best_candidates_for_tokens(
@@ -297,6 +312,251 @@ fn has_routeable_program_pair(markets: &[ProgramMarket]) -> bool {
     false
 }
 
+fn has_routeable_program_pair_with_min_liquidity(
+    markets: &[ProgramMarket],
+    min_liquidity: f64,
+) -> bool {
+    if min_liquidity <= 0.0 {
+        return has_routeable_program_pair(markets);
+    }
+    for (index, left) in markets.iter().enumerate() {
+        for right in markets.iter().skip(index + 1) {
+            if left.kind == right.kind || left.quote_mint != right.quote_mint {
+                continue;
+            }
+            let left_liquidity = left.liquidity_usd.unwrap_or(0.0);
+            let right_liquidity = right.liquidity_usd.unwrap_or(0.0);
+            if left_liquidity >= min_liquidity && right_liquidity >= min_liquidity {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+struct RouteableTokenProfile {
+    token_mint: String,
+    score: f64,
+    blocked_reason: Option<&'static str>,
+}
+
+fn token_route_profile(
+    config: &Config,
+    metadata: &HashMap<String, AccountMetadata>,
+    token_mint: &str,
+    token_markets: &[ProgramMarket],
+) -> Option<RouteableTokenProfile> {
+    if token_markets.len() < 2 {
+        return None;
+    }
+
+    let dex_count = token_markets
+        .iter()
+        .map(|market| market.kind)
+        .collect::<HashSet<_>>()
+        .len();
+    let pool_count = token_markets.len();
+    let live_liquidity_usd = token_markets
+        .iter()
+        .filter_map(|market| market.liquidity_usd)
+        .sum::<f64>();
+    let snapshot_liquidity_usd = metadata
+        .values()
+        .filter(|meta| meta.token_mint.as_deref() == Some(token_mint))
+        .filter_map(|meta| meta.quote_liquidity_usdc.or(meta.liquidity_usd))
+        .sum::<f64>();
+    let total_liquidity_usd = live_liquidity_usd.max(snapshot_liquidity_usd);
+    if dex_count < 2 || pool_count < 2 || !has_routeable_program_pair(token_markets) {
+        return Some(RouteableTokenProfile {
+            token_mint: token_mint.to_string(),
+            score: 0.0,
+            blocked_reason: Some("insufficient_routeable_coverage"),
+        });
+    }
+
+    if !config.discovery.token_selection_enabled {
+        return Some(RouteableTokenProfile {
+            token_mint: token_mint.to_string(),
+            score: 0.0,
+            blocked_reason: None,
+        });
+    }
+
+    let sol_quote_count = token_markets
+        .iter()
+        .filter(|market| market.quote_mint == config.tokens.sol_mint)
+        .count();
+    let recent_trades_5m = sum_metadata_u64(metadata, token_mint, |meta| meta.recent_trades_5m);
+    let recent_trades_15m = sum_metadata_u64(metadata, token_mint, |meta| meta.recent_trades_15m);
+    let recent_volume_5m_usd =
+        sum_metadata_f64(metadata, token_mint, |meta| meta.recent_volume_5m_usd);
+    let recent_volume_15m_usd =
+        sum_metadata_f64(metadata, token_mint, |meta| meta.recent_volume_15m_usd);
+    let newest_seen_unix = newest_metadata_seen_unix(metadata, token_mint);
+
+    let has_liquid_route = has_routeable_program_pair_with_min_liquidity(
+        token_markets,
+        config.discovery.token_selection_min_per_dex_liquidity_usdc,
+    );
+    if total_liquidity_usd < config.discovery.token_selection_min_total_liquidity_usdc
+        || recent_trades_15m < config.discovery.token_selection_min_recent_trades_15m
+        || !has_liquid_route
+    {
+        return Some(RouteableTokenProfile {
+            token_mint: token_mint.to_string(),
+            score: 0.0,
+            blocked_reason: Some(
+                if total_liquidity_usd < config.discovery.token_selection_min_total_liquidity_usdc {
+                    "insufficient_total_liquidity"
+                } else if !has_liquid_route {
+                    "insufficient_pair_liquidity"
+                } else {
+                    "inactive_token"
+                },
+            ),
+        });
+    }
+
+    let sol_quote_bonus = if sol_quote_count > 0 { 25.0 } else { 6.0 };
+    let dex_bonus = match dex_count {
+        count if count >= 4 => 20.0,
+        3 => 14.0,
+        2 => 8.0,
+        _ => 0.0,
+    };
+    let activity_bonus = match recent_trades_15m {
+        count if count >= 50 => 25.0,
+        count if count >= 20 => 20.0,
+        count if count >= 10 => 16.0,
+        count if count >= 4 => 10.0,
+        count if count >= 1 => 6.0,
+        _ => 0.0,
+    } + match recent_volume_15m_usd {
+        volume if volume >= 250_000.0 => 15.0,
+        volume if volume >= 100_000.0 => 12.0,
+        volume if volume >= 25_000.0 => 8.0,
+        volume if volume >= 5_000.0 => 4.0,
+        _ => 0.0,
+    } + match recent_trades_5m {
+        count if count >= 20 => 10.0,
+        count if count >= 8 => 8.0,
+        count if count >= 4 => 5.0,
+        count if count >= 1 => 2.0,
+        _ => 0.0,
+    } + match recent_volume_5m_usd {
+        volume if volume >= 100_000.0 => 8.0,
+        volume if volume >= 25_000.0 => 5.0,
+        volume if volume >= 5_000.0 => 2.0,
+        _ => 0.0,
+    };
+    let liquidity_bonus = match total_liquidity_usd {
+        value if value >= 250_000.0 => 25.0,
+        value if value >= 100_000.0 => 18.0,
+        value if value >= 25_000.0 => 12.0,
+        value if value >= 10_000.0 => 8.0,
+        _ => 4.0,
+    };
+    let pair_priority = token_pair_priority_score(config, token_markets);
+    let age_penalty = newest_seen_unix
+        .and_then(|seen| unix_now_secs().checked_sub(seen))
+        .map(|age| match age {
+            0..=300 => 0.0,
+            301..=900 => 2.0,
+            901..=1_800 => 6.0,
+            1_801..=3_600 => 12.0,
+            _ => 20.0,
+        })
+        .unwrap_or(12.0);
+
+    Some(RouteableTokenProfile {
+        token_mint: token_mint.to_string(),
+        score: sol_quote_bonus + dex_bonus + activity_bonus + liquidity_bonus + pair_priority
+            - age_penalty,
+        blocked_reason: None,
+    })
+}
+
+fn token_pair_priority_score(config: &Config, token_markets: &[ProgramMarket]) -> f64 {
+    let has_pumpswap = token_markets
+        .iter()
+        .any(|market| market.kind == ProgramKind::Pumpswap);
+    let has_raydium_clmm = token_markets.iter().any(|market| {
+        market.kind == ProgramKind::RaydiumClmm && market.quote_mint == config.tokens.sol_mint
+    });
+    let has_meteora = token_markets
+        .iter()
+        .any(|market| market.kind == ProgramKind::MeteoraDlmm);
+    let has_whirlpool = token_markets
+        .iter()
+        .any(|market| market.kind == ProgramKind::Whirlpool);
+
+    if has_pumpswap && has_raydium_clmm {
+        30.0
+    } else if has_pumpswap && has_meteora {
+        20.0
+    } else if has_raydium_clmm && has_whirlpool {
+        16.0
+    } else if has_pumpswap && has_whirlpool {
+        15.0
+    } else if has_meteora && has_raydium_clmm {
+        12.0
+    } else if has_pumpswap {
+        8.0
+    } else if has_meteora || has_whirlpool {
+        6.0
+    } else {
+        0.0
+    }
+}
+
+fn sum_metadata_u64<F>(
+    metadata: &HashMap<String, AccountMetadata>,
+    token_mint: &str,
+    accessor: F,
+) -> u64
+where
+    F: Fn(&AccountMetadata) -> Option<u64>,
+{
+    metadata
+        .values()
+        .filter(|meta| meta.token_mint.as_deref() == Some(token_mint))
+        .filter_map(accessor)
+        .sum()
+}
+
+fn sum_metadata_f64<F>(
+    metadata: &HashMap<String, AccountMetadata>,
+    token_mint: &str,
+    accessor: F,
+) -> f64
+where
+    F: Fn(&AccountMetadata) -> Option<f64>,
+{
+    metadata
+        .values()
+        .filter(|meta| meta.token_mint.as_deref() == Some(token_mint))
+        .filter_map(accessor)
+        .sum()
+}
+
+fn newest_metadata_seen_unix(
+    metadata: &HashMap<String, AccountMetadata>,
+    token_mint: &str,
+) -> Option<u64> {
+    metadata
+        .values()
+        .filter(|meta| meta.token_mint.as_deref() == Some(token_mint))
+        .filter_map(|meta| meta.last_seen_unix)
+        .max()
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
 fn best_candidate_for_market_set(
     config: &Config,
     markets: Vec<ProgramMarket>,
@@ -355,6 +615,15 @@ fn evaluate_directional_program_pair(
 
     let gross_profit_pct =
         ((sell_market.price_quote - buy_market.price_quote) / buy_market.price_quote) * 100.0;
+    eprintln!(
+        "[DEBUG] 价格对比：买={}@{:.8} 卖={}@{:.8} 价差={:.4}% token={}",
+        config.program_label(buy_market.kind),
+        buy_market.price_quote,
+        config.program_label(sell_market.kind),
+        sell_market.price_quote,
+        gross_profit_pct,
+        &buy_market.token_mint[..8.min(buy_market.token_mint.len())]
+    );
     if !gross_profit_pct.is_finite() || gross_profit_pct <= 0.0 {
         return None;
     }
@@ -781,6 +1050,16 @@ pub(crate) fn configured_program_pair_trade_sizes_quote(
     }
     sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     sizes.dedup_by(|left, right| (*left - *right).abs() < 1e-9);
+    let max_size = sizes.iter().copied().fold(0.0_f64, f64::max);
+    if max_size < 0.05 {
+        let fallback_sol_sizes = [0.05, 0.1, 0.25, 0.5];
+        sizes.extend(fallback_sol_sizes.into_iter().filter_map(|size| {
+            let trade_size_usd = size * config.strategy.sol_usdc_price;
+            quote_native_price_from_usd(config, quote_mint, trade_size_usd)
+        }));
+        sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sizes.dedup_by(|left, right| (*left - *right).abs() < 1e-9);
+    }
     sizes
 }
 
@@ -873,9 +1152,61 @@ mod tests {
             },
         );
 
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "pump".to_string(),
+            AccountMetadata {
+                address: "pump".to_string(),
+                source: "validated_snapshot".to_string(),
+                dex_id: Some("pumpfun".to_string()),
+                program_kind_hint: Some(ProgramKind::Pumpfun),
+                token_mint: Some("MintA".to_string()),
+                base_mint: Some("MintA".to_string()),
+                quote_mint: Some(SOL.to_string()),
+                label: "Pump".to_string(),
+                price_usd: None,
+                liquidity_usd: None,
+                volume_h24: None,
+                quote_liquidity_usdc: Some(2_000.0),
+                recent_trades_5m: Some(2),
+                recent_trades_15m: Some(6),
+                recent_volume_5m_usd: Some(500.0),
+                recent_volume_15m_usd: Some(1_500.0),
+                first_seen_unix: None,
+                last_seen_unix: None,
+                last_seen_slot: None,
+                verified: true,
+            },
+        );
+        metadata.insert(
+            "ray".to_string(),
+            AccountMetadata {
+                address: "ray".to_string(),
+                source: "validated_snapshot".to_string(),
+                dex_id: Some("raydium_amm_v4".to_string()),
+                program_kind_hint: Some(ProgramKind::RaydiumAmmV4),
+                token_mint: Some("MintA".to_string()),
+                base_mint: Some("MintA".to_string()),
+                quote_mint: Some(SOL.to_string()),
+                label: "Raydium".to_string(),
+                price_usd: None,
+                liquidity_usd: None,
+                volume_h24: None,
+                quote_liquidity_usdc: Some(2_000.0),
+                recent_trades_5m: Some(1),
+                recent_trades_15m: Some(4),
+                recent_volume_5m_usd: Some(250.0),
+                recent_volume_15m_usd: Some(1_000.0),
+                first_seen_unix: None,
+                last_seen_unix: None,
+                last_seen_slot: None,
+                verified: true,
+            },
+        );
+
         let tokens = routeable_tokens(
             &config,
-            &HashMap::new(),
+            &metadata,
             &pump_state,
             &HashMap::new(),
             &raydium_state,
@@ -943,6 +1274,18 @@ mod tests {
         expected.dedup_by(|left, right| (*left - *right).abs() < 1e-9);
 
         assert_eq!(sizes, expected);
+    }
+
+    #[test]
+    fn configured_program_pair_trade_sizes_expand_tiny_sol_quotes() {
+        let mut config = Config::default();
+        config.strategy.program_pair_trade_sizes_sol = vec![0.001, 0.002, 0.005, 0.01];
+
+        let sizes = configured_program_pair_trade_sizes_quote(&config, SOL);
+
+        assert!(sizes.iter().any(|size| (*size - 0.5).abs() < f64::EPSILON));
+        assert!(sizes.iter().all(|size| *size <= 0.5));
+        assert!(sizes.len() > 4);
     }
 
     #[test]
